@@ -29,6 +29,12 @@ Create API Key**.
 4. Use **Discover Cameras** (plugin menu) or **Refresh Cameras** (plugin
    action) to re-poll the camera list at any time.
 
+## Camera snapshot page
+
+An optional HTML page (`pages/cameras.html`) gives you a camera picker with
+snapshot display and live motion state, usable in the Domio iOS app or a
+browser. See [`pages/README.md`](./pages/README.md) for install steps.
+
 ## Reading motion state correctly
 
 **Indigo booleans cannot express "unknown".** When the Protect event
