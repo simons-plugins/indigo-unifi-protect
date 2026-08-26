@@ -345,7 +345,7 @@ def test_snapshot_path_state_is_written_by_the_action(fake_indigo, tmp_path):
     """
     plug = make_plugin({"host": "h", "apiKey": "k"})
     dev = add_camera_device(fake_indigo, plug)
-    plug._resources_dir = str(tmp_path)
+    plug._snapshot_dir = str(tmp_path)
     plug.camera_info = {"cam-1": {"id": "cam-1", "featureFlags": {}}}
 
     class FakeAPI:
@@ -369,7 +369,7 @@ def test_empty_snapshot_body_is_a_failure_not_a_zero_byte_file(fake_indigo, tmp_
 
     plug = make_plugin({"host": "h", "apiKey": "k"})
     dev = add_camera_device(fake_indigo, plug)
-    plug._resources_dir = str(tmp_path)
+    plug._snapshot_dir = str(tmp_path)
 
     class EmptyBodyAPI:
         def get_snapshot(self, camera_id, supports_high_quality=None):
@@ -387,3 +387,37 @@ def test_html_error_page_is_rejected_as_a_snapshot(fake_indigo):
     from protect_api import ProtectAPI, ProtectAPIError
     with pytest.raises(ProtectAPIError, match="not a JPEG"):
         ProtectAPI._check_jpeg(b"<html>gateway timeout</html>", "cam-1")
+
+
+def test_init_does_not_touch_dunder_file(fake_indigo):
+    """Indigo exec()s plugin.py as a string, so __file__ does not exist.
+
+    Touching it in __init__ kills the plugin at InitializeMain with
+    "name '__file__' is not defined" -- before a single line of the plugin
+    runs. Caught on jarvis, not by the suite, so pin it here.
+
+    Fatal-collaborator form: any attempt to resolve the path during
+    construction blows up rather than quietly succeeding.
+    """
+    import builtins
+    plug = make_plugin({})
+    assert plug._snapshot_dir is None, (
+        "the snapshot dir must be resolved lazily, not during __init__"
+    )
+
+
+def test_snapshot_dir_is_outside_the_plugin_bundle(fake_indigo, monkeypatch):
+    """Indigo replaces Contents/ on every plugin upgrade. A snapshot written
+    inside the bundle is silently deleted by the next update.
+    """
+    plug = make_plugin({})
+    monkeypatch.setattr(
+        fake_indigo, "server",
+        type("S", (), {"getInstallFolderPath": staticmethod(lambda: "/Indigo")})(),
+        raising=False,
+    )
+
+    path = plug._get_snapshot_dir()
+
+    assert ".indigoPlugin" not in path, "snapshots must not live inside the bundle"
+    assert "Web Assets" in path, "must be under Web Assets so control pages can serve it"

@@ -58,6 +58,10 @@ TRACKED_DETECT_TYPES = ("person", "vehicle", "animal")
 # a trigger reading it would see "not DISCONNECTED" and believe things are fine.
 STATE_UNAVAILABLE = "unavailable"
 
+# Under Indigo's "Web Assets/images", so snapshots survive plugin upgrades and
+# are servable to control pages at /images/<SNAPSHOT_SUBDIR>/...
+SNAPSHOT_SUBDIR = "unifi-protect"
+
 
 class Plugin(indigo.PluginBase):
 
@@ -81,9 +85,10 @@ class Plugin(indigo.PluginBase):
         self._last_rest_call = 0.0
         self._reconnect_requested = False
         self._reported_dropped = 0
-        self._resources_dir = os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Resources")
-        )
+        # Resolved lazily on first use, NOT here. Indigo exec()s plugin.py as a
+        # string, so __file__ does not exist and touching it in __init__ kills
+        # the plugin at InitializeMain before any of it runs.
+        self._snapshot_dir = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -455,8 +460,9 @@ class Plugin(indigo.PluginBase):
             dev.updateStateOnServer("snapshotPath", value="")
             return
 
-        os.makedirs(self._resources_dir, exist_ok=True)
-        path = os.path.join(self._resources_dir, f"camera_{dev.id}.jpg")
+        snapshot_dir = self._get_snapshot_dir()
+        os.makedirs(snapshot_dir, exist_ok=True)
+        path = os.path.join(snapshot_dir, f"camera_{dev.id}.jpg")
         tmp = f"{path}.tmp"
         # Write via a temp file so a control page never serves a half-written JPEG.
         with open(tmp, "wb") as handle:
@@ -464,7 +470,24 @@ class Plugin(indigo.PluginBase):
         os.replace(tmp, path)
 
         dev.updateStateOnServer("snapshotPath", value=path)
-        self.logger.info(f"{dev.name}: snapshot saved ({len(data)} bytes)")
+        self.logger.info(
+            f"{dev.name}: snapshot saved ({len(data)} bytes) - control pages can "
+            f"use /images/{SNAPSHOT_SUBDIR}/camera_{dev.id}.jpg"
+        )
+
+    def _get_snapshot_dir(self):
+        """Where snapshots live. Resolved on first use, never in __init__.
+
+        Deliberately NOT inside the plugin bundle: Indigo replaces Contents/ on
+        every plugin upgrade, which would silently delete every snapshot. Indigo
+        serves "Web Assets" over its web server, so a file written here is also
+        reachable from a control page as /images/<subdir>/<name>.
+        """
+        if self._snapshot_dir is None:
+            self._snapshot_dir = os.path.join(
+                indigo.server.getInstallFolderPath(), "Web Assets", "images", SNAPSHOT_SUBDIR
+            )
+        return self._snapshot_dir
 
     def refreshCameras(self, action):
         self._refresh_camera_info()
