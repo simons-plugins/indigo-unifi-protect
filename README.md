@@ -31,9 +31,73 @@ Create API Key**.
 
 ## Camera snapshot page
 
-An optional HTML page (`pages/cameras.html`) gives you a camera picker with
-snapshot display and live motion state, usable in the Domio iOS app or a
-browser. See [`pages/README.md`](./pages/README.md) for install steps.
+The plugin ships an optional HTML page — [`pages/cameras.html`](./pages/cameras.html) —
+that turns the camera devices into something you can actually look at:
+
+- **A dropdown over every Protect camera** in Indigo, discovered live by plugin
+  id. Add a camera device and it appears here; no editing the page.
+- **Take snapshot** — fires this plugin's `takeSnapshot` action for the selected
+  camera and reloads the image. No per-camera action group needed.
+- **Auto-refresh** every 30s (off by default) for a rough live view.
+- **Live motion state** — motion, person, vehicle, animal, camera state and
+  event-socket health, polled every 5s.
+
+It also does two things deliberately:
+
+- **It tells you how old the picture is**, read from the file's `Last-Modified`
+  header, and turns amber past two minutes. A camera page showing a silently
+  stale still is worse than showing nothing.
+- **It warns when the event socket is down**, in words, and tells you not to
+  trust the motion indicators until it clears — see
+  [Reading motion state correctly](#reading-motion-state-correctly) below.
+
+### Install
+
+Copy the file into Indigo's **user pages** folder:
+
+```bash
+cp pages/cameras.html \
+  "/Library/Application Support/Perceptive Automation/Indigo 2025.2/Web Assets/static/pages/"
+```
+
+That folder survives plugin upgrades, and it is one of the two directories the
+[Domio](https://domio-smart-home.app) iOS app scans. Restart the Domio plugin
+and the page appears as **Cameras**.
+
+> It is deliberately **not** bundled inside this plugin. Domio only scans its
+> own plugin folder and `Web Assets/static/pages` — a page inside *this*
+> plugin's `Contents/Resources` can never be discovered by it, so shipping a
+> copy there would only create two files that drift apart.
+> ([simons-plugins/indigo-domio-plugin#24](https://github.com/simons-plugins/indigo-domio-plugin/issues/24)
+> tracks fixing that upstream.)
+
+### Use it in a browser
+
+```
+https://<indigo-host>:8176/static/pages/cameras.html?api-key=<your-key>
+```
+
+The `?api-key=` form is how the page authenticates outside the Domio app.
+
+> **Why the page fetches images rather than using `<img src>`:** Indigo's web
+> server requires authentication for everything under `Web Assets`, including
+> the snapshot JPEGs. An `<img src="...">` tag cannot carry an `Authorization`
+> header, so it gets a silent 401 that looks exactly like a missing file. The
+> page fetches the bytes with the bearer token and hands the `<img>` a blob URL
+> instead.
+
+### Where snapshots are stored
+
+```
+/Library/Application Support/Perceptive Automation/Indigo <version>/Web Assets/images/unifi-protect/camera_<deviceId>.jpg
+```
+
+Served by Indigo at `/images/unifi-protect/camera_<deviceId>.jpg`. Files are
+keyed by **Indigo device id**, not camera name, so renaming a device doesn't
+orphan its image. They live outside the plugin bundle on purpose — Indigo
+replaces `Contents/` on every plugin upgrade, which would delete them.
+
+More detail in [`pages/README.md`](./pages/README.md).
 
 ## Reading motion state correctly
 
