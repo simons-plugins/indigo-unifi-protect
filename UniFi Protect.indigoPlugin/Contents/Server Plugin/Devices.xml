@@ -1,0 +1,71 @@
+<?xml version="1.0"?>
+<Devices>
+    <Device type="sensor" subType="kSensorDeviceSubType.Motion" id="protectCamera">
+        <Name>Protect Camera</Name>
+        <ConfigUI>
+            <Field id="cameraIdLabel" type="label">
+                <Label>Select the UniFi Protect camera this device tracks. The list is populated live from your Protect controller.</Label>
+            </Field>
+            <Field id="cameraId" type="menu">
+                <Label>Camera:</Label>
+                <List class="self" method="getCameraList" dynamicReload="true"/>
+            </Field>
+            <Field id="SupportsOnState" type="checkbox" defaultValue="true" hidden="true">
+                <Label/>
+            </Field>
+            <Field id="SupportsSensorValue" type="checkbox" defaultValue="false" hidden="true">
+                <Label/>
+            </Field>
+            <Field id="SupportsStatusRequest" type="checkbox" defaultValue="true" hidden="true">
+                <Label/>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="motionDetected">
+                <ValueType boolType="OnOff">Boolean</ValueType>
+                <TriggerLabel>Motion Detected</TriggerLabel>
+                <ControlPageLabel>Motion Detected</ControlPageLabel>
+            </State>
+            <State id="personDetected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Person Detected</TriggerLabel>
+                <ControlPageLabel>Person Detected</ControlPageLabel>
+            </State>
+            <State id="vehicleDetected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Vehicle Detected</TriggerLabel>
+                <ControlPageLabel>Vehicle Detected</ControlPageLabel>
+            </State>
+            <State id="animalDetected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Animal Detected</TriggerLabel>
+                <ControlPageLabel>Animal Detected</ControlPageLabel>
+            </State>
+            <State id="lastMotion">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Motion</TriggerLabel>
+                <ControlPageLabel>Last Motion</ControlPageLabel>
+            </State>
+            <State id="lastDetectTypes">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Detect Types</TriggerLabel>
+                <ControlPageLabel>Last Detect Types</ControlPageLabel>
+            </State>
+            <State id="cameraState">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Camera State</TriggerLabel>
+                <ControlPageLabel>Camera State</ControlPageLabel>
+            </State>
+            <State id="connected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Event Socket Connected</TriggerLabel>
+                <ControlPageLabel>Event Socket Connected</ControlPageLabel>
+            </State>
+            <State id="snapshotPath">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Snapshot Path</TriggerLabel>
+                <ControlPageLabel>Snapshot Path</ControlPageLabel>
+            </State>
+        </States>
+    </Device>
+</Devices>

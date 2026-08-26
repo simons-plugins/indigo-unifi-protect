@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<Actions>
+    <Action id="takeSnapshot" deviceFilter="self.protectCamera" uiPath="DeviceActions">
+        <Name>Take Snapshot</Name>
+        <CallbackMethod>takeSnapshot</CallbackMethod>
+    </Action>
+
+    <Action id="refreshCameras">
+        <Name>Refresh Cameras</Name>
+        <CallbackMethod>refreshCameras</CallbackMethod>
+    </Action>
+</Actions>

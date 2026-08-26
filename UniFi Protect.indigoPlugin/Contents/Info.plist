@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>UniFi Protect</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.simons-plugins.indigo-unifi-protect</string>
+	<key>CFBundleShortVersionString</key>
+	<string>2026.1</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>https://github.com/simons-plugins/indigo-unifi-protect</string>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1.0.0</string>
+	<key>GithubInfo</key>
+	<dict>
+		<key>GithubRepo</key>
+		<string>indigo-unifi-protect</string>
+		<key>GithubUser</key>
+		<string>simons-plugins</string>
+	</dict>
+	<key>PluginVersion</key>
+	<string>2026.1.0</string>
+	<key>ServerApiVersion</key>
+	<string>3.4</string>
+</dict>
+</plist>

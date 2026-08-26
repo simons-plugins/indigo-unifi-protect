@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<PluginConfig>
+    <Field id="host" type="textfield">
+        <Label>Protect Host/IP:</Label>
+    </Field>
+    <Field id="hostHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+        <Label>The IP address or hostname of your UniFi OS console (UNVR/Dream Machine), e.g. 192.168.0.10.</Label>
+    </Field>
+
+    <Field id="sep1" type="separator"/>
+
+    <Field id="apiKey" type="textfield" secure="true">
+        <Label>API Key:</Label>
+    </Field>
+    <Field id="apiKeySecureLabel" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+        <Label>secure="true" only masks this field in the Indigo UI - it does NOT store the key encrypted on disk. Treat Indigo's preferences file as containing this key in the clear.</Label>
+    </Field>
+    <Field id="apiKeyHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+        <Label>Generate a key on your UniFi OS console: Settings -&gt; Control Plane -&gt; Integrations -&gt; Create API Key.</Label>
+    </Field>
+
+    <Field id="sep2" type="separator"/>
+
+    <Field id="verifySSL" type="checkbox" defaultValue="false">
+        <Label>Verify SSL certificate:</Label>
+        <Description>Require a trusted TLS certificate</Description>
+    </Field>
+    <Field id="verifySSLHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+        <Label>UniFi OS consoles serve a self-signed certificate by default. Leave unchecked unless you have installed your own trusted certificate.</Label>
+    </Field>
+
+    <Field id="sep3" type="separator"/>
+
+    <Field id="showDebugInfo" type="checkbox" defaultValue="false">
+        <Label>Enable debug logging:</Label>
+        <Description>Show detailed API/WebSocket activity in the Event Log</Description>
+    </Field>
+</PluginConfig>

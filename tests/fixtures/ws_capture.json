@@ -1,0 +1,177 @@
+[
+  {
+    "recvLocal": "16:02:39",
+    "frame": 1,
+    "message": {
+      "type": "add",
+      "item": {
+        "id": "9b5f3607-d8d6-4ddf-b17d-8cde369e4327",
+        "modelKey": "event",
+        "type": "smartDetectZone",
+        "start": 1787756557629,
+        "device": "69ed1b24002f7f03e407c90a",
+        "smartDetectTypes": [
+          "person"
+        ]
+      }
+    }
+  },
+  {
+    "recvLocal": "16:02:40",
+    "frame": 2,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "9b5f3607-d8d6-4ddf-b17d-8cde369e4327",
+        "type": "smartDetectZone",
+        "start": 1787756557629,
+        "device": "69ed1b24002f7f03e407c90a",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "16:02:46",
+    "frame": 3,
+    "message": {
+      "type": "add",
+      "item": {
+        "id": "bd8282c1-8249-4cf8-9dd1-7e38707f1f3c",
+        "modelKey": "event",
+        "type": "smartDetectZone",
+        "start": 1787756563350,
+        "device": "69bea2c1001d4703e4002686",
+        "smartDetectTypes": [
+          "person"
+        ]
+      }
+    }
+  },
+  {
+    "recvLocal": "16:02:46",
+    "frame": 4,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "bd8282c1-8249-4cf8-9dd1-7e38707f1f3c",
+        "type": "smartDetectZone",
+        "start": 1787756563350,
+        "device": "69bea2c1001d4703e4002686",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "16:02:54",
+    "frame": 5,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "9b5f3607-d8d6-4ddf-b17d-8cde369e4327",
+        "type": "smartDetectZone",
+        "start": 1787756557629,
+        "end": 1787756568153,
+        "device": "69ed1b24002f7f03e407c90a",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "16:02:54",
+    "frame": 6,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "9b5f3607-d8d6-4ddf-b17d-8cde369e4327",
+        "type": "smartDetectZone",
+        "start": 1787756557629,
+        "end": 1787756568153,
+        "device": "69ed1b24002f7f03e407c90a",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "16:02:54",
+    "frame": 7,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "9b5f3607-d8d6-4ddf-b17d-8cde369e4327",
+        "type": "smartDetectZone",
+        "start": 1787756557629,
+        "end": 1787756568153,
+        "device": "69ed1b24002f7f03e407c90a",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "16:03:01",
+    "frame": 8,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "bd8282c1-8249-4cf8-9dd1-7e38707f1f3c",
+        "type": "smartDetectZone",
+        "start": 1787756563350,
+        "device": "69bea2c1001d4703e4002686",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "16:03:01",
+    "frame": 9,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "bd8282c1-8249-4cf8-9dd1-7e38707f1f3c",
+        "type": "smartDetectZone",
+        "start": 1787756563350,
+        "end": 1787756574537,
+        "device": "69bea2c1001d4703e4002686",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "16:03:02",
+    "frame": 10,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "bd8282c1-8249-4cf8-9dd1-7e38707f1f3c",
+        "type": "smartDetectZone",
+        "start": 1787756563350,
+        "end": 1787756574537,
+        "device": "69bea2c1001d4703e4002686",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  }
+]

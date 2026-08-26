@@ -1,0 +1,190 @@
+[
+ {
+  "id": "69be54f600574703e4000ff4",
+  "modelKey": "camera",
+  "state": "CONNECTED",
+  "name": "Side Path",
+  "type": "UVC G5 Turret Ultra",
+  "guid": "00000000-0000-4000-8000-000000000000",
+  "mac": "AABBCC000001",
+  "isMicEnabled": true,
+  "osdSettings": {
+   "isNameEnabled": false,
+   "isDateEnabled": false,
+   "isLogoEnabled": true,
+   "isDebugEnabled": false,
+   "overlayLocation": "topLeft"
+  },
+  "ledSettings": {
+   "isEnabled": false,
+   "welcomeLed": true,
+   "floodLed": true
+  },
+  "micVolume": 100,
+  "activePatrolSlot": null,
+  "videoMode": "slowShutter",
+  "hdrType": "auto",
+  "featureFlags": {
+   "supportFullHdSnapshot": false,
+   "hasHdr": true,
+   "smartDetectTypes": [
+    "person",
+    "vehicle",
+    "animal"
+   ],
+   "smartDetectAudioTypes": [
+    "alrmSmoke",
+    "alrmCmonx",
+    "alrmBabyCry",
+    "alrmSpeak"
+   ],
+   "videoModes": [
+    "default",
+    "sport",
+    "slowShutter"
+   ],
+   "hasMic": true,
+   "hasLedStatus": true,
+   "hasSpeaker": false
+  },
+  "smartDetectSettings": {
+   "objectTypes": [
+    "person",
+    "vehicle",
+    "animal"
+   ],
+   "audioTypes": [
+    "alrmSmoke",
+    "alrmCmonx",
+    "alrmBabyCry",
+    "alrmSpeak"
+   ]
+  },
+  "hasPackageCamera": false
+ },
+ {
+  "id": "69bea2c1001d4703e4002686",
+  "modelKey": "camera",
+  "state": "CONNECTED",
+  "name": "Patio",
+  "type": "UVC G5 Turret Ultra",
+  "guid": "00000000-0000-4000-8000-000000000000",
+  "mac": "AABBCC000002",
+  "isMicEnabled": true,
+  "osdSettings": {
+   "isNameEnabled": false,
+   "isDateEnabled": false,
+   "isLogoEnabled": true,
+   "isDebugEnabled": false,
+   "overlayLocation": "topLeft"
+  },
+  "ledSettings": {
+   "isEnabled": false,
+   "welcomeLed": true,
+   "floodLed": true
+  },
+  "micVolume": 100,
+  "activePatrolSlot": null,
+  "videoMode": "default",
+  "hdrType": "auto",
+  "featureFlags": {
+   "supportFullHdSnapshot": false,
+   "hasHdr": true,
+   "smartDetectTypes": [
+    "person",
+    "vehicle",
+    "animal"
+   ],
+   "smartDetectAudioTypes": [
+    "alrmSmoke",
+    "alrmCmonx",
+    "alrmBabyCry",
+    "alrmSpeak"
+   ],
+   "videoModes": [
+    "default",
+    "sport",
+    "slowShutter"
+   ],
+   "hasMic": true,
+   "hasLedStatus": true,
+   "hasSpeaker": false
+  },
+  "smartDetectSettings": {
+   "objectTypes": [
+    "person",
+    "vehicle",
+    "animal"
+   ],
+   "audioTypes": [
+    "alrmSmoke",
+    "alrmCmonx",
+    "alrmBabyCry",
+    "alrmSpeak"
+   ]
+  },
+  "hasPackageCamera": false
+ },
+ {
+  "id": "69ed1b24002f7f03e407c90a",
+  "modelKey": "camera",
+  "state": "CONNECTED",
+  "name": "Side Patio",
+  "type": "UVC G5 Bullet",
+  "guid": "00000000-0000-4000-8000-000000000001",
+  "mac": "AABBCC000003",
+  "isMicEnabled": true,
+  "osdSettings": {
+   "isNameEnabled": false,
+   "isDateEnabled": true,
+   "isLogoEnabled": false,
+   "isDebugEnabled": false,
+   "overlayLocation": "topLeft"
+  },
+  "ledSettings": {
+   "isEnabled": true,
+   "welcomeLed": true,
+   "floodLed": true
+  },
+  "micVolume": 100,
+  "activePatrolSlot": null,
+  "videoMode": "slowShutter",
+  "hdrType": "on",
+  "featureFlags": {
+   "supportFullHdSnapshot": false,
+   "hasHdr": true,
+   "smartDetectTypes": [
+    "person",
+    "vehicle",
+    "animal"
+   ],
+   "smartDetectAudioTypes": [
+    "alrmSmoke",
+    "alrmCmonx",
+    "alrmBabyCry",
+    "alrmSpeak"
+   ],
+   "videoModes": [
+    "default",
+    "sport",
+    "slowShutter"
+   ],
+   "hasMic": true,
+   "hasLedStatus": false,
+   "hasSpeaker": false
+  },
+  "smartDetectSettings": {
+   "objectTypes": [
+    "person",
+    "vehicle",
+    "animal"
+   ],
+   "audioTypes": [
+    "alrmSmoke",
+    "alrmCmonx",
+    "alrmBabyCry"
+   ]
+  },
+  "hasPackageCamera": false
+ }
+]

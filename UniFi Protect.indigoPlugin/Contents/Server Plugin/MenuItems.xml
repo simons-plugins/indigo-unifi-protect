@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<MenuItems>
+	<MenuItem id="discoverCameras">
+		<Name>Discover Cameras</Name>
+        <CallbackMethod>discoverCameras</CallbackMethod>
+	</MenuItem>
+	<MenuItem id="sep1"/>
+	<MenuItem id="toggleDebug">
+		<Name>Toggle Debug Logging</Name>
+        <CallbackMethod>toggleDebug</CallbackMethod>
+	</MenuItem>
+</MenuItems>
