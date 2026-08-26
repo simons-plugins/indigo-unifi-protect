@@ -1,0 +1,21 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pytest
+        run: pip install pytest
+      # The plugin itself is stdlib-only; pytest is the sole dev dependency.
+      - name: Run tests
+        run: python -m pytest tests/ -q

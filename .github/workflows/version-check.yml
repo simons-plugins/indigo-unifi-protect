@@ -1,0 +1,89 @@
+name: Version Check
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine plugin bundle
+        id: get_plugin
+        run: |
+          PLUGIN_BUNDLE_PATH=$(find . -maxdepth 1 -iname "*.indigoPlugin" -type d | head -1)
+          if [ -z "$PLUGIN_BUNDLE_PATH" ]; then
+            echo "Error: No .indigoPlugin directory found in repository root." >&2
+            exit 1
+          fi
+          PLUGIN_BUNDLE=$(basename "$PLUGIN_BUNDLE_PATH")
+          echo "plugin_bundle=$PLUGIN_BUNDLE" >> $GITHUB_OUTPUT
+          echo "Detected plugin bundle: $PLUGIN_BUNDLE"
+
+      - name: Extract version from Info.plist
+        id: get_version
+        run: |
+          PLUGIN_BUNDLE="${{ steps.get_plugin.outputs.plugin_bundle }}"
+          VERSION=$(grep -A1 '<key>PluginVersion</key>' "${PLUGIN_BUNDLE}/Contents/Info.plist" | grep '<string>' | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
+          if [ -z "$VERSION" ]; then
+            echo "Error: Could not extract PluginVersion from Info.plist." >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
+      - name: Check if tag already exists
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Version v$VERSION already exists as a git tag. Please update the PluginVersion in Info.plist."
+            exit 1
+          fi
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "::error::Version $VERSION already exists as a git tag. Please update the PluginVersion in Info.plist."
+            exit 1
+          fi
+          echo "✓ Version $VERSION is new and can be released."
+
+      - name: Validate Info.plist version keys
+        run: |
+          PLIST=$(find . -maxdepth 3 -ipath "*.indigoplugin/Contents/Info.plist" | head -1)
+          if [ -z "$PLIST" ]; then
+            echo "::error::No .indigoPlugin/Contents/Info.plist found." >&2
+            exit 1
+          fi
+          read_key() { grep -A1 "<key>$1</key>" "$PLIST" | grep '<string>' | sed 's/.*<string>\(.*\)<\/string>.*/\1/'; }
+          PLUGIN_VERSION=$(read_key PluginVersion)
+          BUNDLE_VERSION=$(read_key CFBundleVersion)
+          fail=0
+          # Plugin Developer's Guide, "General Rules": version numbers in Info.plist
+          # must be of the form X.Y.Z — digits and periods only, no beta or
+          # pre-release signifiers.
+          for pair in "PluginVersion:$PLUGIN_VERSION" "CFBundleVersion:$BUNDLE_VERSION"; do
+            key=${pair%%:*}; val=${pair#*:}
+            if [ -z "$val" ]; then
+              echo "::error::$key is missing from $PLIST."; fail=1; continue
+            fi
+            if ! printf '%s' "$val" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::$key is '$val'. The Plugin Developer's Guide requires the form X.Y.Z — digits and periods only, no beta or pre-release signifiers."
+              fail=1
+            fi
+          done
+          # UNDOCUMENTED store limit: the Plugin Store keeps CFBundleVersion in a
+          # varchar(8) column. Longer values fail ingestion with "1406 (22001): Data
+          # too long for column 'bundleVersion'" and the store silently stops picking
+          # up releases. Note 2026.2.12 satisfies X.Y.Z yet still breaks it, which is
+          # why this needs its own check.
+          if [ -n "$BUNDLE_VERSION" ] && [ ${#BUNDLE_VERSION} -gt 8 ]; then
+            echo "::error::CFBundleVersion '$BUNDLE_VERSION' is ${#BUNDLE_VERSION} characters; the Plugin Store column holds 8. Per the Plugin Developer's Guide CFBundleVersion 'represents the layout of the bundle' and 'is controlled by us' (Indigo Domotics) — it is not your release version (that is PluginVersion). Use a short static value such as 1.0.0 and do not bump it per release."
+            fail=1
+          fi
+          [ $fail -eq 0 ] || exit 1
+          echo "PluginVersion=$PLUGIN_VERSION  CFBundleVersion=$BUNDLE_VERSION (${#BUNDLE_VERSION} chars) - OK"
