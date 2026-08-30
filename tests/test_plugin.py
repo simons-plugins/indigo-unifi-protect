@@ -344,6 +344,16 @@ def test_every_written_state_is_declared_and_legal(fake_indigo):
     plug.tracker.handle({"type": "add", "item": {
         "id": "e2", "device": "cam-1", "type": "smartAudioDetect", "start": 1787756557630,
         "smartDetectTypes": ["alrmSpeak", "alrmBabyCry", "alrmSmoke", "alrmCmonx"]}})
+    # Populate camera_info too, so the issue #4 hardware/config states
+    # (cameraModel, videoMode, hdrType, micEnabled, micVolume, ledEnabled,
+    # osdNameEnabled, osdDateEnabled) are actually exercised here rather
+    # than silently exempted the way snapshotPath is below.
+    plug.camera_info = {"cam-1": {
+        "type": "UVC G5 Turret Ultra", "videoMode": "default", "hdrType": "auto",
+        "isMicEnabled": True, "micVolume": 100,
+        "ledSettings": {"isEnabled": True},
+        "osdSettings": {"isNameEnabled": True, "isDateEnabled": True},
+    }}
     plug._apply_camera_state("cam-1", force=True)
 
     written = {entry["key"] for batch in dev.state_writes for entry in batch}
@@ -678,3 +688,201 @@ def test_pump_logs_unknown_type_once_per_type_debug_vs_warning(fake_indigo, capl
         "a genuinely unrecognized type must log WARNING exactly once, not per frame"
     )
     assert len(records("DEBUG", "bogus")) == 0
+
+
+# ---------------------------------------------------------------------
+# Issue #4: camera hardware/config states + dev.model.
+#
+# The question, per workspace convention: when could this write a
+# fabricated hardware value, or clobber a real one, instead of admitting
+# it doesn't know?
+# ---------------------------------------------------------------------
+
+def _first_fixture_camera():
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).parent / "fixtures" / "cameras.json"
+    with open(path) as f:
+        return json.load(f)[0]
+
+
+def test_camera_info_states_written_from_real_fixture(fake_indigo):
+    """The first camera in the live-captured fixture: all eight camera-info
+    states must land with the right values and types."""
+    camera = _first_fixture_camera()
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug, camera_id=camera["id"])
+    plug.camera_info = {camera["id"]: camera}
+    plug.socket = object()
+
+    plug._apply_camera_state(camera["id"], force=True)
+
+    assert dev.states["cameraModel"] == "UVC G5 Turret Ultra"
+    assert dev.states["videoMode"] == "slowShutter"
+    assert dev.states["hdrType"] == "auto"
+    assert dev.states["micEnabled"] is True
+    assert dev.states["micVolume"] == 100
+    assert isinstance(dev.states["micVolume"], int)
+    assert dev.states["ledEnabled"] is False
+    assert dev.states["osdNameEnabled"] is False
+    assert dev.states["osdDateEnabled"] is False
+
+
+def test_camera_info_states_from_hand_built_object(fake_indigo):
+    """A hand-built object exercising values not present in the fixture:
+    slowShutter video mode, LED off, OSD date ON."""
+    info = {
+        "type": "UVC G5 Turret Ultra",
+        "videoMode": "slowShutter",
+        "hdrType": "off",
+        "isMicEnabled": False,
+        "micVolume": 100,
+        "ledSettings": {"isEnabled": False},
+        "osdSettings": {"isNameEnabled": True, "isDateEnabled": True},
+    }
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.camera_info = {"cam-1": info}
+    plug.socket = object()
+
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert dev.states["videoMode"] == "slowShutter"
+    assert dev.states["ledEnabled"] is False
+    assert dev.states["osdDateEnabled"] is True
+    assert dev.states["osdNameEnabled"] is True
+    assert dev.states["micEnabled"] is False
+    assert dev.states["micVolume"] == 100
+
+
+def test_camera_info_states_untouched_when_info_unavailable(fake_indigo):
+    """A dead camera_info lookup must not overwrite last-known hardware
+    states with a fabricated False/"" -- cameraState already says
+    unavailable, and leaving these alone is the honest choice."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.camera_info = {"cam-1": {
+        "type": "UVC G5 Turret Ultra", "videoMode": "default", "hdrType": "auto",
+        "isMicEnabled": True, "micVolume": 42,
+        "ledSettings": {"isEnabled": True},
+        "osdSettings": {"isNameEnabled": True, "isDateEnabled": True},
+    }}
+    plug.socket = object()
+    plug._apply_camera_state("cam-1", force=True)
+    assert dev.states["cameraModel"] == "UVC G5 Turret Ultra"
+
+    # The lookup goes away entirely (e.g. a failed refresh left camera_info
+    # empty) and the socket also drops.
+    plug.camera_info = {}
+    plug._apply_camera_state("cam-1", connected=False, force=True)
+
+    assert dev.states["cameraState"] == plugin_module.STATE_UNAVAILABLE
+    assert dev.states["cameraModel"] == "UVC G5 Turret Ultra", "last-known model must survive"
+    assert dev.states["micVolume"] == 42, "last-known mic volume must survive"
+
+    last_batch = dev.state_writes[-1]
+    written_keys = {entry["key"] for entry in last_batch}
+    for key in ("cameraModel", "videoMode", "hdrType", "micEnabled",
+                "micVolume", "ledEnabled", "osdNameEnabled", "osdDateEnabled"):
+        assert key not in written_keys, f"{key} must not be re-written when info is unavailable"
+
+
+def test_camera_info_missing_nested_objects_defaults_booleans_false(fake_indigo):
+    """ledSettings/osdSettings absent entirely (not just missing keys inside
+    them) must not raise, and must read as False."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.camera_info = {"cam-1": {"type": "UVC G5 Bullet"}}
+    plug.socket = object()
+
+    plug._apply_camera_state("cam-1", force=True)   # must not raise
+
+    assert dev.states["ledEnabled"] is False
+    assert dev.states["osdNameEnabled"] is False
+    assert dev.states["osdDateEnabled"] is False
+    assert dev.states["micEnabled"] is False
+    assert dev.states["cameraModel"] == "UVC G5 Bullet"
+
+
+def test_bad_mic_volume_is_skipped_not_defaulted(fake_indigo):
+    """A non-numeric micVolume must be skipped, not coerced to a fabricated
+    0 -- 0 is a real, meaningful mic volume."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.camera_info = {"cam-1": {
+        "type": "UVC G5 Turret Ultra", "videoMode": "default", "hdrType": "auto",
+        "isMicEnabled": True, "micVolume": "not-a-number",
+        "ledSettings": {"isEnabled": True},
+        "osdSettings": {"isNameEnabled": False, "isDateEnabled": False},
+    }}
+    plug.socket = object()
+
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert "micVolume" not in dev.states
+    for key in ("cameraModel", "videoMode", "hdrType", "micEnabled",
+                "ledEnabled", "osdNameEnabled", "osdDateEnabled"):
+        assert key in dev.states, f"{key} must still be written even when micVolume is bad"
+
+
+def test_dev_model_set_and_replace_on_server_called_once_when_type_differs(fake_indigo):
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    assert dev.model == "Protect Camera"
+    plug.camera_info = {"cam-1": {"type": "UVC G5 Turret Ultra"}}
+    plug.socket = object()
+
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert dev.model == "UVC G5 Turret Ultra"
+    assert dev.replace_on_server_calls == 1
+
+
+def test_dev_model_not_replaced_again_when_type_unchanged(fake_indigo):
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.camera_info = {"cam-1": {"type": "UVC G5 Turret Ultra"}}
+    plug.socket = object()
+
+    plug._apply_camera_state("cam-1", force=True)
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert dev.replace_on_server_calls == 1, (
+        "a second write with the same type must not re-call replaceOnServer"
+    )
+
+
+def test_dev_model_not_touched_when_type_missing_or_empty(fake_indigo):
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.socket = object()
+
+    plug.camera_info = {"cam-1": {"type": ""}}
+    plug._apply_camera_state("cam-1", force=True)
+    assert dev.model == "Protect Camera"
+    assert dev.replace_on_server_calls == 0
+
+    plug.camera_info = {"cam-1": {}}   # no 'type' key at all
+    plug._apply_camera_state("cam-1", force=True)
+    assert dev.model == "Protect Camera"
+    assert dev.replace_on_server_calls == 0
+
+
+def test_replace_on_server_failure_does_not_prevent_state_write(fake_indigo):
+    """Fatal-collaborator form: replaceOnServer raises. The state write
+    above it must still have happened, and the exception must not
+    propagate out of _apply_camera_state."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+
+    def boom():
+        raise RuntimeError("server busy")
+
+    dev.replaceOnServer = boom
+    plug.camera_info = {"cam-1": {"type": "UVC G5 Turret Ultra"}}
+    plug.socket = object()
+
+    plug._apply_camera_state("cam-1", force=True)   # must not raise
+
+    assert dev.states["cameraModel"] == "UVC G5 Turret Ultra", "state write must still land"
