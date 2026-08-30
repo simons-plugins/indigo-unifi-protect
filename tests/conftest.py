@@ -42,10 +42,12 @@ class _FakeDevice:
         self.enabled = enabled
         self.states = {}
         self.deviceTypeId = "protectCamera"
+        self.model = "Protect Camera"
         # Full history, so a test can assert on the *sequence* of writes and
         # not merely the final resting state.
         self.state_writes = []
         self.image_writes = []
+        self.replace_on_server_calls = 0
 
     def updateStateOnServer(self, key, value=None, **kwargs):
         self.states[key] = value
@@ -58,6 +60,9 @@ class _FakeDevice:
 
     def updateStateImageOnServer(self, image):
         self.image_writes.append(image)
+
+    def replaceOnServer(self):
+        self.replace_on_server_calls += 1
 
 
 class _FakeDevices:
