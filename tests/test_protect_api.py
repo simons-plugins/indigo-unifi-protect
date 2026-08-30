@@ -253,6 +253,109 @@ def test_get_snapshot_supports_high_quality_false_never_retries_on_400(monkeypat
 
 
 # ---------------------------------------------------------------------
+# patch_camera -- the plugin's first write path (issue #6)
+# ---------------------------------------------------------------------
+
+def test_patch_camera_sends_patch_json_body_content_type_and_key_not_in_url(monkeypatch):
+    mock_urlopen = MagicMock(
+        return_value=_FakeResponse(json.dumps({"id": "cam1", "videoMode": "sport"}).encode()))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api(api_key="secret-key")
+    result = api.patch_camera("cam1", {"videoMode": "sport"})
+
+    assert result == {"id": "cam1", "videoMode": "sport"}
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "PATCH"
+    assert json.loads(request.data.decode("utf-8")) == {"videoMode": "sport"}
+    assert request.get_header("Content-type") == "application/json"
+    assert request.get_header("X-api-key") == "secret-key"
+    assert "secret-key" not in request.full_url
+
+
+def test_patch_camera_400_ajv_error_is_bad_request_with_issues(monkeypatch):
+    ajv_body = json.dumps({
+        "error": "Failed to parse 'request-body'",
+        "name": "AJV_PARSE_ERROR",
+        "entity": "request-body",
+        "issues": [{"instancePath": "/videoMode",
+                     "message": "must be equal to one of the allowed values",
+                     "keyword": "enum"}],
+        "body": {"videoMode": "bogus"},
+        "isUserError": True,
+    }).encode()
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(side_effect=http_error(400, body=ajv_body)))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.patch_camera("cam1", {"videoMode": "bogus"})
+
+    exc = excinfo.value
+    assert exc.kind == "bad_request"
+    assert exc.issues == ["/videoMode: must be equal to one of the allowed values"]
+
+
+def test_patch_camera_404_unknown_camera_has_no_issues(monkeypatch):
+    body = json.dumps({"error": "Entity 'camera' not found", "name": "NOT_FOUND"}).encode()
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(side_effect=http_error(404, body=body)))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.patch_camera("unknown-cam", {"videoMode": "sport"})
+
+    assert excinfo.value.kind == "not_found"
+    assert excinfo.value.issues == []
+
+
+def test_issues_empty_for_non_json_body():
+    """A 400 whose body isn't JSON at all (proxy error page, truncated
+    response) must not raise out of `.issues` -- it just has nothing to show.
+    """
+    exc = ProtectAPIError("HTTP 400 for /cameras/cam1", status=400, body="not json {{{")
+    assert exc.issues == []
+
+
+def test_issues_empty_when_body_has_no_issues_key():
+    exc = ProtectAPIError("HTTP 401 for /cameras/cam1", status=401,
+                           body=json.dumps({"error": "unauthorized"}))
+    assert exc.issues == []
+
+
+def test_issues_defaults_missing_instance_path_to_root():
+    exc = ProtectAPIError("HTTP 400", status=400, body=json.dumps(
+        {"issues": [{"message": "request body must be an object"}]}))
+    assert exc.issues == ["/: request body must be an object"]
+
+
+def test_patch_camera_non_dict_response_raises(monkeypatch):
+    monkeypatch.setattr(
+        "protect_api.urllib.request.urlopen",
+        MagicMock(return_value=_FakeResponse(json.dumps(["not", "a", "dict"]).encode())))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError):
+        api.patch_camera("cam1", {"videoMode": "sport"})
+
+
+def test_patch_camera_fake_api_key_never_appears_in_exception(monkeypatch):
+    monkeypatch.setattr(
+        "protect_api.urllib.request.urlopen",
+        MagicMock(side_effect=http_error(400, body=b'{"error":"bad request"}')))
+
+    api = make_api(api_key=FAKE_KEY)
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.patch_camera("cam1", {"videoMode": "sport"})
+
+    exc = excinfo.value
+    assert FAKE_KEY not in str(exc)
+    assert FAKE_KEY not in exc.body
+    assert FAKE_KEY not in exc.url
+    assert FAKE_KEY not in repr(exc)
+
+
+# ---------------------------------------------------------------------
 # SECURITY -- the API key must never leak into anything this module
 # raises or logs. This is a regression guard, not a happy-path check.
 # ---------------------------------------------------------------------
