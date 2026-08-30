@@ -108,6 +108,34 @@ acts on motion **must gate on `connected` first**, or a dead socket reads
 as an empty, quiet house. This is the single most important thing to know
 before wiring this plugin into an automation.
 
+### Audio detection
+
+Cameras with a microphone also report **audio events** — speech, a baby
+crying, or a smoke/CO alarm sounding — over the same event socket as
+motion, but tracked completely separately:
+
+- `audioDetected` is true while any audio event is active on the camera
+  (even before Protect has classified *what* it heard — classification
+  lands about a second after the event starts).
+- `speechDetected`, `babyCryDetected`, `smokeAlarmDetected`, and
+  `coAlarmDetected` are true when that specific type is part of the
+  currently active audio event(s).
+- `lastAudio` / `lastAudioTypes` record the most recent audio event, the
+  same way `lastMotion` / `lastDetectTypes` do for motion.
+
+**By default, `onOffState` — what a "device turned on" trigger watches —
+goes on for motion, speech, or a baby crying.** Uncheck **Audio counts as
+activity** on the device to exclude speech/baby-cry and have `onOffState`
+track motion only. **A smoke or CO alarm sound never turns the device on**,
+checkbox or not — build automations against `smokeAlarmDetected` /
+`coAlarmDetected` directly, not against `onOffState`, so a real alarm is
+never mistaken for (or buried under) routine motion/presence handling.
+
+The same `connected` gating above applies here too: when the event socket
+is down, every audio state goes False/empty exactly like `motionDetected`
+does. Silence is not safety — it can just as easily mean the plugin can't
+hear anything right now.
+
 ## Latency
 
 Motion detection rides the Protect event WebSocket, not polling. Measured

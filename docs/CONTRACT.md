@@ -64,6 +64,42 @@ person). **Two traps it proves, both of which must be handled:**
    `update` with **no** `end` for an event whose `end` lands in frame 9. Treated
    naively it re-arms the sensor and it latches on forever.
 
+#### Two event families share this one socket
+
+`item.type` distinguishes them; `event_tracker.py` must inspect it, and
+originally did not — an audio "speech" event was folded into motion state
+because nothing looked at `item.type` at all. Motion and audio are otherwise
+identical in shape and lifecycle (add/update/end, epoch-ms timestamps, ids
+unique across both families).
+
+- **Motion**: `item.type` in `{"motion", "smartDetectZone", "smartDetectLine",
+  "smartDetectLoiterZone"}`, `smartDetectTypes` ⊂ `{person, vehicle, animal}`
+  (empty for the plain `motion` type, which carries none). Only
+  `smartDetectZone` has been observed on the reference rig; the other three
+  come from Protect's published OpenAPI spec, not proven on the wire.
+- **Audio**: `item.type` is `smartAudioDetect`, `smartDetectTypes` ⊂
+  `{alrmSmoke, alrmCmonx, alrmBabyCry, alrmSpeak}`. Only `alrmSpeak` has been
+  observed live; `alrmSmoke`/`alrmCmonx` remain unverified on the wire.
+- Any other `item.type` (including missing/non-string, and documented-but-
+  unhandled types like doorbell `ring` or Protect sensor events) must be
+  **ignored and counted**, never folded into either family.
+
+**Three wire facts, proven live on 2026-08-26 by speaking near a camera
+(the "Side Path" camera, UNVR 7.2.105):**
+
+1. Audio's `item.type` is `smartAudioDetect`.
+2. The audio `add` frame carries an **EMPTY** `smartDetectTypes` — the
+   actual classification (e.g. `alrmSpeak`) arrives on the first `update`,
+   roughly a second later. This is not malformed; the event is "active but
+   unclassified" in between.
+3. Audio event ids are **24-char hex** (e.g. `6a8f49ac03d53b03e402a148`),
+   not UUIDs like motion event ids.
+
+Real capture in `tests/fixtures/ws_capture_audio.json` (13 frames: 10
+`smartDetectZone` across the same two cameras as `ws_capture.json`,
+interleaved with 3 `smartAudioDetect` frames for a third camera). Frames 3-5
+are the audio add/classify/end sequence proving facts 1-2 above.
+
 ---
 
 ## `protect_api.py`
@@ -194,37 +230,48 @@ fully unit-testable.
 
 ```python
 class EventTracker:
-    """Folds the Protect event stream into per-camera motion state."""
+    """Folds the Protect event stream into per-camera MOTION and AUDIO
+    state, tracked as two fully independent families."""
 
     def __init__(self, finished_cap: int = 512) -> None: ...
 
     def handle(self, message: dict) -> set[str]:
         """Apply one WS message. Return the set of camera ids whose derived
         state CHANGED as a result (empty set when nothing changed — which is
-        the correct outcome for a duplicate or stale frame).
+        the correct outcome for a duplicate or stale frame, or a frame of
+        an item.type this tracker doesn't act on).
 
-        A camera counts as changed when EITHER of two independent things
-        changed: its active/idle flag, OR the union of detect types
-        (person/vehicle/animal/...) across its active events. A camera with
-        an active "person" event that then also picks up an active "vehicle"
-        event does not flip active/idle, but its detect-type union did
-        change, and the caller (which only writes Indigo states for cameras
-        in the returned set) needs to know — otherwise a second concurrent
-        detect type (e.g. vehicleDetected) never becomes True during an
-        overlap with an already-active event.
+        A camera counts as changed when ANY of four independent things
+        changed: the MOTION active/idle flag, the MOTION detect-type union,
+        the AUDIO active/idle flag, or the AUDIO detect-type union. A camera
+        with an active "person" event that then also picks up an active
+        "vehicle" event does not flip active/idle, but its detect-type
+        union did change, and the caller (which only writes Indigo states
+        for cameras in the returned set) needs to know — otherwise a second
+        concurrent detect type (e.g. vehicleDetected) never becomes True
+        during an overlap with an already-active event. The same applies to
+        audio: classification lands on the `update` after the `add`, not on
+        the `add` itself, so speechDetected etc. depend on the type-union
+        case firing, not just the active/idle case.
 
         Malformed messages (missing 'item', missing 'device', non-dict) are
-        ignored and return an empty set. Never raise.
+        ignored and return an empty set. Never raise. A message whose
+        `item.type` is not a recognized MOTION or AUDIO type (missing,
+        non-string, or simply unhandled) is ALSO ignored and returns an
+        empty set, but is counted separately (`ignored_type_counts`) rather
+        than as malformed — the frame parsed fine, it just isn't a family
+        this tracker acts on.
         """
 
     @property
     def malformed_count(self) -> int:
         """Count of messages that could not be parsed at all and were
-        discarded (as opposed to tolerated/degraded and still processed).
-        Exists because an empty `handle()` return set alone can't
-        distinguish "duplicate frame, nothing to do" (correct, expected)
-        from "a frame was destroyed and something may have been lost"
-        (a stream-health problem worth surfacing)."""
+        discarded (as opposed to tolerated/degraded and still processed, or
+        ignored for an unrecognized item.type). Exists because an empty
+        `handle()` return set alone can't distinguish "duplicate frame,
+        nothing to do" (correct, expected) from "a frame was destroyed and
+        something may have been lost" (a stream-health problem worth
+        surfacing)."""
 
     @property
     def dropped_terminal_count(self) -> int:
@@ -235,44 +282,82 @@ class EventTracker:
         destroyed, and `malformed_count` alone doesn't tell the caller
         whether that's possible."""
 
+    @property
+    def ignored_type_counts(self) -> dict[str, int]:
+        """Count of frames whose `item.type` was not a recognized MOTION or
+        AUDIO type, keyed by the type string (`"<missing>"` when absent or
+        not a string). NOT included in `malformed_count` — these frames
+        parsed fine, they just aren't a family this tracker folds into
+        state. plugin.py surfaces new keys here as a log line, once per
+        type per run."""
+
     def is_active(self, camera_id: str) -> bool:
-        """True while >=1 unfinished event references this camera."""
+        """True while >=1 unfinished MOTION event references this camera."""
 
     def detect_types(self, camera_id: str) -> set[str]:
-        """Union of smartDetectTypes across this camera's active events.
-        Empty set when idle."""
+        """Union of smartDetectTypes across this camera's active MOTION
+        events. Empty set when idle."""
 
     def last_motion_ms(self, camera_id: str) -> int | None:
-        """Epoch-ms `start` of the most recent event seen for this camera,
-        active or not. None if never seen."""
+        """Epoch-ms `start` of the most recent MOTION event seen for this
+        camera, active or not. None if never seen."""
+
+    def audio_active(self, camera_id: str) -> bool:
+        """True while >=1 unfinished AUDIO event references this camera.
+        True from the `add` onward, even before classification lands —
+        an unclassified audio event still counts as active."""
+
+    def audio_types(self, camera_id: str) -> set[str]:
+        """Union of smartDetectTypes across this camera's active AUDIO
+        events. Empty set when idle, and also empty for an active-but-not-
+        yet-classified audio event."""
+
+    def last_audio_ms(self, camera_id: str) -> int | None:
+        """Epoch-ms `start` of the most recent AUDIO event seen for this
+        camera, active or not. None if never seen."""
 
     def clear_camera(self, camera_id: str) -> bool:
-        """Force a camera idle (used on socket loss). Returns True if it
-        was active."""
+        """Force a camera idle in BOTH families (used on socket loss).
+        Returns True if EITHER family was active."""
 
     def reset(self) -> None:
-        """Drop all state. Used on reconnect."""
+        """Drop all state, both families. Used on reconnect."""
 ```
 
 ### Required semantics
 
-1. `add` or `update` **without** `end` → the event is active for `item.device`
-   — **unless its id is already finished**, in which case ignore it entirely.
-   This is trap 2 and it is the single most important line in the module.
-2. `update` **with** `end` → mark the id finished, remove from active. Record
-   the id in a bounded structure (cap `finished_cap`, evict oldest) so repeats
-   and late keepalives stay suppressed without unbounded growth.
-3. A camera is active while it has ≥1 active event. Two overlapping events on
-   one camera must both clear before it goes idle.
-4. `detect_types` is the union over active events only.
+1. `add` or `update` **without** `end` → the event is active, in its
+   family, for `item.device` — **unless its id is already finished**, in
+   which case ignore it entirely. This is trap 2 and it is the single most
+   important line in the module. The finished-id cache is **shared** across
+   both families: motion and audio event ids are already globally unique
+   (UUIDs vs 24-char hex), so there is no need to key it per-family.
+2. `update` **with** `end` → mark the id finished, remove from that
+   family's active set. Record the id in a bounded structure (cap
+   `finished_cap`, evict oldest) so repeats and late keepalives stay
+   suppressed without unbounded growth.
+3. A camera is active (per family) while it has ≥1 active event in that
+   family. Two overlapping events on one camera, in the same family, must
+   both clear before that family goes idle. The two families never
+   interact: an active audio event never makes `is_active` true, and an
+   active motion event never makes `audio_active` true.
+4. `detect_types`/`audio_types` is the union over that family's active
+   events only.
 5. An `end` for an id never seen before still marks it finished (out-of-order
    arrival must not create an active event).
-6. `handle` returns changed-camera ids so the caller writes Indigo states only
+6. `item.type` selects the family BEFORE anything else runs: `{"motion",
+   "smartDetectZone", "smartDetectLine", "smartDetectLoiterZone"}` →
+   MOTION, `{"smartAudioDetect"}` → AUDIO, anything else → ignored and
+   counted in `ignored_type_counts`, with no further processing — an `end`
+   frame of an unrecognized type must not finish (or create) anything.
+7. `handle` returns changed-camera ids so the caller writes Indigo states only
    on real transitions — but "changed" is EITHER the active/idle flag OR the
-   detect-type union moving, not only active/idle transitions. (An earlier
-   version only fired on active/idle transitions; that was a real bug —
-   `vehicleDetected` never became True when a vehicle event overlapped an
-   already-active person event on the same camera.) A duplicate `end`
+   detect-type union moving, for EITHER family, not only active/idle
+   transitions. (An earlier version only fired on active/idle transitions;
+   that was a real bug — `vehicleDetected` never became True when a vehicle
+   event overlapped an already-active person event on the same camera. A
+   second, related bug folded audio events into motion state entirely,
+   because `item.type` was never inspected at all.) A duplicate `end`
    still returns an empty set.
 
 ---
@@ -306,18 +391,34 @@ The declared states are exactly:
 
 | State id | Type | Meaning |
 |---|---|---|
-| `motionDetected` | Boolean (OnOff) | mirrors `onState` |
-| `personDetected` | Boolean | `person` in active detect types |
-| `vehicleDetected` | Boolean | `vehicle` in active detect types |
-| `animalDetected` | Boolean | `animal` in active detect types |
+| `motionDetected` | Boolean | MOTION family active (person/vehicle/animal/plain motion) |
+| `personDetected` | Boolean | `person` in active MOTION detect types |
+| `vehicleDetected` | Boolean | `vehicle` in active MOTION detect types |
+| `animalDetected` | Boolean | `animal` in active MOTION detect types |
+| `audioDetected` | Boolean | AUDIO family active — true even while unclassified |
+| `speechDetected` | Boolean | `alrmSpeak` in active AUDIO detect types |
+| `babyCryDetected` | Boolean | `alrmBabyCry` in active AUDIO detect types |
+| `smokeAlarmDetected` | Boolean | `alrmSmoke` in active AUDIO detect types |
+| `coAlarmDetected` | Boolean | `alrmCmonx` in active AUDIO detect types |
 | `lastMotion` | String | ISO-8601 local time, `""` if never |
-| `lastDetectTypes` | String | comma-joined, e.g. `person,vehicle` |
+| `lastDetectTypes` | String | comma-joined MOTION types, e.g. `person,vehicle` |
+| `lastAudio` | String | ISO-8601 local time, `""` if never |
+| `lastAudioTypes` | String | comma-joined AUDIO types, e.g. `alrmSpeak` |
 | `cameraState` | String | Protect's `state`, e.g. `CONNECTED` |
 | `connected` | Boolean | **event socket** health, not the camera's |
 | `snapshotPath` | String | path written by the snapshot action |
 
-Set `onState` via `dev.updateStateOnServer("onOffState", value=<bool>)` and keep
-`motionDetected` in step. Batch multi-state writes with
+`onOffState` (the built-in on/off state) is `motionDetected` OR (the
+per-device `audioCountsAsActivity` checkbox, default True, AND active AUDIO
+types intersect `{alrmSpeak, alrmBabyCry}`). Smoke/CO alarm sounds NEVER
+contribute to `onOffState`, checkbox or not — an alarm is not presence, and
+folding it in would make a "device turned on" trigger fire on a smoke alarm.
+Everything is False/empty when `connected` is False, exactly as today.
+
+Set `onOffState` via `dev.updateStateOnServer("onOffState", value=<bool>)`
+and keep `motionDetected`/`audioDetected` in step. The state image
+(`MotionSensorTripped`/`MotionSensor`) tracks `onOffState`, not
+`motionDetected` alone. Batch multi-state writes with
 `dev.updateStatesOnServer([...])`.
 
 ---
@@ -339,6 +440,25 @@ adversarially — **"when could this report idle and be wrong?"**:
 - malformed messages (`{}`, missing `item`, `item` not a dict, missing
   `device`, missing `smartDetectTypes`) are ignored and never raise
 - `finished_cap` eviction does not resurrect a recently-ended event
+
+Issue #5 (audio) added `tests/fixtures/ws_capture_audio.json` (13 frames: 10
+`smartDetectZone` across the same two cameras as `ws_capture.json`,
+interleaved with 3 `smartAudioDetect` frames for a third, "Side Path",
+camera — captured 2026-08-26 by speaking near it), and must additionally
+cover:
+
+- the 13-frame capture replayed in order, asserting motion and audio never
+  bleed into each other on any camera at any frame
+- an unrecognized `item.type` (missing, non-string, or a documented-but-
+  unhandled type like `ring`) never activates either family and is counted
+  in `ignored_type_counts`, not `malformed_count`
+- trap 2 applies identically to audio: a stale post-end audio keepalive
+  does not re-arm `audio_active`
+- a motion event and an audio event on one camera are fully independent:
+  ending either leaves the other's state untouched
+- `clear_camera`/`reset` clear both families
+- `handle` reports changed when only the audio detect-type union moves
+  (empty → `{alrmSpeak}`), mirroring the motion-family overlap fix
 
 Per workspace convention, a degradation-path test must make the negative
 assertion **fatal**: to prove the tracker never consults the network, hand it a
