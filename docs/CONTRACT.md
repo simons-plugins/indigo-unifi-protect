@@ -428,8 +428,26 @@ The declared states are exactly:
 | `lastAudio` | String | ISO-8601 local time, `""` if never |
 | `lastAudioTypes` | String | comma-joined AUDIO types, e.g. `alrmSpeak` |
 | `cameraState` | String | Protect's `state`, e.g. `CONNECTED` |
+| `cameraModel` | String | camera object's `type`, e.g. `UVC G5 Turret Ultra` |
+| `videoMode` | String | camera object's `videoMode` |
+| `hdrType` | String | camera object's `hdrType` |
+| `micEnabled` | Boolean | camera object's `isMicEnabled` |
+| `micVolume` | Integer | camera object's `micVolume`; the key is skipped (not written) if it fails to parse as `int` |
+| `ledEnabled` | Boolean | camera object's `ledSettings.isEnabled` |
+| `osdNameEnabled` | Boolean | camera object's `osdSettings.isNameEnabled` |
+| `osdDateEnabled` | Boolean | camera object's `osdSettings.isDateEnabled` |
 | `connected` | Boolean | **event socket** health, not the camera's |
 | `snapshotPath` | String | path written by the snapshot action |
+
+The eight camera-info states above (issue #4) are read straight from the
+cached `GET /cameras` object (`self.camera_info`), not from the WS tracker.
+They are **only written when that object is available** — when the lookup
+has failed, `cameraState` already reports `STATE_UNAVAILABLE` and these eight
+are left at their last-known values rather than overwritten with a made-up
+False/`""` that would look like a fresh, confirmed read. `dev.model` is also
+set from `type` when it differs from the device's current model, via
+`dev.replaceOnServer()`; a failure there is logged at DEBUG and never blocks
+the state write, which always happens first.
 
 `onOffState` (the built-in on/off state) is `motionDetected` OR (the
 per-device `audioCountsAsActivity` checkbox, default True, AND active AUDIO
