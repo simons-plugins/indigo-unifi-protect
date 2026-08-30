@@ -31,6 +31,19 @@ def add_camera_device(fake_indigo, plug, camera_id="cam-1", dev_id=1001, name="P
     return dev
 
 
+def add_camera_device_with_props(fake_indigo, plug, extra_props,
+                                  camera_id="cam-1", dev_id=1001, name="Patio"):
+    """Like add_camera_device, but with extra pluginProps set — e.g.
+    audioCountsAsActivity."""
+    from conftest import _FakeDevice
+    props = {"cameraId": camera_id}
+    props.update(extra_props)
+    dev = _FakeDevice(dev_id, name=name, plugin_props=props)
+    fake_indigo.devices.add(dev)
+    plug.deviceStartComm(dev)
+    return dev
+
+
 # ---------------------------------------------------------------------
 # The worst bug found in review: an unconfigured plugin claiming health
 # ---------------------------------------------------------------------
@@ -323,8 +336,14 @@ def test_every_written_state_is_declared_and_legal(fake_indigo):
     dev = add_camera_device(fake_indigo, plug)
     plug.socket = object()          # make _is_connected() true
     plug.tracker.handle({"type": "add", "item": {
-        "id": "e1", "device": "cam-1", "start": 1787756557629,
+        "id": "e1", "device": "cam-1", "type": "smartDetectZone", "start": 1787756557629,
         "smartDetectTypes": ["person", "vehicle", "animal"]}})
+    # Drive an audio event too, so the audio-family states (audioDetected,
+    # the four specifics, lastAudio, lastAudioTypes) are actually exercised
+    # here rather than exempted like snapshotPath below.
+    plug.tracker.handle({"type": "add", "item": {
+        "id": "e2", "device": "cam-1", "type": "smartAudioDetect", "start": 1787756557630,
+        "smartDetectTypes": ["alrmSpeak", "alrmBabyCry", "alrmSmoke", "alrmCmonx"]}})
     plug._apply_camera_state("cam-1", force=True)
 
     written = {entry["key"] for batch in dev.state_writes for entry in batch}
@@ -421,3 +440,171 @@ def test_snapshot_dir_is_outside_the_plugin_bundle(fake_indigo, monkeypatch):
 
     assert ".indigoPlugin" not in path, "snapshots must not live inside the bundle"
     assert "Web Assets" in path, "must be under Web Assets so control pages can serve it"
+
+
+# ---------------------------------------------------------------------
+# Issue #5: audio detection states and onOffState presence logic.
+#
+# The question, per workspace convention: when could this report the
+# wrong onOffState, or fold something into motion/audio that shouldn't be?
+# ---------------------------------------------------------------------
+
+def _handle_audio(plug, camera_id, event_id, smart_types, start=1):
+    """Drive one audio add + one classifying update through the tracker,
+    the same two-frame shape the real wire uses (add carries EMPTY
+    smartDetectTypes; classification lands on the following update)."""
+    plug.tracker.handle({"type": "add", "item": {
+        "id": event_id, "device": camera_id, "type": "smartAudioDetect",
+        "start": start, "smartDetectTypes": []}})
+    plug.tracker.handle({"type": "update", "item": {
+        "id": event_id, "device": camera_id, "type": "smartAudioDetect",
+        "start": start, "smartDetectTypes": list(smart_types)}})
+
+
+def test_speech_counts_as_activity_by_default(fake_indigo):
+    """Speech on a connected camera: onOffState True, motionDetected False,
+    speechDetected/audioDetected True, and the state image tracks onOffState
+    (not motion-only), so it must trip on speech alone."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.socket = object()          # make _is_connected() true
+    _handle_audio(plug, "cam-1", "a1", ["alrmSpeak"])
+
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert dev.states["motionDetected"] is False
+    assert dev.states["audioDetected"] is True
+    assert dev.states["speechDetected"] is True
+    assert dev.states["babyCryDetected"] is False
+    assert dev.states["onOffState"] is True, "speech must count as activity by default"
+    assert dev.image_writes[-1] == indigo.kStateImageSel.MotionSensorTripped
+
+
+def test_speech_with_checkbox_off_does_not_count_as_activity(fake_indigo):
+    """audioCountsAsActivity=False must exclude speech from onOffState
+    without suppressing speechDetected itself -- the checkbox governs the
+    presence rollup, not the specific state."""
+    plug = make_plugin({})
+    dev = add_camera_device_with_props(
+        fake_indigo, plug, {"audioCountsAsActivity": False})
+    plug.socket = object()
+    _handle_audio(plug, "cam-1", "a1", ["alrmSpeak"])
+
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert dev.states["speechDetected"] is True
+    assert dev.states["onOffState"] is False, "checkbox off must exclude speech from onOffState"
+
+
+def test_smoke_alarm_never_counts_as_activity_even_with_checkbox_on(fake_indigo):
+    """A smoke/CO alarm sound must NEVER contribute to onOffState, checkbox
+    or not -- folding it in would make a 'device turned on' trigger fire on
+    a smoke alarm, burying a real alert under a routine motion notification.
+    """
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)   # audioCountsAsActivity defaults True
+    plug.socket = object()
+    _handle_audio(plug, "cam-1", "a1", ["alrmSmoke"])
+
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert dev.states["smokeAlarmDetected"] is True
+    assert dev.states["onOffState"] is False, (
+        "a smoke alarm sound must never turn the device on, checkbox or not"
+    )
+
+
+def test_unclassified_audio_is_audio_detected_but_no_specific_type(fake_indigo):
+    """The add frame's smartDetectTypes is always empty -- audioDetected
+    must go True immediately, before classification lands, but none of the
+    four specific states can be true for a type not yet known, and it must
+    not count as onOffState activity either."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.tracker.handle({"type": "add", "item": {
+        "id": "a1", "device": "cam-1", "type": "smartAudioDetect",
+        "start": 1, "smartDetectTypes": []}})
+
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert dev.states["audioDetected"] is True
+    assert dev.states["speechDetected"] is False
+    assert dev.states["babyCryDetected"] is False
+    assert dev.states["smokeAlarmDetected"] is False
+    assert dev.states["coAlarmDetected"] is False
+    assert dev.states["onOffState"] is False
+
+
+def test_disconnected_camera_reports_every_audio_state_false(fake_indigo):
+    """Even when the tracker still holds live audio state from before the
+    socket died, a disconnected camera must report every audio state
+    False/empty -- the same 'unknown, not no-activity' rule that already
+    applies to motionDetected."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    _handle_audio(plug, "cam-1", "a1", ["alrmSpeak"])
+
+    plug._apply_camera_state("cam-1", connected=False, force=True)
+
+    assert dev.states["audioDetected"] is False
+    assert dev.states["speechDetected"] is False
+    assert dev.states["babyCryDetected"] is False
+    assert dev.states["smokeAlarmDetected"] is False
+    assert dev.states["coAlarmDetected"] is False
+    assert dev.states["lastAudioTypes"] == ""
+    assert dev.states["onOffState"] is False
+
+
+def test_pump_logs_unknown_type_once_per_type_debug_vs_warning(fake_indigo, caplog):
+    """'ring' is a documented-but-unsupported type (doorbell) and must log
+    at DEBUG; 'bogus' is genuinely unrecognized and must log at WARNING.
+    Both must log exactly once per type no matter how many frames of that
+    type arrive, not once per frame.
+    """
+    plug = make_plugin({})
+    plug.cameras = {}
+
+    messages = [
+        {"item": {"id": "r1", "device": "camDoor", "type": "ring", "start": 1}},
+        {"item": {"id": "r2", "device": "camDoor", "type": "ring", "start": 2}},
+        {"item": {"id": "b1", "device": "camWeird", "type": "bogus", "start": 1}},
+        {"item": {"id": "b2", "device": "camWeird", "type": "bogus", "start": 2}},
+    ]
+
+    class FeedSocket:
+        last_frame_at = time.monotonic()
+
+        def __init__(self, msgs):
+            self._msgs = list(msgs)
+
+        def read_message(self, timeout=1.0):
+            if self._msgs:
+                return self._msgs.pop(0)
+            raise plug.StopThread()
+
+        def send_ping(self):
+            pass
+
+    plug.socket = FeedSocket(messages)
+
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(plug.StopThread):
+            plug._pump()
+
+    # Quoted, not a bare substring: "ring" is itself a substring of
+    # "Ignoring", so an unquoted needle would false-match the wrong record.
+    def records(level, event_type):
+        needle = f"'{event_type}'"
+        return [r for r in caplog.records if r.levelname == level and needle in r.getMessage()]
+
+    assert len(records("DEBUG", "ring")) == 1, (
+        "a documented-but-unsupported type must log DEBUG exactly once, not per frame"
+    )
+    assert len(records("WARNING", "ring")) == 0, (
+        "a documented type must not trigger the unknown-type warning"
+    )
+    assert len(records("WARNING", "bogus")) == 1, (
+        "a genuinely unrecognized type must log WARNING exactly once, not per frame"
+    )
+    assert len(records("DEBUG", "bogus")) == 0
