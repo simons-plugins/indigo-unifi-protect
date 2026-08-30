@@ -13,9 +13,23 @@ is the official UniFi Protect Integration API OpenAPI 3.1 document, downloaded
 publishes this per Protect version — swap `v6.2.83` in that URL for whatever
 version you're targeting. v6.2.83 was the newest version the docs site listed
 on 2026-08-31; everything else in this file was verified live against a
-controller running Protect **7.2.105**, which is newer than the spec. No
-diffs were found between what 7.2.105 does and what the v6.2.83 spec
-describes, except where noted below (`GET /nvrs`'s `armMode`).
+controller running Protect **7.2.105**, which is newer than the spec. Every
+known live-vs-spec gap is listed here, not just wherever it happens to come
+up below:
+
+- `GET /nvrs` returns `armMode`, plus `type`, `guid`, `mac` — none of the
+  four are in the spec's `nvr` schema (see the `GET /nvrs` section below).
+- Camera objects carry `guid`, `type`, `hasPackageCamera` live (and in
+  `CONTRACT.md`'s observed key list), none of which are in the spec's
+  `camera` schema. The RTSPS section below relies on `hasPackageCamera` —
+  flagged there too as undocumented.
+- `/v1/users` and `/v1/bridges` are live REST endpoints; neither path
+  exists in the spec (see the endpoint table below).
+- The observed `/subscribe/devices` `bridge` update frame carried `guid`,
+  which is not a property of the spec's `bridge` schema.
+- The live `PATCH` 400 error body (`issues`, `isUserError`,
+  `AJV_PARSE_ERROR`) is richer than the spec's generic `genericError` shape
+  (`error`, `name`, optional `cause`) — see Writes below.
 
 **The console itself serves no docs endpoint.** Probed 2026-08-31 against the
 same controller — all 404:
@@ -76,22 +90,32 @@ live.** Same treatment as `GET /nvrs`'s `armMode` (see below): observed on
 the real controller, absent from v6.2.83. Verified 2026-08-31 on 7.2.105:
 `GET /v1/users` → HTTP 200, a JSON array of user objects (`{id, name,
 firstName, lastName, email, ucoreUserId, modelKey: "user"}`); `GET
-/v1/bridges` → HTTP 200 `[]` on the reference rig. Neither path nor a `user`
-schema appears anywhere in v6.2.83 — `bridge` only exists there as a
-`modelKey` on `/subscribe/devices` (see below). Whether these were pulled
-from the documented surface in v6.2.83, or the spec has simply never listed
-them, is unknown; treat their shape as provisional, the same caveat as
-`armMode`.
+/v1/bridges` → HTTP 200 `[]` on the reference rig. `bridge` appears in
+v6.2.83 only inside the `/subscribe/devices` device union (schema: `id`,
+`modelKey`, `state`, `name`, `mac`) — there is no `/v1/bridges` path. There
+is no `user` object schema either (only a `userId` string used by
+`liveview.owner`). Whether these were pulled from the documented surface in
+v6.2.83, or the spec has simply never listed them, is unknown; treat their
+shape as provisional, the same caveat as `armMode`.
 
 ## Event types on `/subscribe/events`
 
-From the spec's `event` schema (a `oneOf` of 15 event shapes), common frame
-shape:
+From the spec's `event` schema (a `oneOf` of 16 event shapes) — this is the
+shape of the WS frame's `item`, not the frame itself. The wire frame is the
+envelope `{"type": "add"|"update", "item": <event>}` (see
+[`CONTRACT.md`](./CONTRACT.md) for a captured example). Common `item` shape:
 
 ```json
 {"id": "...", "modelKey": "event", "type": "<one of below>",
  "start": <epoch ms>, "end": <epoch ms>|null, "device": "<device id>"}
 ```
+
+`end` is optional **and** nullable in the spec — it is never in a type's
+`required` list, and it is simply absent on `add` frames (the event hasn't
+ended yet when it's created). That's the distinction `lightMotion`'s "no
+`end` at all" below is contrasted against: every other type *can* carry
+`end` (missing on `add`, `number` or `null` on `update`); `lightMotion` never
+has the property, on either frame type.
 
 Types: `motion`, `smartDetectZone`, `smartDetectLine`, `smartDetectLoiterZone`,
 `smartAudioDetect`, `ring`, `sensorMotion`, `sensorOpened`, `sensorClosed`,
@@ -112,7 +136,7 @@ Additions to the common shape, per type:
 - `sensorBatteryLow` adds `metadata.sensorBatteryPercentage.number`.
 - `lightMotion` has **no `end` field at all** in the spec — it is a fire-once
   signal, not a start/stop pair like the others.
-- `ring`, `sensorMotion`, `sensorTamper`, `sensorSmokeTest` carry no
+- `motion`, `ring`, `sensorMotion`, `sensorTamper`, `sensorSmokeTest` carry no
   additional fields.
 
 **Observed live on the reference rig so far: only `smartDetectZone` and
@@ -121,7 +145,7 @@ witnessed — the rig has no doorbell, no Protect sensors, no floodlights.
 
 `smartDetectTypes` object enum (from `cameraFeatureFlags.smartDetectTypes`
 and the zone/line/loiter event schemas): `person, vehicle, package,
-licensePlate, face, animal`. The reference cameras (UVC G5 Turret Ultra)
+licensePlate, face, animal`. The reference cameras (2× UVC G5 Turret Ultra, 1× UVC G5 Bullet — all three advertise the same sets)
 advertise `person, vehicle, animal` in `featureFlags.smartDetectTypes` (no
 package, license plate, or face support on this hardware).
 
@@ -139,9 +163,12 @@ Live test: a `PATCH ledSettings.isEnabled` on a camera produced exactly one
 `update` frame, whose `item` held only `id`, `modelKey`, and `ledSettings` —
 not the full camera object. An unrelated `bridge` device on the same rig
 emitted its own `update` frame in the same window, with `item` holding only
-`id`, `modelKey`, and `guid`. In both cases the frame carries **only the keys
-that changed**, plus `id`/`modelKey` for routing — this is a partial-update
-protocol, not a full-object push.
+`id`, `modelKey`, and `guid`. The partial-ness is **top-level only**: in the
+capture, `ledSettings` arrived as the *whole* sub-object (`isEnabled`,
+`welcomeLed`, `floodLed`), even though only `isEnabled` was patched. So the
+frame carries only the top-level keys that changed, plus `id`/`modelKey` for
+routing — but a nested settings object arrives whole, not diffed down to the
+one field that actually moved.
 
 The spec also defines `add` and `remove` frames:
 
@@ -198,10 +225,15 @@ writes are spec-documented (see the endpoint table above) but untested.
 Verified 2026-08-31: the token was **identical** across two `GET`s 10s apart.
 Rotation over longer windows (hours/days, or across controller reboot) is
 untested. `package` is `null` on the reference cameras (`hasPackageCamera:
-false`).
+false` — itself undocumented, see "Where the truth lives" above: it's on the
+live camera object and in `CONTRACT.md`, but not in the spec's `camera`
+schema).
 
-The spec also documents `POST` (body `{"qualities": [...]}` — creates
-streams) and `DELETE` on the same path. Neither has been exercised.
+The spec also documents `POST` (body `{"qualities": [...]}`, `qualities` has
+`minItems: 1` — creates streams) and `DELETE` (takes `qualities` as a
+**query** parameter, not a body — array or single value of
+`high|medium|low|package` — and returns **204** on success) on the same
+path. Neither has been exercised.
 
 **Treat the URL as a credential** — the token in the path *is* the auth, per
 issue #7. Don't log it, and think before writing it into a device state that
