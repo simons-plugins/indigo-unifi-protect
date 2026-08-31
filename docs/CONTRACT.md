@@ -17,6 +17,10 @@ Nothing goes in `Contents/Packages/`.
 Proven live on 2026-08-26 against a UNVR at `192.168.0.10`, UniFi Protect
 **7.2.105**. Do not "fix" code to contradict these.
 
+For the full endpoint and event-type inventory (all 25 paths, the vendored
+OpenAPI spec, `/subscribe/devices`, write verification, and the official-vs-
+private API gap), see [`API-REFERENCE.md`](./API-REFERENCE.md).
+
 - Base URL: `https://<host>/proxy/protect/integration/v1`
 - Auth: **`X-API-KEY: <key>` header alone.** No login, no cookies, no CSRF token.
   The same header authenticates the WebSocket upgrade.
@@ -500,6 +504,9 @@ Standard Indigo lifecycle. Key points:
   mapping Protect camera id → the set of Indigo device ids pointed at it (a
   set, not a scalar, because Indigo's Duplicate command trivially produces
   two devices on one camera).
+- `deviceStartComm` must call `stateListOrDisplayStateIdChanged()` before its
+  first state write — Indigo does not add new Devices.xml states to existing
+  devices otherwise.
 
 ### State IDs — strict, undocumented Indigo rule
 

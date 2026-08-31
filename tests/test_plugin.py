@@ -302,6 +302,46 @@ def test_device_stop_removes_by_device_id_not_by_current_props(fake_indigo):
 
 
 # ---------------------------------------------------------------------
+# State list refresh on start: states added by a plugin upgrade are not
+# retroactively applied to devices created by an older version, so Indigo
+# silently drops every write to them unless the device's state list is
+# refreshed first.
+# ---------------------------------------------------------------------
+
+def test_device_start_comm_refreshes_state_list_before_first_write(fake_indigo):
+    """The ordering is the whole bug: called too late, it does nothing for
+    the write it was meant to unlock. The fake's
+    stateListOrDisplayStateIdChanged() itself asserts no writes happened yet,
+    so this is fatal on ordering, not just a call count.
+    """
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug, camera_id="cam-1", dev_id=1)
+
+    assert dev.state_list_changed_calls == 1
+    assert dev.state_writes, "the first apply-state call must still have run"
+
+
+def test_state_list_refresh_failure_does_not_block_state_writes(fake_indigo, caplog):
+    """A device stuck on an old state list is a degraded device, not a
+    reason to abandon startup - deviceStartComm must still write states, and
+    must say why the refresh failed rather than swallowing it silently.
+    """
+    from conftest import _FakeDevice
+
+    plug = make_plugin({})
+    dev = _FakeDevice(1, name="Patio", plugin_props={"cameraId": "cam-1"})
+    dev.state_list_changed_raises = RuntimeError("boom")
+    fake_indigo.devices.add(dev)
+
+    with caplog.at_level("WARNING"):
+        plug.deviceStartComm(dev)
+
+    assert dev.state_writes, "states must still be written despite the failure"
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("could not refresh the device state list" in r.getMessage() for r in warnings)
+
+
+# ---------------------------------------------------------------------
 # Static wiring: the failure mode Indigo reports without naming the culprit
 # ---------------------------------------------------------------------
 
