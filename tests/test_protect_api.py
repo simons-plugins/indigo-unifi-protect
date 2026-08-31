@@ -603,3 +603,203 @@ def test_fake_api_key_never_appears_in_create_rtsps_streams_exception(monkeypatc
     assert FAKE_KEY not in exc.body
     assert FAKE_KEY not in exc.url
     assert FAKE_KEY not in repr(exc)
+
+
+# ---------------------------------------------------------------------
+# Issue #8: sensors/lights/chimes/nvr via the new _request helper.
+#
+# Spec-derived (OpenAPI v6.2.83) -- the reference rig's /sensors, /lights,
+# /chimes all return []; /nvrs is the one endpoint with real live data.
+# ---------------------------------------------------------------------
+
+def test_get_sensors_sends_get_and_parses_list(monkeypatch):
+    body = json.dumps([{"id": "s1", "modelKey": "sensor"}]).encode("utf-8")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(body))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    result = api.get_sensors()
+
+    assert result == [{"id": "s1", "modelKey": "sensor"}]
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "GET"
+    assert request.full_url.endswith("/sensors")
+
+
+def test_get_sensors_dict_body_raises(monkeypatch):
+    body = json.dumps({"not": "a list"}).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+    api = make_api()
+    with pytest.raises(ProtectAPIError):
+        api.get_sensors()
+
+
+def test_get_sensor_sends_get_with_id_in_path(monkeypatch):
+    body = json.dumps({"id": "s1"}).encode("utf-8")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(body))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    result = api.get_sensor("s1")
+
+    assert result == {"id": "s1"}
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "GET"
+    assert request.full_url.endswith("/sensors/s1")
+
+
+def test_patch_sensor_sends_patch_with_body(monkeypatch):
+    body = json.dumps({"id": "s1", "motionSettings": {"isEnabled": False}}).encode("utf-8")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(body))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    result = api.patch_sensor("s1", {"motionSettings": {"isEnabled": False}})
+
+    assert result["motionSettings"]["isEnabled"] is False
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "PATCH"
+    assert request.full_url.endswith("/sensors/s1")
+    assert json.loads(request.data.decode("utf-8")) == {"motionSettings": {"isEnabled": False}}
+
+
+def test_patch_sensor_non_dict_response_raises(monkeypatch):
+    body = json.dumps(["not", "a", "dict"]).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+    api = make_api()
+    with pytest.raises(ProtectAPIError):
+        api.patch_sensor("s1", {})
+
+
+def test_get_lights_sends_get_and_parses_list(monkeypatch):
+    body = json.dumps([{"id": "l1", "modelKey": "light"}]).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+    api = make_api()
+    assert api.get_lights() == [{"id": "l1", "modelKey": "light"}]
+
+
+def test_get_light_sends_get_with_id_in_path(monkeypatch):
+    body = json.dumps({"id": "l1"}).encode("utf-8")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(body))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+    api = make_api()
+    api.get_light("l1")
+    request = mock_urlopen.call_args[0][0]
+    assert request.full_url.endswith("/lights/l1")
+
+
+def test_patch_light_sends_patch_with_body(monkeypatch):
+    body = json.dumps({"id": "l1", "isLightForceEnabled": True}).encode("utf-8")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(body))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    result = api.patch_light("l1", {"isLightForceEnabled": True})
+
+    assert result["isLightForceEnabled"] is True
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "PATCH"
+    assert json.loads(request.data.decode("utf-8")) == {"isLightForceEnabled": True}
+
+
+def test_get_chimes_sends_get_and_parses_list(monkeypatch):
+    body = json.dumps([{"id": "c1", "modelKey": "chime"}]).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+    api = make_api()
+    assert api.get_chimes() == [{"id": "c1", "modelKey": "chime"}]
+
+
+def test_get_chime_sends_get_with_id_in_path(monkeypatch):
+    body = json.dumps({"id": "c1"}).encode("utf-8")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(body))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+    api = make_api()
+    api.get_chime("c1")
+    request = mock_urlopen.call_args[0][0]
+    assert request.full_url.endswith("/chimes/c1")
+
+
+def test_patch_chime_sends_patch_with_ring_settings_body(monkeypatch):
+    body = json.dumps({"id": "c1", "ringSettings": []}).encode("utf-8")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(body))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    ring_settings = [{"cameraId": "cam1", "repeatTimes": 1, "ringtoneId": "r1", "volume": 50}]
+    api.patch_chime("c1", {"ringSettings": ring_settings})
+
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "PATCH"
+    assert json.loads(request.data.decode("utf-8")) == {"ringSettings": ring_settings}
+
+
+# -- NVR: dict, one-element list, and every rejected shape ---------------
+
+def test_get_nvr_accepts_a_bare_dict(monkeypatch):
+    """The live-observed shape: a single JSON object, not an array."""
+    body = json.dumps({
+        "id": "nvr1", "modelKey": "nvr", "name": "UNVR",
+        "armMode": {"status": "disabled"},
+    }).encode("utf-8")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(body))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    result = api.get_nvr()
+
+    assert result["id"] == "nvr1"
+    assert result["armMode"]["status"] == "disabled"
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "GET"
+    assert request.full_url.endswith("/nvrs")
+
+
+def test_get_nvr_accepts_a_one_element_list(monkeypatch):
+    """Defensive tolerance in case some deployment wraps the object in an
+    array, even though the reference rig and the OpenAPI spec both say the
+    response is a bare object."""
+    body = json.dumps([{"id": "nvr1", "modelKey": "nvr"}]).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+    api = make_api()
+    result = api.get_nvr()
+    assert result["id"] == "nvr1"
+
+
+@pytest.mark.parametrize("raw_body", [
+    b"[]",
+    b'[{"id":"a"},{"id":"b"}]',
+    b'"just a string"',
+    b"42",
+    b"null",
+])
+def test_get_nvr_rejects_every_other_shape(monkeypatch, raw_body):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(raw_body)))
+    api = make_api()
+    with pytest.raises(ProtectAPIError):
+        api.get_nvr()
+
+
+def test_request_helper_returns_none_for_empty_body(monkeypatch):
+    """A 2xx with no body (e.g. a 204) must not raise a JSON decode error --
+    it returns None."""
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(b"")))
+    api = make_api()
+    assert api._request("PATCH", "/sensors/s1", body={"name": "x"}) is None
+
+
+def test_fake_api_key_never_appears_in_request_helper_exception(monkeypatch):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(side_effect=http_error(500, body=b"server error")))
+    api = make_api(api_key=FAKE_KEY)
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.get_sensors()
+    exc = excinfo.value
+    assert FAKE_KEY not in str(exc)
+    assert FAKE_KEY not in exc.url

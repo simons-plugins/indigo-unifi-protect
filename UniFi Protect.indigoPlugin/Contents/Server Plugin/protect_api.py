@@ -419,6 +419,175 @@ class ProtectAPI:
                                    url=f"{self._base_url}{path}")
         return parsed
 
+    def _request(self, method: str, path: str, params: Optional[dict[str, str]] = None,
+                 body: Optional[dict] = None) -> Any:
+        """General request helper (issue #8): GET/PATCH (or any verb) with an
+        optional JSON body, returning the parsed JSON response (or None for
+        an empty body, e.g. a 204).
+
+        Added here because this branch's base does not yet have it -- issue
+        #6 (stacked earlier, not yet rebased into this branch) is expected
+        to add a method with this exact signature. On rebase, prefer #6's
+        version and drop this one if the two are equivalent; every method
+        below that uses `_request` should keep working unchanged either way.
+
+        Raises ProtectAPIError on any non-2xx response or transport failure,
+        with the response body attached (unlike `_post_json`, nothing that
+        calls this method handles a URL-embedded secret the way
+        `create_rtsps_streams` does).
+        """
+        url = f"{self._base_url}{path}"
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
+        data = None
+        headers = {"X-API-KEY": self._api_key}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout,
+                                         context=self._ctx) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            resp_body = exc.read().decode("utf-8", errors="replace")
+            retry_after = _parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+            message = _assert_no_secret(f"HTTP {exc.code} for {path}", self._api_key)
+            raise ProtectAPIError(message, status=exc.code, body=resp_body, url=url,
+                                   retry_after=retry_after) from None
+        except urllib.error.URLError as exc:
+            message = _assert_no_secret(
+                f"Connection failure for {path}: {exc.reason}", self._api_key)
+            raise ProtectAPIError(message, status=None, body=str(exc.reason), url=url) from None
+        except OSError as exc:
+            message = _assert_no_secret(f"Connection failure for {path}: {exc}", self._api_key)
+            raise ProtectAPIError(message, status=None, body=str(exc), url=url) from None
+
+        if not raw:
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            message = _assert_no_secret(f"Invalid JSON response for {path}: {exc}", self._api_key)
+            raise ProtectAPIError(message, status=None, body=raw[:200].decode(
+                "utf-8", errors="replace"), url=url) from None
+
+    def _expect_list_of_dicts(self, path: str, body: Any) -> list[dict]:
+        if not isinstance(body, list) or not all(isinstance(item, dict) for item in body):
+            message = _assert_no_secret(
+                f"Unexpected response shape for {path}: expected a list of objects",
+                self._api_key)
+            raise ProtectAPIError(message, status=None, body=str(body)[:200],
+                                   url=f"{self._base_url}{path}")
+        return body
+
+    def _expect_dict(self, path: str, body: Any) -> dict:
+        if not isinstance(body, dict):
+            message = _assert_no_secret(
+                f"Unexpected response shape for {path}: expected an object",
+                self._api_key)
+            raise ProtectAPIError(message, status=None, body=str(body)[:200],
+                                   url=f"{self._base_url}{path}")
+        return body
+
+    # -- Sensors (issue #8) ----------------------------------------------
+    # Spec-derived (OpenAPI v6.2.83): the reference rig's /sensors always
+    # returned []. UNVERIFIED against real hardware.
+
+    def get_sensors(self) -> list[dict]:
+        """GET /sensors. Raises ProtectAPIError, including when the parsed
+        body is not a JSON array of objects."""
+        path = "/sensors"
+        return self._expect_list_of_dicts(path, self._request("GET", path))
+
+    def get_sensor(self, sensor_id: str) -> dict:
+        """GET /sensors/{id}. Raises ProtectAPIError, including when the
+        parsed body is not a JSON object."""
+        path = f"/sensors/{sensor_id}"
+        return self._expect_dict(path, self._request("GET", path))
+
+    def patch_sensor(self, sensor_id: str, body: dict) -> dict:
+        """PATCH /sensors/{id}. Returns the updated sensor object. Raises
+        ProtectAPIError, including when the parsed body is not a JSON
+        object."""
+        path = f"/sensors/{sensor_id}"
+        return self._expect_dict(path, self._request("PATCH", path, body=body))
+
+    # -- Lights (issue #8) ------------------------------------------------
+    # Spec-derived (OpenAPI v6.2.83): the reference rig's /lights always
+    # returned []. UNVERIFIED against real hardware.
+
+    def get_lights(self) -> list[dict]:
+        """GET /lights. Raises ProtectAPIError, including when the parsed
+        body is not a JSON array of objects."""
+        path = "/lights"
+        return self._expect_list_of_dicts(path, self._request("GET", path))
+
+    def get_light(self, light_id: str) -> dict:
+        """GET /lights/{id}. Raises ProtectAPIError, including when the
+        parsed body is not a JSON object."""
+        path = f"/lights/{light_id}"
+        return self._expect_dict(path, self._request("GET", path))
+
+    def patch_light(self, light_id: str, body: dict) -> dict:
+        """PATCH /lights/{id}. Returns the updated light object. Raises
+        ProtectAPIError, including when the parsed body is not a JSON
+        object."""
+        path = f"/lights/{light_id}"
+        return self._expect_dict(path, self._request("PATCH", path, body=body))
+
+    # -- Chimes (issue #8) ------------------------------------------------
+    # Spec-derived (OpenAPI v6.2.83): the reference rig's /chimes always
+    # returned []. UNVERIFIED against real hardware.
+
+    def get_chimes(self) -> list[dict]:
+        """GET /chimes. Raises ProtectAPIError, including when the parsed
+        body is not a JSON array of objects."""
+        path = "/chimes"
+        return self._expect_list_of_dicts(path, self._request("GET", path))
+
+    def get_chime(self, chime_id: str) -> dict:
+        """GET /chimes/{id}. Raises ProtectAPIError, including when the
+        parsed body is not a JSON object."""
+        path = f"/chimes/{chime_id}"
+        return self._expect_dict(path, self._request("GET", path))
+
+    def patch_chime(self, chime_id: str, body: dict) -> dict:
+        """PATCH /chimes/{id}. Returns the updated chime object. Raises
+        ProtectAPIError, including when the parsed body is not a JSON
+        object."""
+        path = f"/chimes/{chime_id}"
+        return self._expect_dict(path, self._request("PATCH", path, body=body))
+
+    # -- NVR (issue #8) -----------------------------------------------------
+
+    def get_nvr(self) -> dict:
+        """GET /nvrs.
+
+        Live-verified 2026-08-31 on 7.2.105: the controller returns a
+        SINGLE JSON OBJECT, not an array -- matching the OpenAPI spec's
+        response schema for this path, which is `nvr`, not `array<nvr>`
+        (the plural path name is misleading). Tolerates a one-element list
+        defensively in case some deployment differs from both; raises on
+        `[]`, a multi-element list, or any other non-dict/non-list shape.
+
+        The live object also carries `armMode`, `type`, `guid`, and `mac`,
+        none of which are in the OpenAPI spec -- they are passed through
+        unchanged since this method does no schema filtering, only shape
+        validation.
+        """
+        path = "/nvrs"
+        body = self._request("GET", path)
+        if isinstance(body, list):
+            if len(body) != 1 or not isinstance(body[0], dict):
+                message = _assert_no_secret(
+                    f"Unexpected response shape for {path}: expected an object "
+                    f"(or a one-element list of one)", self._api_key)
+                raise ProtectAPIError(message, status=None, body=str(body)[:200],
+                                       url=f"{self._base_url}{path}")
+            body = body[0]
+        return self._expect_dict(path, body)
+
     def get_meta_info(self) -> dict:
         """GET /meta/info -> {'applicationVersion': '7.2.105'}.
 
