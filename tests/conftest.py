@@ -46,6 +46,10 @@ class _FakeDevice:
         # not merely the final resting state.
         self.state_writes = []
         self.image_writes = []
+        self.state_list_changed_calls = 0
+        # Set to an exception instance to make stateListOrDisplayStateIdChanged
+        # raise, for testing the deviceStartComm degradation path.
+        self.state_list_changed_raises = None
 
     def updateStateOnServer(self, key, value=None, **kwargs):
         self.states[key] = value
@@ -58,6 +62,18 @@ class _FakeDevice:
 
     def updateStateImageOnServer(self, image):
         self.image_writes.append(image)
+
+    def stateListOrDisplayStateIdChanged(self):
+        # Fatal ordering check: if this ever runs after a state write has
+        # already happened, a plugin upgrade adding new Devices.xml states
+        # would silently drop writes to them - this must run first.
+        assert self.state_writes == [], (
+            f"{self.name}: stateListOrDisplayStateIdChanged() called after "
+            "state writes had already started - it must run first"
+        )
+        self.state_list_changed_calls += 1
+        if self.state_list_changed_raises is not None:
+            raise self.state_list_changed_raises
 
 
 class _FakeDevices:
