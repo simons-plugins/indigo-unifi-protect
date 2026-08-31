@@ -4,14 +4,23 @@
 
 ## Install
 
-Copy it into Indigo's **user pages** folder:
+**Automatic, since plugin version 2026.10.0.** The plugin ships a copy of this
+page inside its bundle and, on every `startup()`, copies it into Indigo's
+**user pages** folder if it is missing or out of date:
 
 ```
 /Library/Application Support/Perceptive Automation/Indigo <version>/Web Assets/static/pages/
 ```
 
-That is the folder the Domio iOS app scans for user-installed pages. It also
-survives plugin upgrades, unlike anything inside a plugin bundle.
+That is the folder the Domio iOS app scans for user-installed pages, and it
+survives plugin upgrades, unlike anything inside a plugin bundle — the
+bundled copy is the source of truth, and Web Assets is just where it gets
+installed to. This is opt-out: untick **"Manage the Cameras web page"** in
+the plugin's configuration if you hand-edit the installed copy yourself —
+otherwise the plugin overwrites your changes the next time it starts.
+
+If you've unticked that box (or are on an older plugin version), fall back to
+copying it by hand:
 
 ```bash
 cp cameras.html "/Library/Application Support/Perceptive Automation/Indigo 2025.2/Web Assets/static/pages/"
@@ -19,10 +28,18 @@ cp cameras.html "/Library/Application Support/Perceptive Automation/Indigo 2025.
 
 Restart the Domio plugin (or Indigo) and the page appears as **Cameras**.
 
-> The page deliberately does **not** ship inside this plugin's bundle. Domio only
-> scans its own plugin folder and `Web Assets/static/pages` — a page inside
-> *this* plugin's `Contents/Resources` can never be discovered by it, so
-> shipping a copy there would only create two files that drift apart.
+> The page ships inside this plugin's bundle at
+> `Contents/Resources/pages/cameras.html` purely as the **managed source**
+> for the auto-install step above — Domio itself still only scans its own
+> plugin folder and `Web Assets/static/pages`, never a sibling plugin's
+> `Contents/Resources`. `pages/cameras.html` (this file's sibling) remains
+> the repo's single source of truth; a pytest
+> (`tests/test_page_bundle.py`) asserts the two copies are byte-identical,
+> so they cannot silently drift apart. If you edit `pages/cameras.html`,
+> sync the bundled copy before committing:
+> ```bash
+> cp pages/cameras.html "UniFi Protect.indigoPlugin/Contents/Resources/pages/cameras.html"
+> ```
 
 ## Use in a browser
 

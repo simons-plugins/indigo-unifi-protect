@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+<meta name="indigo-page-name" content="Cameras">
+<meta name="indigo-page-icon" content="video.fill">
+<meta name="indigo-page-description" content="UniFi Protect camera snapshots with live motion state and camera config">
+<title>Cameras</title>
+<style>
+:root{--bg:#f5f5f7;--card-bg:#fff;--text:#1d1d1f;--text-secondary:#86868b;--border:#d2d2d7;
+--accent:#5856d6;--on-color:#34c759;--off-color:#d2d2d7;--warn:#ff9f0a;--bad:#ff453a;
+--shadow:0 1px 3px rgba(0,0,0,.08)}
+@media (prefers-color-scheme:dark){:root{--bg:#000;--card-bg:#1c1c1e;--text:#f5f5f7;
+--text-secondary:#98989d;--border:#38383a;--accent:#7d7aff;--on-color:#30d158;--off-color:#48484a;
+--warn:#ffd60a;--bad:#ff453a;--shadow:0 1px 3px rgba(0,0,0,.3)}}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;
+background:var(--bg);color:var(--text);font-size:17px;-webkit-font-smoothing:antialiased;
+padding:16px;padding-top:max(16px,env(safe-area-inset-top));
+padding-bottom:max(32px,env(safe-area-inset-bottom));
+padding-left:max(16px,env(safe-area-inset-left));padding-right:max(16px,env(safe-area-inset-right))}
+.wrap{max-width:760px;margin:0 auto}
+h1{font-size:28px;margin:0 0 16px;letter-spacing:-.02em}
+.card{background:var(--card-bg);border-radius:14px;box-shadow:var(--shadow);padding:16px;margin-bottom:14px}
+label{display:block;font-size:13px;text-transform:uppercase;letter-spacing:.04em;
+color:var(--text-secondary);margin-bottom:8px}
+select{width:100%;min-height:44px;font-size:17px;font-family:inherit;color:var(--text);
+background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:10px 12px;
+-webkit-appearance:none;appearance:none;
+background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8'><path d='M1 1l5 5 5-5' stroke='%2386868b' stroke-width='2' fill='none' stroke-linecap='round'/></svg>");
+background-repeat:no-repeat;background-position:right 14px center}
+.shot{position:relative;margin-top:14px;border-radius:12px;overflow:hidden;background:var(--bg);
+border:1px solid var(--border);min-height:180px;display:flex;align-items:center;justify-content:center}
+.shot img{display:block;width:100%;height:auto}
+.shot .msg{padding:28px 20px;text-align:center;color:var(--text-secondary);font-size:15px;line-height:1.45}
+.age{margin-top:10px;font-size:13px;color:var(--text-secondary);display:flex;
+justify-content:space-between;gap:10px;flex-wrap:wrap}
+.age .stale{color:var(--warn);font-weight:600}
+.row{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+button{flex:1 1 auto;min-height:44px;min-width:44px;font-size:17px;font-family:inherit;font-weight:500;
+border:none;border-radius:10px;padding:10px 20px;background:var(--accent);color:#fff;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
+button.sec{background:var(--bg);color:var(--text);border:1px solid var(--border)}
+.states{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:4px}
+.sep{margin-top:16px;padding-top:14px;border-top:1px solid var(--border)}
+.pill{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--border);
+border-radius:10px;padding:10px 12px;font-size:15px}
+.pill.chip{color:var(--text-secondary)}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--off-color);flex:0 0 auto}
+.dot.on{background:var(--on-color)}.dot.bad{background:var(--bad)}.dot.warn{background:var(--warn)}
+.banner{border-radius:10px;padding:12px 14px;font-size:15px;line-height:1.4;margin-bottom:14px;display:none}
+.banner.show{display:block}
+.banner.bad{background:rgba(255,69,58,.14);color:var(--bad);border:1px solid rgba(255,69,58,.3)}
+.banner.warn{background:rgba(255,159,10,.14);color:var(--warn);border:1px solid rgba(255,159,10,.35)}
+.note{font-size:13px;color:var(--text-secondary);line-height:1.45;margin-top:12px}
+@media (min-width:744px){.wrap{max-width:680px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Cameras</h1>
+<div id="err" class="banner bad"></div>
+<div id="offline" class="banner warn"></div>
+
+<div class="card">
+  <label for="cam">Camera</label>
+  <select id="cam"><option>Loading…</option></select>
+
+  <div class="shot" id="shot"><div class="msg" id="shotmsg">Select a camera</div></div>
+  <div class="age"><span id="age"></span><span id="dims"></span></div>
+
+  <div class="row">
+    <button id="refresh">Take snapshot</button>
+    <button id="auto" class="sec">Auto: off</button>
+  </div>
+</div>
+
+<div class="card">
+  <label>Live state</label>
+  <div class="states" id="states"></div>
+  <div class="note" id="gate"></div>
+
+  <label class="sep">Camera config</label>
+  <div class="states" id="configStates"></div>
+</div>
+</div>
+<script>
+// -- indigo-api.js V1 (inlined; pages must be self-contained) --
+/**
+ * Indigo API JavaScript Helper — V1
+ *
+ * Provides a clean client-side API for HTML pages served by Indigo plugins.
+ * Reads connection credentials from window.INDIGO_CONFIG (injected by the
+ * Domio iOS app's WKWebView, or set manually for browser testing).
+ *
+ * Usage:
+ *   const indigo = new IndigoAPI();
+ *   const devices = await indigo.getDevices();
+ *   await indigo.turnOn(deviceId);
+ */
+
+class IndigoAPI {
+    /**
+     * @param {Object} [config] - Optional config override.
+     * @param {string} config.baseURL - Indigo server base URL.
+     * @param {string} config.apiKey - Bearer token for authentication.
+     */
+    constructor(config) {
+        const cfg = config || window.INDIGO_CONFIG || IndigoAPI._configFromURL();
+        if (!cfg || !cfg.baseURL || !cfg.apiKey) {
+            this._configured = false;
+            this._showConfigError();
+            return;
+        }
+        this._configured = true;
+        this._baseURL = cfg.baseURL.replace(/\/+$/, "");
+        this._apiKey = cfg.apiKey;
+        this._errorHandler = null;
+        this._authFailureHandler = null;
+    }
+
+    // ── Configuration Check ──────────────────────────
+
+    /** Check whether INDIGO_CONFIG is available. */
+    static isConfigured() {
+        const cfg = window.INDIGO_CONFIG || IndigoAPI._configFromURL();
+        return !!(cfg && cfg.baseURL && cfg.apiKey);
+    }
+
+    /**
+     * Derive config from the page's own URL for browser testing.
+     * When loaded via IWS with `?api-key=KEY`, the origin is the Indigo
+     * server and the key is in the query string.
+     */
+    static _configFromURL() {
+        if (typeof location === "undefined") return null;
+        const params = new URLSearchParams(location.search);
+        const apiKey = params.get("api-key");
+        if (!apiKey) return null;
+        return { baseURL: location.origin, apiKey };
+    }
+
+    // ── Devices ──────────────────────────────────────
+
+    /** Fetch all devices. @returns {Promise<Object[]>} */
+    async getDevices() {
+        return this._getList("/v2/api/indigo.devices");
+    }
+
+    /** Fetch a single device by ID. @returns {Promise<Object>} */
+    async getDevice(id) {
+        return this._get(`/v2/api/indigo.devices/${id}`);
+    }
+
+    /** Turn a device on. */
+    async turnOn(id) {
+        return this._command(id, "indigo.device.turnOn");
+    }
+
+    /** Turn a device off. */
+    async turnOff(id) {
+        return this._command(id, "indigo.device.turnOff");
+    }
+
+    /** Toggle a device. */
+    async toggle(id) {
+        return this._command(id, "indigo.device.toggle");
+    }
+
+    /** Set dimmer brightness (0-100). */
+    async setBrightness(id, value) {
+        return this._command(id, "indigo.dimmer.setBrightness", { value });
+    }
+
+    /** Set thermostat heat setpoint. */
+    async setHeatSetpoint(id, value) {
+        return this._command(id, "indigo.thermostat.setHeatSetpoint", { value });
+    }
+
+    /** Set thermostat cool setpoint. */
+    async setCoolSetpoint(id, value) {
+        return this._command(id, "indigo.thermostat.setCoolSetpoint", { value });
+    }
+
+    // ── Action Groups ────────────────────────────────
+
+    /** Fetch all action groups. @returns {Promise<Object[]>} */
+    async getActionGroups() {
+        return this._getList("/v2/api/indigo.actionGroups");
+    }
+
+    /** Execute an action group by ID. */
+    async executeActionGroup(id) {
+        return this._post("/v2/api/command", {
+            message: "indigo.actionGroup.execute",
+            objectId: id,
+        });
+    }
+
+    // ── Variables ────────────────────────────────────
+
+    /** Fetch all variables. @returns {Promise<Object[]>} */
+    async getVariables() {
+        return this._getList("/v2/api/indigo.variables");
+    }
+
+    /** Fetch a single variable by ID. @returns {Promise<Object>} */
+    async getVariable(id) {
+        return this._get(`/v2/api/indigo.variables/${id}`);
+    }
+
+    // ── Reactive Polling ─────────────────────────────
+
+    /**
+     * Observe a single device, calling back when its state changes.
+     * @param {number} deviceId - Device ID to observe.
+     * @param {Function} callback - Called with the device object on each poll.
+     * @param {number} [intervalMs=5000] - Poll interval in milliseconds.
+     * @returns {{ stop: Function }} Call stop() to end observation.
+     */
+    observe(deviceId, callback, intervalMs = 5000) {
+        let lastJson = null;
+        const poll = async () => {
+            try {
+                const device = await this.getDevice(deviceId);
+                const json = JSON.stringify(device);
+                if (json !== lastJson) {
+                    lastJson = json;
+                    callback(device);
+                }
+            } catch (err) {
+                this._handleError(err);
+            }
+        };
+        poll(); // initial fetch
+        const timer = setInterval(poll, intervalMs);
+        return { stop: () => clearInterval(timer) };
+    }
+
+    /**
+     * Observe all devices, calling back when any device state changes.
+     * @param {Function} callback - Called with the full device array on each poll.
+     * @param {number} [intervalMs=5000] - Poll interval in milliseconds.
+     * @returns {{ stop: Function }} Call stop() to end observation.
+     */
+    observeAll(callback, intervalMs = 5000) {
+        let lastJson = null;
+        const poll = async () => {
+            try {
+                const devices = await this.getDevices();
+                const json = JSON.stringify(devices);
+                if (json !== lastJson) {
+                    lastJson = json;
+                    callback(devices);
+                }
+            } catch (err) {
+                this._handleError(err);
+            }
+        };
+        poll(); // initial fetch
+        const timer = setInterval(poll, intervalMs);
+        return { stop: () => clearInterval(timer) };
+    }
+
+    // ── Event Handlers ───────────────────────────────
+
+    /** Register a global error handler. */
+    onError(callback) {
+        this._errorHandler = callback;
+    }
+
+    /** Register a handler for authentication failures (401/403). */
+    onAuthFailure(callback) {
+        this._authFailureHandler = callback;
+    }
+
+    // ── Internal Methods ─────────────────────────────
+
+    async _get(path) {
+        return this._fetch(path, { method: "GET" });
+    }
+
+    async _getList(path) {
+        return this._fetch(path, { method: "GET" });
+    }
+
+    async _post(path, body) {
+        return this._fetch(path, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+    }
+
+    async _put(path, body) {
+        return this._fetch(path, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+    }
+
+    async _command(deviceId, message, parameters) {
+        const body = { message, objectId: deviceId };
+        if (parameters) body.parameters = parameters;
+        return this._post("/v2/api/command", body);
+    }
+
+    async _fetch(path, options = {}) {
+        this._requireConfigured();
+
+        const url = `${this._baseURL}${path}`;
+        const headers = {
+            Authorization: `Bearer ${this._apiKey}`,
+            Accept: "application/json",
+            ...options.headers,
+        };
+
+        let response;
+        try {
+            response = await fetch(url, { ...options, headers });
+        } catch (err) {
+            const error = new IndigoAPIError("Network error: " + err.message, 0, err);
+            this._handleError(error);
+            throw error;
+        }
+
+        if (response.status === 401 || response.status === 403) {
+            const error = new IndigoAPIError(
+                "Authentication failed — check your API key",
+                response.status
+            );
+            if (this._authFailureHandler) this._authFailureHandler(error);
+            this._handleError(error);
+            throw error;
+        }
+
+        if (!response.ok) {
+            const text = await response.text().catch(() => "");
+            const error = new IndigoAPIError(
+                `HTTP ${response.status}: ${text || response.statusText}`,
+                response.status
+            );
+            this._handleError(error);
+            throw error;
+        }
+
+        // Some commands return empty responses (204).
+        const contentType = response.headers.get("Content-Type") || "";
+        if (!contentType.includes("json")) return null;
+
+        try {
+            return await response.json();
+        } catch (err) {
+            const error = new IndigoAPIError("Invalid JSON response", response.status, err);
+            this._handleError(error);
+            throw error;
+        }
+    }
+
+    _requireConfigured() {
+        if (!this._configured) {
+            throw new IndigoAPIError(
+                "IndigoAPI is not configured — window.INDIGO_CONFIG is missing or incomplete",
+                0
+            );
+        }
+    }
+
+    _handleError(error) {
+        if (this._errorHandler) {
+            try { this._errorHandler(error); } catch (_) { /* prevent handler errors from cascading */ }
+        }
+    }
+
+    _showConfigError() {
+        if (typeof document === "undefined") return;
+        const banner = document.createElement("div");
+        banner.id = "indigo-config-error";
+        banner.style.cssText =
+            "position:fixed;top:0;left:0;right:0;padding:12px 16px;" +
+            "background:#dc3545;color:#fff;font:14px/1.4 -apple-system,sans-serif;" +
+            "text-align:center;z-index:99999;";
+        banner.textContent = "Indigo connection not configured. Set window.INDIGO_CONFIG or add ?api-key= to the URL.";
+        if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", () => document.body.prepend(banner));
+        } else {
+            document.body.prepend(banner);
+        }
+    }
+}
+
+/** Typed error class for Indigo API failures. */
+class IndigoAPIError extends Error {
+    /**
+     * @param {string} message - Human-readable error description.
+     * @param {number} status - HTTP status code (0 for network errors).
+     * @param {Error} [cause] - Original error, if any.
+     */
+    constructor(message, status, cause) {
+        super(message);
+        this.name = "IndigoAPIError";
+        this.status = status;
+        if (cause) this.cause = cause;
+    }
+}
+</script>
+<script>
+// ── page logic ──────────────────────────────────────────────────────────
+const PLUGIN_ID = "com.simons-plugins.indigo-unifi-protect";
+const DEVICE_TYPE_MATCH = /^Protect - /;      // fallback naming filter
+const AUTO_MS = 30000;
+const STALE_AFTER_MS = 120000;                // 2 min -> call the image stale
+
+const $ = id => document.getElementById(id);
+let indigo = null, cams = [], current = null, autoTimer = null, watcher = null;
+
+function showErr(msg) {
+  const el = $("err");
+  el.textContent = msg;                       // textContent: never interpolate server text as HTML
+  el.classList.toggle("show", !!msg);
+}
+
+function baseURL() {
+  const cfg = window.INDIGO_CONFIG;
+  return (cfg && cfg.baseURL) ? cfg.baseURL.replace(/\/+$/, "") : "";
+}
+
+function shotURL(devId, bust) {
+  return `${baseURL()}/images/unifi-protect/camera_${devId}.jpg${bust ? "?t=" + Date.now() : ""}`;
+}
+
+// ── loading the image ───────────────────────────────────────────────────
+// Indigo's web server requires auth for Web Assets: a bare <img src> gets a
+// 401, because an <img> tag cannot carry an Authorization header. So fetch the
+// bytes with the bearer token and hand the <img> a blob URL instead.
+//
+// The same response carries Last-Modified, so the age costs no extra request.
+function apiKey() {
+  const cfg = window.INDIGO_CONFIG;
+  if (cfg && cfg.apiKey) return cfg.apiKey;
+  return new URLSearchParams(location.search).get("api-key") || "";
+}
+
+let objectURL = null;
+
+function setMsg(text) {
+  const shot = $("shot");
+  shot.innerHTML = "";
+  const d = document.createElement("div");
+  d.className = "msg";
+  d.textContent = text;                       // textContent, never innerHTML
+  shot.appendChild(d);
+  $("dims").textContent = "";
+  $("age").textContent = "";
+}
+
+function renderAge(lastModified) {
+  const ageEl = $("age");
+  ageEl.innerHTML = "";
+  if (!lastModified) { ageEl.textContent = "Age unknown"; return; }
+  const when = new Date(lastModified), delta = Date.now() - when.getTime();
+  const mins = Math.floor(delta / 60000);
+  const span = document.createElement("span");
+  span.textContent = mins < 1 ? "Taken just now"
+                   : mins === 1 ? "Taken 1 minute ago"
+                   : mins < 60 ? `Taken ${mins} minutes ago`
+                   : `Taken ${when.toLocaleString()}`;
+  if (delta > STALE_AFTER_MS) span.className = "stale";
+  ageEl.appendChild(span);
+}
+
+async function loadImage(devId) {
+  try {
+    const r = await fetch(shotURL(devId, true), {
+      headers: { Authorization: `Bearer ${apiKey()}` },
+    });
+    // Distinguish the causes. A 401 and a missing file are completely
+    // different problems and must not share one message.
+    if (r.status === 401 || r.status === 403) {
+      setMsg("Not authorised to read the snapshot. Open this page from the "
+           + "Domio app, or append ?api-key=… in a browser.");
+      return;
+    }
+    if (r.status === 404) {
+      setMsg("No snapshot taken yet for this camera. Tap \u201cTake snapshot\u201d.");
+      return;
+    }
+    if (!r.ok) { setMsg(`Could not load snapshot (HTTP ${r.status}).`); return; }
+
+    const blob = await r.blob();
+    if (!blob.size) { setMsg("The snapshot file is empty."); return; }
+
+    const img = new Image();
+    img.alt = "Camera snapshot";
+    img.onload = () => {
+      const shot = $("shot");
+      shot.innerHTML = "";
+      shot.appendChild(img);
+      $("dims").textContent = `${img.naturalWidth} \u00d7 ${img.naturalHeight}`;
+      renderAge(r.headers.get("Last-Modified"));
+    };
+    img.onerror = () => setMsg("Snapshot downloaded but could not be decoded.");
+    if (objectURL) URL.revokeObjectURL(objectURL);
+    objectURL = URL.createObjectURL(blob);
+    img.src = objectURL;
+  } catch (e) {
+    setMsg("Error loading snapshot: " + e.message);
+  }
+}
+
+// ── take a snapshot ─────────────────────────────────────────────────────
+async function takeSnapshot() {
+  if (!current || !indigo) return;
+  const btn = $("refresh");
+  btn.disabled = true;
+  btn.textContent = "Taking…";
+  try {
+    await indigo._post("/v2/api/command", {
+      message: "plugin.executeAction",
+      pluginId: PLUGIN_ID,
+      actionId: "takeSnapshot",
+      deviceId: current,
+    });
+    // The action writes the file server-side; give it a beat before reloading.
+    setTimeout(() => loadImage(current), 1200);
+    showErr("");
+  } catch (e) {
+    showErr("Snapshot failed: " + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Take snapshot";
+  }
+}
+
+// ── live state ──────────────────────────────────────────────────────────
+function pill(label, on, cls) {
+  const d = document.createElement("div");
+  d.className = "pill";
+  const dot = document.createElement("span");
+  dot.className = "dot" + (on ? " " + (cls || "on") : "");
+  const t = document.createElement("span");
+  t.textContent = label;
+  d.appendChild(dot); d.appendChild(t);
+  return d;
+}
+
+// A text chip for a non-boolean config value (videoMode, hdrType, OSD
+// summary) — no dot, since there's no on/off to indicate.
+function chip(label) {
+  const d = document.createElement("div");
+  d.className = "pill chip";
+  const t = document.createElement("span");
+  t.textContent = label;
+  d.appendChild(t);
+  return d;
+}
+
+function renderStates(dev) {
+  const box = $("states");
+  box.innerHTML = "";
+  $("configStates").innerHTML = "";
+  if (!dev) return;
+  const s = dev.states || {};
+  const connected = s.connected === true;
+
+  box.appendChild(pill(connected ? "Socket connected" : "Socket DOWN",
+                       true, connected ? "on" : "bad"));
+  box.appendChild(pill(s.motionDetected ? "Motion" : "No motion", !!s.motionDetected));
+  box.appendChild(pill("Person", !!s.personDetected));
+  box.appendChild(pill("Vehicle", !!s.vehicleDetected));
+  box.appendChild(pill("Animal", !!s.animalDetected));
+  box.appendChild(pill("Camera: " + (s.cameraState || "unknown"),
+                       s.cameraState === "CONNECTED",
+                       s.cameraState === "CONNECTED" ? "on" : "warn"));
+
+  // The whole point of the plugin's design: booleans cannot say "unknown", so
+  // motion is only meaningful while the event socket is up. Say so, loudly.
+  const off = $("offline");
+  if (!connected) {
+    off.textContent = "The event socket is down, so motion is UNKNOWN, not absent. "
+      + "The motion states below are forced off and should not be trusted until this clears.";
+    off.classList.add("show");
+  } else {
+    off.classList.remove("show");
+  }
+
+  $("gate").textContent = s.lastMotion
+    ? "Last motion: " + s.lastMotion
+    : "No motion recorded since the plugin last connected.";
+
+  // Camera config states (ledEnabled, videoMode, hdrType, micEnabled,
+  // micVolume, osdNameEnabled, osdDateEnabled) are push-live over the
+  // /subscribe/devices socket since 2026.8.0 (issue #18). A simple
+  // `"ledEnabled" in s` guard is NOT enough here: Indigo materialises
+  // every state declared in Devices.xml with its type default (false/0),
+  // so on any plugin >= 2026.8.0 the keys always exist and a value the
+  // plugin deliberately never wrote is indistinguishable from a real
+  // "off"/0. The plugin itself skips-not-defaults these keys
+  // (_camera_info_states), so the page must not re-fabricate them.
+  // cameraModel is the tell: it is also skipped-not-defaulted and only
+  // ever written from a real camera read -- until it is non-empty, the
+  // config values are Indigo defaults, not readings, and rendering them
+  // as confident off/0% would be a lie. Older plugins never declare the
+  // keys at all, which the same gate covers.
+  const cfg = $("configStates");
+  const cfgKnown = typeof s.cameraModel === "string" && !!s.cameraModel;
+
+  if (cfgKnown && "ledEnabled" in s) {
+    cfg.appendChild(pill(s.ledEnabled ? "Status LED on" : "Status LED off", !!s.ledEnabled));
+  }
+
+  if (cfgKnown && "micEnabled" in s) {
+    let micLabel = "Mic off";
+    if (s.micEnabled) {
+      // micVolume 0 is ambiguous even after a real read: Indigo's integer
+      // default and "the controller omitted micVolume" both look like 0.
+      // "Mic on" is the honest rendering there; a real, written volume
+      // > 0 gets the percentage.
+      micLabel = (typeof s.micVolume === "number" && s.micVolume > 0)
+        ? `Mic ${s.micVolume}%` : "Mic on";
+    }
+    cfg.appendChild(pill(micLabel, !!s.micEnabled));
+  }
+
+  if (typeof s.videoMode === "string" && s.videoMode) {
+    cfg.appendChild(chip("Video: " + s.videoMode));
+  }
+  if (typeof s.hdrType === "string" && s.hdrType) {
+    cfg.appendChild(chip("HDR: " + s.hdrType));
+  }
+
+  if (cfgKnown && ("osdNameEnabled" in s || "osdDateEnabled" in s)) {
+    const parts = [];
+    if (s.osdNameEnabled) parts.push("name");
+    if (s.osdDateEnabled) parts.push("date");
+    cfg.appendChild(chip("OSD: " + (parts.length ? parts.join("+") : "off")));
+  }
+}
+
+// ── wiring ──────────────────────────────────────────────────────────────
+function selectCamera(devId) {
+  current = devId;
+  $("shot").innerHTML = '<div class="msg">Loading…</div>';
+  loadImage(devId);
+  const dev = cams.find(c => c.id === devId);
+  renderStates(dev);
+  if (watcher) watcher.stop();
+  watcher = indigo.observe(devId, d => {
+    const i = cams.findIndex(c => c.id === d.id);
+    if (i >= 0) cams[i] = d;
+    if (current === d.id) renderStates(d);
+  }, 5000);
+}
+
+function toggleAuto() {
+  const btn = $("auto");
+  if (autoTimer) {
+    clearInterval(autoTimer); autoTimer = null;
+    btn.textContent = "Auto: off"; btn.classList.add("sec");
+  } else {
+    autoTimer = setInterval(takeSnapshot, AUTO_MS);
+    btn.textContent = "Auto: 30s"; btn.classList.remove("sec");
+    takeSnapshot();
+  }
+}
+
+async function init() {
+  if (typeof IndigoAPI === "undefined" || !IndigoAPI.isConfigured()) {
+    showErr("Not connected to Indigo. Open this page from the Indigo server or the Domio app.");
+    return;
+  }
+  indigo = new IndigoAPI();
+  indigo.onError(e => showErr("Indigo error: " + e.message));
+  try {
+    const all = await indigo.getDevices();
+    cams = all.filter(d =>
+      (d.pluginId === PLUGIN_ID) ||
+      (d.model === "Protect Camera") ||
+      DEVICE_TYPE_MATCH.test(d.name || "")
+    );
+  } catch (e) {
+    showErr("Could not load devices: " + e.message);
+    return;
+  }
+  const sel = $("cam");
+  sel.innerHTML = "";
+  if (!cams.length) {
+    sel.innerHTML = "<option>No Protect cameras found</option>";
+    $("shotmsg").textContent = "No UniFi Protect camera devices exist in Indigo yet.";
+    return;
+  }
+  cams.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  for (const c of cams) {
+    const o = document.createElement("option");
+    o.value = c.id;
+    o.textContent = (c.name || "").replace(DEVICE_TYPE_MATCH, "");
+    sel.appendChild(o);
+  }
+  sel.addEventListener("change", e => selectCamera(parseInt(e.target.value, 10)));
+  $("refresh").addEventListener("click", takeSnapshot);
+  $("auto").addEventListener("click", toggleAuto);
+  selectCamera(cams[0].id);
+}
+
+init();
+</script>
+</body>
+</html>

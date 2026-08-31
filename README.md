@@ -60,23 +60,31 @@ It also does two things deliberately:
 
 ### Install
 
-Copy the file into Indigo's **user pages** folder:
+**Automatic, since 2026.10.0.** The plugin bundles this page and installs/updates
+it into Indigo's **user pages** folder on every `startup()`:
+
+```
+/Library/Application Support/Perceptive Automation/Indigo <version>/Web Assets/static/pages/
+```
+
+That folder survives plugin upgrades, and it is one of the two directories the
+[Domio](https://domio-smart-home.app) iOS app scans — a page inside *this*
+plugin's `Contents/Resources` can never be discovered by Domio directly
+([simons-plugins/indigo-domio-plugin#24](https://github.com/simons-plugins/indigo-domio-plugin/issues/24)
+tracks fixing that upstream), which is why the plugin copies it out to Web
+Assets rather than relying on the bundle alone. Untick **"Manage the Cameras
+web page"** in the plugin's configuration if you hand-edit the installed copy
+— otherwise your changes are overwritten on the next start.
+
+With that box unticked (or on an older plugin version), copy the file by hand
+instead:
 
 ```bash
 cp pages/cameras.html \
   "/Library/Application Support/Perceptive Automation/Indigo 2025.2/Web Assets/static/pages/"
 ```
 
-That folder survives plugin upgrades, and it is one of the two directories the
-[Domio](https://domio-smart-home.app) iOS app scans. Restart the Domio plugin
-and the page appears as **Cameras**.
-
-> It is deliberately **not** bundled inside this plugin. Domio only scans its
-> own plugin folder and `Web Assets/static/pages` — a page inside *this*
-> plugin's `Contents/Resources` can never be discovered by it, so shipping a
-> copy there would only create two files that drift apart.
-> ([simons-plugins/indigo-domio-plugin#24](https://github.com/simons-plugins/indigo-domio-plugin/issues/24)
-> tracks fixing that upstream.)
+Restart the Domio plugin (or Indigo) and the page appears as **Cameras**.
 
 ### Use it in a browser
 

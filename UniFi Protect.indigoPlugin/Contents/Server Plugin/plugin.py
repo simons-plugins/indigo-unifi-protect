@@ -123,6 +123,12 @@ HDR_TYPES = ("auto", "on", "off")
 # are servable to control pages at /images/<SNAPSHOT_SUBDIR>/...
 SNAPSHOT_SUBDIR = "unifi-protect"
 
+# Issue #27: the bundled HTML page this plugin auto-installs into Web Assets.
+# The bundle folder name below is the actual on-disk ".indigoPlugin" name,
+# not the CFBundleIdentifier -- it must match the repo's top-level directory.
+WEB_PAGE_FILENAME = "cameras.html"
+WEB_PAGE_BUNDLE_DIR = "UniFi Protect.indigoPlugin"
+
 # Stream-quality key (as returned by the rtsps-stream endpoint) -> the state
 # it is written to (issue #7). Order matters only for the log message below.
 STREAM_URL_STATES = {
@@ -404,6 +410,7 @@ class Plugin(indigo.PluginBase):
         # NB: no super().startup() -- it does not exist on PluginBase.
         self.logger.info("UniFi Protect starting")
         self._rebuild_client()
+        self._sync_web_page()
 
     def shutdown(self):
         self.logger.info("UniFi Protect stopping")
@@ -426,11 +433,17 @@ class Plugin(indigo.PluginBase):
     def closedPrefsConfigUi(self, valuesDict, userCancelled):
         if userCancelled:
             return
+        # Captured before anything below changes self.pluginPrefs's meaning,
+        # so ticking the box in this same dialog session takes effect
+        # immediately rather than waiting for the next restart (issue #27).
+        page_was_managed = _truthy(self.pluginPrefs.get("managePage"))
         self.debug = valuesDict.get("showDebugInfo", False)
         self.host = valuesDict.get("host", "").strip()
         self.api_key = valuesDict.get("apiKey", "").strip()
         self.verify_ssl = valuesDict.get("verifySSL", False)
         self._rebuild_client()
+        if _truthy(valuesDict.get("managePage")) and not page_was_managed:
+            self._sync_web_page(valuesDict)
         # Do NOT close the socket here. This runs on Indigo's UI thread, and
         # ProtectEventSocket is single-threaded by contract: closing an fd that
         # runConcurrentThread is blocked reading is genuinely unsafe, not merely
@@ -2561,6 +2574,70 @@ class Plugin(indigo.PluginBase):
                 indigo.server.getInstallFolderPath(), "Web Assets", "images", SNAPSHOT_SUBDIR
             )
         return self._snapshot_dir
+
+    def _sync_web_page(self, prefs=None):
+        """Issue #27: install/update the bundled Cameras page into Web
+        Assets on startup (and when the pref is switched on), so users stop
+        manually copying it after every change.
+
+        Must NEVER raise out of startup: the whole body is one try/except,
+        and every failure path -- missing bundle, unreadable/unwritable
+        destination -- is a WARNING naming the destination path so the user
+        can copy the file by hand instead. Paths are resolved lazily here,
+        never in __init__ or at module scope: Indigo exec()s plugin.py as a
+        string, so __file__ does not exist (see _get_snapshot_dir).
+        """
+        prefs = self.pluginPrefs if prefs is None else prefs
+        if not _truthy(prefs.get("managePage")):
+            return
+
+        dest = None
+        try:
+            install = indigo.server.getInstallFolderPath()
+            source = os.path.join(
+                install, "Plugins", WEB_PAGE_BUNDLE_DIR, "Contents",
+                "Resources", "pages", WEB_PAGE_FILENAME,
+            )
+            dest_dir = os.path.join(install, "Web Assets", "static", "pages")
+            dest = os.path.join(dest_dir, WEB_PAGE_FILENAME)
+
+            if not os.path.isfile(source):
+                self.logger.warning(
+                    f"Cameras page not found in the plugin bundle ({source}) - "
+                    f"cannot install/update it at {dest}. Reinstalling the "
+                    "plugin should restore the bundled copy."
+                )
+                return
+
+            with open(source, "rb") as handle:
+                source_bytes = handle.read()
+
+            dest_bytes = None
+            if os.path.isfile(dest):
+                with open(dest, "rb") as handle:
+                    dest_bytes = handle.read()
+
+            if dest_bytes == source_bytes:
+                self.logger.debug(f"Cameras page already up to date in Web Assets ({dest})")
+                return
+
+            os.makedirs(dest_dir, exist_ok=True)
+            tmp = f"{dest}.tmp"
+            with open(tmp, "wb") as handle:
+                handle.write(source_bytes)
+            os.replace(tmp, dest)
+
+            self.logger.info(
+                f"Installed/updated the Cameras page in Web Assets (v{self.pluginVersion} "
+                "-> managed by the plugin; untick 'Manage the Cameras web page' to hand-edit it)"
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            where = dest or f"Web Assets/static/pages/{WEB_PAGE_FILENAME}"
+            self.logger.warning(
+                f"Could not install/update the Cameras page at {where}: {exc}. "
+                "Copy pages/cameras.html there by hand, or untick 'Manage the "
+                "Cameras web page' to stop the plugin trying."
+            )
 
     # ------------------------------------------------------------------
     # Camera control actions (issue #6) -- the plugin's first write path.
