@@ -915,3 +915,275 @@ Issue #7 (stream URLs) added, in `test_plugin.py` and `test_protect_api.py`:
   ProtectAPIError's `.body` is always `""` (HTTP error, transport failure,
   or shape mismatch), tested the same way for both methods, including a
   body deliberately constructed to contain a token
+---
+
+## Issue #8: sensors, lights, chimes, NVR
+
+> **UNVERIFIED -- spec-derived.** Everything in this section (except the
+> NVR's `armMode` fields, which were captured live) is built from Protect's
+> published OpenAPI 3.1 spec (v6.2.83), not from a real device. The
+> reference rig's `GET /sensors`, `GET /lights`, and `GET /chimes` all
+> return `[]` -- there is nothing to capture against. Do not "fix" this
+> code to match a hunch about real hardware behavior without a debug
+> capture backing it; file a bug with one instead.
+
+### `event_tracker.py`: generic lifecycle families + pulses
+
+Four new **lifecycle** families, each routed by `item.type` exactly like
+MOTION/AUDIO (`add`/`update` keepalive/`update`-with-`end`, traps 1 and 2
+apply identically):
+
+| `item.type` | Internal family (`FAMILY_*` constant) | Per-event type source |
+|---|---|---|
+| `sensorMotion` | `FAMILY_SENSOR_MOTION` ("sensorMotion") | none (always empty) |
+| `sensorWaterLeak` | `FAMILY_SENSOR_LEAK` ("sensorLeak") | none |
+| `sensorAlarm` | `FAMILY_SENSOR_ALARM` ("sensorAlarm") | `metadata.alarmType.text` |
+| `sensorTamper` | `FAMILY_SENSOR_TAMPER` ("sensorTamper") | none |
+
+Reached via the generic methods, not per-family wrappers: `family_active(family,
+device_id)`, `family_types(family, device_id)`, `last_family_ms(family,
+device_id)`, `clear_family(family, device_id)`. `is_active`/`detect_types`/
+`audio_active`/etc. are unchanged and are NOT reimplemented on top of the
+generic methods -- they predate this generalization and share the same
+underlying per-family storage, so the two APIs can never disagree.
+
+Six **pulse** types -- fire-once notifications, never an active/idle span
+(the OpenAPI spec gives each a nullable `end`, but the type's own
+description is a point-in-time notice, e.g. "has entered an open state",
+not a lifecycle): `sensorOpened`, `sensorClosed`, `sensorBatteryLow`,
+`sensorExtremeValues`, `sensorSmokeTest`, `lightMotion`. Any `add`/`update`
+frame of a pulse type is recorded via `last_pulse(device_id, pulse_type) ->
+{"start": epoch_ms|None, "metadata": dict}` and reports the device
+changed; a repeat of the same event id is a no-op, deduped against the
+**same** finished-id cache lifecycle events use (event ids are globally
+unique across the whole schema, so sharing is safe). Pulses **survive**
+`clear_family`/`clear_camera` (they are a history, not live state) and are
+**dropped** by `reset()`.
+
+`KNOWN_UNSUPPORTED_EVENT_TYPES` now holds only `"ring"` -- every other
+previously-unsupported type is a recognized family or pulse.
+
+### `protect_api.py`: new methods
+
+```python
+def _request(self, method: str, path: str, params=None, body=None) -> Any: ...
+    # General GET/PATCH (or any verb) helper, added because this branch's
+    # base did not yet have one. Issue #6 (stacked earlier, rebased in
+    # later) is expected to add a method with this exact signature -- on
+    # rebase, prefer #6's and drop this one if they are equivalent.
+
+def get_sensors(self) -> list[dict]: ...
+def get_sensor(self, sensor_id: str) -> dict: ...
+def patch_sensor(self, sensor_id: str, body: dict) -> dict: ...
+
+def get_lights(self) -> list[dict]: ...
+def get_light(self, light_id: str) -> dict: ...
+def patch_light(self, light_id: str, body: dict) -> dict: ...
+
+def get_chimes(self) -> list[dict]: ...
+def get_chime(self, chime_id: str) -> dict: ...
+def patch_chime(self, chime_id: str, body: dict) -> dict: ...
+
+def get_nvr(self) -> dict: ...
+    # GET /nvrs. Live-verified 2026-08-31 on 7.2.105: returns a SINGLE
+    # OBJECT, not an array -- matching the OpenAPI spec's response schema
+    # for this path (`nvr`, not `array<nvr>`) despite the plural path name.
+    # Tolerates a one-element list defensively; raises on [], a
+    # multi-element list, or any other non-dict/non-list shape.
+```
+
+Every method follows the same shape-validation and error style as
+`get_cameras`/`get_camera`.
+
+### Live NVR facts (verified 2026-08-31, UNVR 7.2.105)
+
+`GET /nvrs` returns:
+
+```json
+{"id": "...", "modelKey": "nvr", "name": "...", "type": "UNVRINSTANT",
+ "guid": "...", "mac": "...",
+ "doorbellSettings": {...},
+ "armMode": {"status": "disabled", "armedAt": null, "willBeArmedAt": null,
+             "breachDetectedAt": null, "breachEventCount": 0,
+             "breachTriggerEventId": null, "breachEventId": null}}
+```
+
+`armMode`, `type`, `guid`, and `mac` are **not** in the OpenAPI spec --
+observed-only. `armMode` may be absent entirely on some Protect versions;
+tolerate both a dict and its absence.
+
+### `plugin.py`: device classes
+
+Registries mirror `self.cameras`/`self.camera_info`: `self.sensors`,
+`self.sensor_info`, `self.lights`, `self.light_info`, `self.chimes`,
+`self.chime_info`, and `self.nvrs`/`self.nvr_info` (`self.nvrs` is keyed by
+the NVR's own id once a poll has learned it, or the literal string `"nvr"`
+before that -- `_rekey_nvr()` moves the device-id set across on first
+successful poll).
+
+**Polling** (`_poll_devices()`, `DEVICE_POLL_INTERVAL = 60.0`): called from
+`_pump()` when due, and from `_open_socket()` right after
+`_refresh_camera_info()` -- but ONLY when at least one non-camera device is
+registered, so an API that raises if touched is never touched with only
+cameras present. Each registered class costs one throttled REST call
+(`_rest` enforces `MIN_REST_INTERVAL = 3.0s`), so a full poll cycle inside
+`_pump()` can block that loop for up to *N* × 3s; any WS frames that
+arrive meanwhile simply queue in the socket's own read buffer -- an
+accepted trade against a second thread. A poll failure logs ERROR once per
+class per outage (`_poll_failed_classes` guard set, cleared on success),
+leaves every cached value at its last-known state, sets that class's own
+state string (`sensorState`/`lightState`/`chimeState`) to
+`STATE_UNAVAILABLE`, and never touches `lastPoll`.
+
+**Reconciliation** (poll is authoritative for measurements/flags; between
+polls, the live event stream drives the boolean):
+
+- Sensor `motionDetected`: driven live by `family_active(FAMILY_SENSOR_MOTION,
+  ...)`. At poll time, if the poll's own `isMotionDetected` is `False`
+  while the tracker still thinks it's active, the tracker is corrected
+  (`clear_family`) -- never the other direction.
+- Sensor `isOpen`: the poll's `isOpened`, overridden by whichever of a
+  `sensorOpened`/`sensorClosed` pulse has a newer `start` than the poll's
+  own `openStatusChangedAt` (and than each other, if both exist). The
+  winning timestamp doubles as `lastOpenChange`.
+- Sensor `batteryLow`: poll's `batteryStatus.isLow`, OR a `sensorBatteryLow`
+  pulse newer than `_device_last_poll_ms[sensor_id]` (the wall-clock time
+  of that sensor's last poll write) -- self-expiring, since the next poll
+  always advances that timestamp.
+- Sensor `temperature`/`humidity`/`lightLevel`: poll's `stats.<metric>.value`,
+  immediately overridden by a `sensorExtremeValues` pulse for the matching
+  metric (`metadata.sensorType.text`) newer than `_device_last_poll_ms` --
+  same self-expiring pattern.
+- Light `pirMotionDetected`: treated like a sensor lifecycle boolean (see
+  disconnect rule below) -- forced `False` when the socket is down.
+  Otherwise, the poll's `isPirMotionDetected`, overridden `True` by a
+  `lightMotion` pulse newer than `_device_last_poll_ms[light_id]`.
+- Light `lastMotion`: the newer of the poll's own `lastMotion` field and a
+  `lightMotion` pulse's `start`.
+
+**Disconnect rule, extended**: on socket loss, sensor
+`motionDetected`/`leakDetected`/`alarmTriggered`+`alarmType`/`tampered`
+and light `pirMotionDetected` go `False` with `connected` `False` -- the
+same honesty rule as camera motion, because these are the fields driven by
+the live event stream. Everything else on sensors/lights (`isOpen`,
+`batteryLow`, `temperature`, `isLightOn`, ...) and everything on
+chimes/NVR is REST-poll-derived and is **kept** at its last-known value,
+exactly like a camera's `cameraModel`/`videoMode` survive a socket loss.
+`connected` on every new device type reflects the same event-socket health
+signal as a camera's `connected` (`_is_connected()`), even for chimes/NVR,
+which have no live feed of their own -- there is one connectivity concept
+in this plugin, not a per-class one.
+
+**`primaryState` resolution** (`protectSensor` only): `"auto"` (default)
+maps mount type to a boolean via `SENSOR_MOUNT_PRIMARY_STATE` --
+`door`/`window`/`garage` -> `isOpen`, `leak` -> `leakDetected`, `none` (or
+anything unrecognized) -> `motionDetected`. Any other explicit choice
+(`open`/`motion`/`leak`/`alarm`) wins outright.
+
+**`actionControlDevice`** (protectLight only -- the only new device type
+that declares TurnOn/TurnOff/Toggle): `PATCH .../lights/{id}` with
+`{"isLightForceEnabled": <bool>}`, THEN a re-`GET` to pick up every other
+field, THEN the full state write. Toggle reads the cached
+`isLightForceEnabled` to decide direction. "Off" only clears the force
+flag -- the floodlight's own motion mode, if any, can still turn it on.
+
+**`actionControlUniversal` RequestStatus**, every new type: an immediate
+single-device `GET` (not the batch `GET .../sensors` etc.) + state write,
+mirroring the camera path's `_refresh_camera_info()` + `_apply_camera_state`.
+
+### State tables
+
+**protectSensor** (`type="sensor"`, no subType -- one device tracks up to
+five different physical sensor kinds):
+
+| State | Type | Source |
+|---|---|---|
+| `isOpen` | Boolean | poll `isOpened`, pulse-overridden (see above) |
+| `motionDetected` | Boolean | `family_active(FAMILY_SENSOR_MOTION, ...)` |
+| `leakDetected` | Boolean | `family_active(FAMILY_SENSOR_LEAK, ...)` |
+| `alarmTriggered` | Boolean | `family_active(FAMILY_SENSOR_ALARM, ...)` |
+| `alarmType` | String | `family_types(FAMILY_SENSOR_ALARM, ...)`, comma-joined |
+| `tampered` | Boolean | `family_active(FAMILY_SENSOR_TAMPER, ...)` |
+| `batteryLow` | Boolean | poll `batteryStatus.isLow`, pulse-overridden |
+| `temperature`/`humidity`/`lightLevel` | Number | poll `stats.*.value`, pulse-overridden; omitted (not `0`) when unknown |
+| `mountType` | String | poll `mountType` |
+| `sensorState` | String | poll `state`, or `STATE_UNAVAILABLE` |
+| `connected` | Boolean | event socket health |
+| `lastMotion` | String | ISO or `""`, from `last_family_ms(FAMILY_SENSOR_MOTION, ...)` |
+| `lastOpenChange` | String | ISO or `""`, the `isOpen` reconciliation's winning timestamp |
+| `lastPoll` | String | ISO, only present on a poll-triggered write |
+| *(native)* `batteryLevel` | -- | poll `batteryStatus.percentage`, via `updateStateOnServer` -- **not** a `<State>` |
+
+**protectLight** (`type="relay"`): `onOffState` = `isLightOn`.
+
+| State | Type | Source |
+|---|---|---|
+| `isDark` | Boolean | poll `isDark` |
+| `pirMotionDetected` | Boolean | poll `isPirMotionDetected`, pulse-overridden; disconnect-forced False |
+| `forceEnabled` | Boolean | poll `isLightForceEnabled` |
+| `ledLevel` | Integer | poll `lightDeviceSettings.ledLevel`; skipped if unparseable |
+| `lightMode` | String | poll `lightModeSettings.mode` |
+| `lightState` | String | poll `state`, or `STATE_UNAVAILABLE` |
+| `connected` | Boolean | event socket health |
+| `lastMotion` | String | ISO or `""` (see reconciliation above) |
+| `lastPoll` | String | ISO, poll-triggered writes only |
+
+**protectChime** (`type="custom"`):
+
+| State | Type | Source |
+|---|---|---|
+| `chimeState` | String | poll `state`, or `STATE_UNAVAILABLE` |
+| `pairedCameraCount` | Integer | `len(cameraIds)` |
+| `ringVolume` | Integer | first `ringSettings` entry's `volume`; omitted if no entries |
+| `connected` | Boolean | event socket health |
+| `lastPoll` | String | ISO, poll-triggered writes only |
+
+**protectNvr** (`type="custom"`, no device picker -- one NVR per console):
+
+| State | Type | Source |
+|---|---|---|
+| `nvrName` | String | poll `name` |
+| `nvrModel` | String | poll `type` (observed-only field); omitted if absent |
+| `protectVersion` | String | `GET /meta/info` (`applicationVersion`), refreshed alongside each NVR poll |
+| `armStatus` | String | `armMode.status`, or `STATE_UNAVAILABLE` if `armMode`/`nvr_info` absent |
+| `armedAt` | String | ISO or `""` |
+| `breachDetectedAt` | String | ISO or `""` |
+| `breachEventCount` | Integer | `armMode.breachEventCount` |
+| `connected` | Boolean | event socket health |
+| `lastPoll` | String | ISO, poll-triggered writes only |
+
+No actions -- arm/disarm is not in the published integration API.
+
+### Testing
+
+`tests/fixtures/{sensors,lights,chimes,nvrs}_spec.json` (spec-derived, see
+`tests/fixtures/README.md`). Per workspace convention, the adversarial
+question is "when could this report idle/unavailable/kept and be wrong?":
+
+- fatal-collaborator: `_poll_devices()` with only cameras registered never
+  touches any non-camera API method; with exactly one sensor registered,
+  only `get_sensors` is touched
+- a poll failure keeps every last-known value, marks the class's own state
+  string `"unavailable"`, never writes `lastPoll`, and logs ERROR exactly
+  once across two consecutive failures
+- `primaryState=auto` picks the right boolean per mount type, and an
+  explicit choice overrides mount type
+- `isOpen` reconciliation both directions: a pulse newer than the poll's
+  `openStatusChangedAt` wins; a poll newer than the pulse wins
+- a poll's `isMotionDetected: false` clears a tracker family stuck active
+  from a lost `end` frame
+- `batteryLevel` lands as a native single-key write, never inside the
+  batched `updateStatesOnServer` call
+- disconnect forces sensor lifecycle booleans and light `pirMotionDetected`
+  False while keeping poll-derived values (`temperature`, `onOffState`)
+- light TurnOn does PATCH-then-GET in that order; a refused PATCH logs
+  ERROR and leaves every state untouched (proven with a `get_light` that
+  raises if called)
+- `setChimeVolume` on a chime with no `ringSettings` errors without
+  calling `patch_chime`
+- NVR `armStatus` reads `"unavailable"` both before any poll and when
+  `armMode` itself is absent from a present `nvr_info`
+- declared-vs-written, extended to iterate every `<Device>` in Devices.xml
+  (not just the camera), with `batteryLevel` explicitly exempted from both
+  the "undeclared" and "never written" checks since it is a native
+  property, never a `<State>`

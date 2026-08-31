@@ -244,6 +244,107 @@ A one-line example: copy the `streamUrlHigh` state's value and hand it
 straight to a player -- `ffplay "rtsps://192.168.0.10:7441/<token>?enableSrtp"`,
 or paste the same URL into VLC's **Open Network Stream** dialog.
 
+## Other Protect devices -- sensors, floodlights, chimes, NVR
+
+> **Built from the official OpenAPI spec, never exercised on real
+> hardware.** Every camera feature in this plugin (above) was verified
+> against a live UniFi Protect console. Sensors, floodlights, and chimes
+> were not: the reference console has none, and `GET /sensors`, `GET
+> /lights`, and `GET /chimes` all return `[]` there. This code is built
+> entirely from Protect's published OpenAPI 3.1 spec (v6.2.83) --
+> field names, shapes, and event types should be right, but nothing here
+> has been proven against a real Protect sensor, floodlight, or chime.
+> **If something looks wrong, please open an issue with a debug capture**:
+> run `docs/ws_probe.py` while triggering the sensor/light/chime, and
+> attach its output alongside a `GET /sensors` (or `/lights`, `/chimes`)
+> JSON dump from your console. The NVR device below is the one exception
+> -- its arm-state fields were captured live.
+
+Each class gets its own Indigo device type, added and configured the same
+way as a camera: create a device, pick the Protect object from the
+dropdown (populated live), done. Use **Discover Devices** (plugin menu,
+renamed from "Discover Cameras") to list everything your console reports
+across all four classes.
+
+### Polling
+
+Sensors, floodlights, and chimes have no live push feed from Protect for
+most of their state -- only cameras get one. This plugin polls each class
+over REST every **60 seconds**, and only for classes that actually have a
+registered Indigo device (a console with sensors but no chimes never
+triggers a chime poll). Sensors and floodlights *also* receive live
+updates over the same camera event socket for the fields that have a
+matching Protect event (motion/leak/alarm/tamper lifecycle events, and the
+open/closed/battery-low/extreme-value/PIR-motion "pulse" notifications) --
+the poll is what keeps everything else (temperature, battery percentage,
+light mode, chime ring settings, ...) current, and it's also what
+corrects a live motion flag that's gotten stuck (if Protect's own poll
+answer says motion has stopped, that wins). A poll failure logs one ERROR
+per class per outage (not once a minute), keeps every last-known value,
+and marks that class's own state string (`sensorState`/`lightState`/
+`chimeState`) `"unavailable"` -- it never fabricates a fresh-looking
+False/empty value.
+
+### Protect Sensor
+
+Tracks a Protect multi-purpose sensor (door/window/garage contact, leak,
+motion, tamper, and a smoke/CO/glass-break alarm listener, plus
+temperature/humidity/light-level readings on models that have them).
+
+States: `isOpen`, `motionDetected`, `leakDetected`, `alarmTriggered`,
+`alarmType`, `tampered`, `batteryLow`, `temperature`, `humidity`,
+`lightLevel`, `mountType`, `sensorState`, `connected`, `lastMotion`,
+`lastOpenChange`, `lastPoll`.
+
+**Which state drives the device's on/off status** (what a "device turned
+on" trigger watches) is the **Primary state** device setting: `Auto`
+(default) picks by mount type -- door/window/garage mounts use `isOpen`,
+a leak mount uses `leakDetected`, no mount uses `motionDetected` -- or
+pin it explicitly to Open/Closed, Motion, Leak, or Alarm.
+
+**Battery percentage is Indigo's native battery state**, not a plugin
+state -- it shows up wherever Indigo already shows battery level for any
+device, via the `SupportsBatteryLevel` device property.
+
+`motionDetected`/`leakDetected`/`alarmTriggered`/`tampered` are
+live-event-driven, so they follow the same honesty rule as camera motion:
+when the event socket is down they go `False`, not "unknown". Everything
+else here (`isOpen`, `batteryLow`, `temperature`, ...) comes from the
+60-second poll and is kept at its last-known value through a socket
+outage, the same way a camera's hardware states survive one.
+
+### Protect Light (floodlight)
+
+States: `isDark`, `pirMotionDetected`, `forceEnabled`, `ledLevel`,
+`lightMode`, `lightState`, `connected`, `lastMotion`, `lastPoll`. The
+device's on/off state is the light's actual LED (`isLightOn`).
+
+**Turning the device "on" or "off" force-enables/disables the light's main
+LED** (`PATCH .../lights/{id}` with `isLightForceEnabled`). **"Off" only
+clears the force flag -- it does not disable the floodlight's own motion
+mode.** If the light's mode is set to turn on for motion, it can still
+light up on its own right after you turn it "off" here. There's a
+**Set LED Level** action (1-6) for the light's brightness.
+
+### Protect Chime
+
+States: `chimeState`, `pairedCameraCount`, `ringVolume` (the first paired
+camera's ring volume -- skipped entirely if the chime has no ringtone
+settings), `connected`, `lastPoll`. There's a **Set Chime Volume** action
+(0-100) that applies the same volume to every camera paired to the chime;
+it errors without doing anything if the chime has no ring settings to set
+volume on in the first place (nothing paired to it yet).
+
+### Protect NVR
+
+One device, no picker -- there is only one NVR per console. Tracks your
+UniFi OS console's arm/disarm state: `nvrName`, `nvrModel`,
+`protectVersion`, `armStatus`, `armedAt`, `breachDetectedAt`,
+`breachEventCount`, `connected`, `lastPoll`. `armStatus` reads
+`"unavailable"` before the first successful poll, or if the console never
+reports an arm state at all. Arm/disarm itself is not exposed as an
+action -- it isn't part of the published integration API.
+
 ## Latency
 
 Motion detection rides the Protect event WebSocket, not polling. Measured
