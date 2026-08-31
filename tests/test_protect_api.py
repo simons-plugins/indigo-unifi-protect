@@ -785,13 +785,25 @@ def test_get_nvr_rejects_every_other_shape(monkeypatch, raw_body):
         api.get_nvr()
 
 
-def test_request_helper_returns_none_for_empty_body(monkeypatch):
-    """A 2xx with no body (e.g. a 204) must not raise a JSON decode error --
-    it returns None."""
+def test_request_helper_returns_raw_bytes(monkeypatch):
+    """_request (issue #6) returns the raw response body -- JSON parsing is
+    each caller's own job (_get_json/_patch_json), matching patch_camera's
+    existing inline pattern."""
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(b'{"id":"s1"}')))
+    api = make_api()
+    assert api._request("PATCH", "/sensors/s1", body={"name": "x"}) == b'{"id":"s1"}'
+
+
+def test_patch_json_empty_body_raises_not_none(monkeypatch):
+    """A 2xx with no body (e.g. a 204) cannot be parsed as JSON -- _patch_json
+    (and _get_json) raise ProtectAPIError rather than silently returning
+    None, matching patch_camera's own empty/malformed-body handling."""
     monkeypatch.setattr("protect_api.urllib.request.urlopen",
                          MagicMock(return_value=_FakeResponse(b"")))
     api = make_api()
-    assert api._request("PATCH", "/sensors/s1", body={"name": "x"}) is None
+    with pytest.raises(ProtectAPIError):
+        api._patch_json("/sensors/s1", {"name": "x"})
 
 
 def test_fake_api_key_never_appears_in_request_helper_exception(monkeypatch):
