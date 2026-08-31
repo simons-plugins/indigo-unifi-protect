@@ -8,7 +8,9 @@ object carries no motion field and `GET /events` returns 404.
 
 What that costs, stated plainly because it shapes every automation written
 against this plugin: Indigo booleans cannot express "unknown". When the socket
-is down this plugin forces `motionDetected` False and `connected` False. It
+is down this plugin forces `motionDetected` False and `connected` False --
+and, identically, `audioDetected` plus the four specific audio states
+(speechDetected/babyCryDetected/smokeAlarmDetected/coAlarmDetected). It
 does NOT have a way to say "I cannot tell" in the motion state itself.
 
     Any trigger that acts on motion MUST gate on `connected` first.
@@ -23,7 +25,7 @@ from datetime import datetime
 
 import indigo
 
-from event_tracker import EventTracker
+from event_tracker import EventTracker, KNOWN_UNSUPPORTED_EVENT_TYPES, MISSING_TYPE_KEY
 from protect_api import ProtectAPI, ProtectAPIError
 from protect_ws import ProtectEventSocket
 
@@ -53,6 +55,23 @@ STALE_TIMEOUT = 90.0
 
 TRACKED_DETECT_TYPES = ("person", "vehicle", "animal")
 
+# Audio smartDetectTypes this plugin surfaces as their own boolean states,
+# mapped to the state key each one writes.
+TRACKED_AUDIO_TYPES = {
+    "alrmSpeak": "speechDetected",
+    "alrmBabyCry": "babyCryDetected",
+    "alrmSmoke": "smokeAlarmDetected",
+    "alrmCmonx": "coAlarmDetected",
+}
+
+# Which audio types count as "activity" for onOffState purposes, subject to
+# the per-device audioCountsAsActivity checkbox. Smoke/CO alarms are
+# deliberately NOT in here -- an alarm sound is not presence, and folding it
+# into onOffState would make "device turned on" trigger on a smoke alarm,
+# which is not what that trigger means and could bury a real alert under a
+# routine motion notification.
+PRESENCE_AUDIO_TYPES = frozenset({"alrmSpeak", "alrmBabyCry"})
+
 # Written to cameraState when the camera list could not be fetched. An empty
 # string is indistinguishable from "the camera genuinely reports no state", and
 # a trigger reading it would see "not DISCONNECTED" and believe things are fine.
@@ -61,6 +80,22 @@ STATE_UNAVAILABLE = "unavailable"
 # Under Indigo's "Web Assets/images", so snapshots survive plugin upgrades and
 # are servable to control pages at /images/<SNAPSHOT_SUBDIR>/...
 SNAPSHOT_SUBDIR = "unifi-protect"
+
+
+def _truthy(value, default=True):
+    """Coerce a pluginProps checkbox value to bool.
+
+    Indigo can hand a checkbox prop back as the STRING "false" rather than
+    the bool False (see heatmiser's `_coerce_bool`, indigo-matter's
+    `export_dialog_mixin._truthy`), and `bool("false")` is True -- so a
+    naive `.get(key, True)` would silently ignore a user unchecking the
+    box. None (the prop was never set) resolves to `default`.
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
 
 
 class Plugin(indigo.PluginBase):
@@ -85,6 +120,10 @@ class Plugin(indigo.PluginBase):
         self._last_rest_call = 0.0
         self._reconnect_requested = False
         self._reported_dropped = 0
+        # Which ignored item.type strings we've already logged this plugin
+        # run -- so a burst of the same unsupported/unknown type doesn't
+        # spam the Event Log once per frame.
+        self._reported_ignored_types = set()
         # Resolved lazily on first use, NOT here. Indigo exec()s plugin.py as a
         # string, so __file__ does not exist and touching it in __init__ kills
         # the plugin at InitializeMain before any of it runs.
@@ -311,6 +350,7 @@ class Plugin(indigo.PluginBase):
                 for camera_id in changed:
                     self._apply_camera_state(camera_id)
                 self._report_dropped_frames()
+                self._report_ignored_types()
 
             # Active liveness probe. See PING_INTERVAL above for why silence
             # alone cannot be trusted as a death signal.
@@ -335,6 +375,32 @@ class Plugin(indigo.PluginBase):
             )
             self._reported_dropped = dropped
 
+    def _report_ignored_types(self):
+        """Surface the tracker's ignore-and-count for item.type values this
+        plugin does not act on, once per type per plugin run so a burst of
+        the same type doesn't spam the Event Log. A documented-but-not-yet-
+        supported type (doorbell ring, Protect sensor) is expected and
+        unremarkable -- log it at DEBUG. Anything else is either a genuinely
+        new event type or a parsing gap and is worth a bug report -- log it
+        at WARNING. Both include the first camera id seen sending it, so the
+        log line points somewhere useful."""
+        for event_type in self.tracker.ignored_type_counts:
+            if event_type in self._reported_ignored_types:
+                continue
+            self._reported_ignored_types.add(event_type)
+            sample_device = self.tracker.ignored_type_samples.get(event_type, "unknown")
+            if event_type == MISSING_TYPE_KEY:
+                what = "event frames with no `type` field"
+            else:
+                what = f"'{event_type}' event frames"
+            if event_type in KNOWN_UNSUPPORTED_EVENT_TYPES:
+                self.logger.debug(f"Ignoring {what} - not supported yet (e.g. device {sample_device})")
+            else:
+                self.logger.warning(
+                    f"Ignoring {what} - not treated as motion (e.g. device {sample_device}). "
+                    "Please report this on GitHub with a debug capture."
+                )
+
     def _close_socket(self):
         if self.socket is None:
             return
@@ -358,7 +424,9 @@ class Plugin(indigo.PluginBase):
     def _mark_all_disconnected(self):
         """A dead socket means motion is unknown. Indigo booleans cannot say
         that, so motion goes False and `connected` goes False alongside it --
-        automations are expected to gate on the latter."""
+        the same forced-False rule covers `audioDetected` and the four
+        specific audio states too, for the same reason. Automations are
+        expected to gate on `connected`."""
         for camera_id in list(self.cameras):
             self.tracker.clear_camera(camera_id)
             self._apply_camera_state(camera_id, connected=False, force=True)
@@ -389,19 +457,34 @@ class Plugin(indigo.PluginBase):
             self._write_states(dev, camera_id, connected, force)
 
     def _write_states(self, dev, camera_id, connected, force):
-        active = self.tracker.is_active(camera_id) if connected else False
-        types = sorted(self.tracker.detect_types(camera_id)) if connected else []
+        motion_active = self.tracker.is_active(camera_id) if connected else False
+        motion_types = sorted(self.tracker.detect_types(camera_id)) if connected else []
+        audio_active = self.tracker.audio_active(camera_id) if connected else False
+        audio_types = sorted(self.tracker.audio_types(camera_id)) if connected else []
         info = self.camera_info.get(camera_id)
 
+        # Speech/baby-cry count toward onOffState by default -- the per-
+        # device checkbox can opt out. Smoke/CO alarm sounds NEVER count,
+        # checkbox or not: an alarm is not presence, and folding it into
+        # onOffState would make a "device turned on" trigger fire on a smoke
+        # alarm, burying a real alert under a routine motion notification.
+        counts_as_activity = _truthy(dev.pluginProps.get("audioCountsAsActivity"))
+        audio_presence = bool(counts_as_activity and PRESENCE_AUDIO_TYPES.intersection(audio_types))
+        on_state = motion_active or audio_presence
+
         states = [
-            {"key": "onOffState", "value": active},
-            {"key": "motionDetected", "value": active},
-            {"key": "lastDetectTypes", "value": ",".join(types)},
+            {"key": "onOffState", "value": on_state},
+            {"key": "motionDetected", "value": motion_active},
+            {"key": "lastDetectTypes", "value": ",".join(motion_types)},
+            {"key": "audioDetected", "value": audio_active},
+            {"key": "lastAudioTypes", "value": ",".join(audio_types)},
             {"key": "cameraState", "value": info.get("state", "") if info else STATE_UNAVAILABLE},
             {"key": "connected", "value": connected},
         ]
         for detect_type in TRACKED_DETECT_TYPES:
-            states.append({"key": f"{detect_type}Detected", "value": detect_type in types})
+            states.append({"key": f"{detect_type}Detected", "value": detect_type in motion_types})
+        for audio_type, state_key in TRACKED_AUDIO_TYPES.items():
+            states.append({"key": state_key, "value": audio_type in audio_types})
 
         last_ms = self.tracker.last_motion_ms(camera_id)
         if isinstance(last_ms, (int, float)) and last_ms > 0:
@@ -410,9 +493,18 @@ class Plugin(indigo.PluginBase):
                 "value": datetime.fromtimestamp(last_ms / 1000.0).isoformat(timespec="seconds"),
             })
 
-        if force or active != bool(dev.states.get("onOffState", False)):
+        last_audio_ms = self.tracker.last_audio_ms(camera_id)
+        if isinstance(last_audio_ms, (int, float)) and last_audio_ms > 0:
+            states.append({
+                "key": "lastAudio",
+                "value": datetime.fromtimestamp(last_audio_ms / 1000.0).isoformat(timespec="seconds"),
+            })
+
+        # The state image tracks onOffState, not motion alone -- a speech or
+        # baby-cry event (with the checkbox on) trips it exactly like motion.
+        if force or on_state != bool(dev.states.get("onOffState", False)):
             dev.updateStateImageOnServer(
-                indigo.kStateImageSel.MotionSensorTripped if active
+                indigo.kStateImageSel.MotionSensorTripped if on_state
                 else indigo.kStateImageSel.MotionSensor
             )
         dev.updateStatesOnServer(states)

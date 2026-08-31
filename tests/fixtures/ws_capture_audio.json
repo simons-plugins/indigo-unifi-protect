@@ -1,0 +1,227 @@
+[
+  {
+    "recvLocal": "21:16:34",
+    "frame": 1,
+    "message": {
+      "type": "add",
+      "item": {
+        "id": "77737bac-a028-4060-99b6-69131873da28",
+        "modelKey": "event",
+        "type": "smartDetectZone",
+        "start": 1787775392219,
+        "device": "69bea2c1001d4703e4002686",
+        "smartDetectTypes": [
+          "person"
+        ]
+      }
+    }
+  },
+  {
+    "recvLocal": "21:16:34",
+    "frame": 2,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "77737bac-a028-4060-99b6-69131873da28",
+        "type": "smartDetectZone",
+        "start": 1787775392219,
+        "device": "69bea2c1001d4703e4002686",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "21:16:44",
+    "frame": 3,
+    "message": {
+      "item": {
+        "id": "6a8f49ac03d53b03e402a148",
+        "modelKey": "event",
+        "type": "smartAudioDetect",
+        "start": 1787775388929,
+        "device": "69be54f600574703e4000ff4",
+        "smartDetectTypes": []
+      },
+      "type": "add"
+    }
+  },
+  {
+    "recvLocal": "21:16:45",
+    "frame": 4,
+    "message": {
+      "item": {
+        "id": "6a8f49ac03d53b03e402a148",
+        "modelKey": "event",
+        "type": "smartAudioDetect",
+        "start": 1787775388929,
+        "device": "69be54f600574703e4000ff4",
+        "smartDetectTypes": [
+          "alrmSpeak"
+        ]
+      },
+      "type": "update"
+    }
+  },
+  {
+    "recvLocal": "21:17:05",
+    "frame": 5,
+    "message": {
+      "item": {
+        "id": "6a8f49ac03d53b03e402a148",
+        "modelKey": "event",
+        "type": "smartAudioDetect",
+        "start": 1787775388929,
+        "end": 1787775413022,
+        "device": "69be54f600574703e4000ff4",
+        "smartDetectTypes": [
+          "alrmSpeak"
+        ]
+      },
+      "type": "update"
+    }
+  },
+  {
+    "recvLocal": "21:18:00",
+    "frame": 6,
+    "message": {
+      "type": "add",
+      "item": {
+        "id": "cb90f7bf-a7ce-4c04-b3f8-6c91234563ae",
+        "modelKey": "event",
+        "type": "smartDetectZone",
+        "start": 1787775477590,
+        "device": "69ed1b24002f7f03e407c90a",
+        "smartDetectTypes": [
+          "person"
+        ]
+      }
+    }
+  },
+  {
+    "recvLocal": "21:18:02",
+    "frame": 7,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "cb90f7bf-a7ce-4c04-b3f8-6c91234563ae",
+        "type": "smartDetectZone",
+        "start": 1787775477590,
+        "device": "69ed1b24002f7f03e407c90a",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "21:18:03",
+    "frame": 8,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "77737bac-a028-4060-99b6-69131873da28",
+        "type": "smartDetectZone",
+        "start": 1787775392219,
+        "device": "69bea2c1001d4703e4002686",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "21:18:03",
+    "frame": 9,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "77737bac-a028-4060-99b6-69131873da28",
+        "type": "smartDetectZone",
+        "start": 1787775392219,
+        "end": 1787775477224,
+        "device": "69bea2c1001d4703e4002686",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "21:18:04",
+    "frame": 10,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "77737bac-a028-4060-99b6-69131873da28",
+        "type": "smartDetectZone",
+        "start": 1787775392219,
+        "end": 1787775477224,
+        "device": "69bea2c1001d4703e4002686",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "21:18:10",
+    "frame": 11,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "cb90f7bf-a7ce-4c04-b3f8-6c91234563ae",
+        "type": "smartDetectZone",
+        "start": 1787775477590,
+        "end": 1787775483729,
+        "device": "69ed1b24002f7f03e407c90a",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "21:18:10",
+    "frame": 12,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "cb90f7bf-a7ce-4c04-b3f8-6c91234563ae",
+        "type": "smartDetectZone",
+        "start": 1787775477590,
+        "end": 1787775483729,
+        "device": "69ed1b24002f7f03e407c90a",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  },
+  {
+    "recvLocal": "21:18:10",
+    "frame": 13,
+    "message": {
+      "type": "update",
+      "item": {
+        "id": "cb90f7bf-a7ce-4c04-b3f8-6c91234563ae",
+        "type": "smartDetectZone",
+        "start": 1787775477590,
+        "end": 1787775483729,
+        "device": "69ed1b24002f7f03e407c90a",
+        "smartDetectTypes": [
+          "person"
+        ],
+        "modelKey": "event"
+      }
+    }
+  }
+]

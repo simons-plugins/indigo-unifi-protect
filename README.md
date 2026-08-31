@@ -1,7 +1,8 @@
 # UniFi Protect for Indigo
 
-Bridges UniFi Protect camera motion, person, vehicle, and animal detection
-into [Indigo](https://www.indigodomo.com) sensor devices, via the official
+Bridges UniFi Protect camera motion (person, vehicle, animal) and audio
+(speech, baby cry, smoke/CO alarm sounds) detection into
+[Indigo](https://www.indigodomo.com) sensor devices, via the official
 UniFi OS integration API.
 
 ## Requirements
@@ -108,6 +109,35 @@ acts on motion **must gate on `connected` first**, or a dead socket reads
 as an empty, quiet house. This is the single most important thing to know
 before wiring this plugin into an automation.
 
+### Audio detection
+
+Cameras with a microphone also report **audio events** — speech, a baby
+crying, or a smoke/CO alarm sounding — over the same event socket as
+motion, but tracked completely separately:
+
+- `audioDetected` is true while any audio event is active on the camera
+  (even before Protect has classified *what* it heard — classification
+  lands about a second after the `add` frame arrives).
+- `speechDetected`, `babyCryDetected`, `smokeAlarmDetected`, and
+  `coAlarmDetected` are true when that specific type is part of the
+  currently active audio event(s).
+- `lastAudio` / `lastAudioTypes` record the most recent audio event, the
+  same way `lastMotion` / `lastDetectTypes` do for motion.
+
+**By default, `onOffState` — what a "device turned on" trigger watches —
+goes on for motion, speech, or a baby crying.** Uncheck **Audio counts as
+activity** on the device to exclude speech/baby-cry and have `onOffState`
+track motion only. **A smoke or CO alarm sound never turns the device on**,
+checkbox or not — build automations against `smokeAlarmDetected` /
+`coAlarmDetected` directly, not against `onOffState`, so a real alarm is
+never mistaken for (or buried under) routine motion/presence handling.
+
+The same `connected` gating above applies here too: when the event socket
+is down, the live audio booleans and `lastAudioTypes` go False/empty
+exactly like `motionDetected` does (`lastAudio` is a historical
+timestamp and is kept, same as `lastMotion`). Silence is not safety —
+it can just as easily mean the plugin can't hear anything right now.
+
 ## Latency
 
 Motion detection rides the Protect event WebSocket, not polling. Measured
@@ -117,6 +147,9 @@ resolution):
 
 - **Motion on**: ~1–3s
 - **Motion off**: ~6–7s
+- **Audio** (one live sample, 2026-08-26): the `add` trailed Protect's
+  own `start` by ~16s and the `end` arrived ~12s after it — do not
+  assume motion-like latency for audio.
 
 These figures exclude the plugin's own message parsing and the Indigo
 state-write. This is fine for occupancy and security automation, but the

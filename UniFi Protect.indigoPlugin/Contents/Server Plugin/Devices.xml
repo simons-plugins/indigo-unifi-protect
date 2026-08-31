@@ -10,6 +10,13 @@
                 <Label>Camera:</Label>
                 <List class="self" method="getCameraList" dynamicReload="true"/>
             </Field>
+            <Field id="audioCountsAsActivity" type="checkbox" defaultValue="true">
+                <Label>Audio counts as activity:</Label>
+                <Description>Speech or a baby crying turns the device on, like motion</Description>
+            </Field>
+            <Field id="audioCountsAsActivityHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+                <Label>With this checked, the device on/off state (what a "Device turned on" trigger watches) goes on for motion, speech, or a baby crying. Unchecked, it tracks motion only. A smoke or CO alarm sound never turns it on either way - use their own states.</Label>
+            </Field>
             <Field id="SupportsOnState" type="checkbox" defaultValue="true" hidden="true">
                 <Label/>
             </Field>
@@ -41,6 +48,31 @@
                 <TriggerLabel>Animal Detected</TriggerLabel>
                 <ControlPageLabel>Animal Detected</ControlPageLabel>
             </State>
+            <State id="audioDetected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Audio Detected</TriggerLabel>
+                <ControlPageLabel>Audio Detected</ControlPageLabel>
+            </State>
+            <State id="speechDetected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Speech Detected</TriggerLabel>
+                <ControlPageLabel>Speech Detected</ControlPageLabel>
+            </State>
+            <State id="babyCryDetected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Baby Cry Detected</TriggerLabel>
+                <ControlPageLabel>Baby Cry Detected</ControlPageLabel>
+            </State>
+            <State id="smokeAlarmDetected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Smoke Alarm Sound Detected</TriggerLabel>
+                <ControlPageLabel>Smoke Alarm Sound Detected</ControlPageLabel>
+            </State>
+            <State id="coAlarmDetected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>CO Alarm Sound Detected</TriggerLabel>
+                <ControlPageLabel>CO Alarm Sound Detected</ControlPageLabel>
+            </State>
             <State id="lastMotion">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Last Motion</TriggerLabel>
@@ -50,6 +82,16 @@
                 <ValueType>String</ValueType>
                 <TriggerLabel>Last Detect Types</TriggerLabel>
                 <ControlPageLabel>Last Detect Types</ControlPageLabel>
+            </State>
+            <State id="lastAudio">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Audio</TriggerLabel>
+                <ControlPageLabel>Last Audio</ControlPageLabel>
+            </State>
+            <State id="lastAudioTypes">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Audio Types</TriggerLabel>
+                <ControlPageLabel>Last Audio Types</ControlPageLabel>
             </State>
             <State id="cameraState">
                 <ValueType>String</ValueType>
