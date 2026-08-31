@@ -57,14 +57,11 @@ class _FakeDevice:
         # not merely the final resting state.
         self.state_writes = []
         self.image_writes = []
-<<<<<<< HEAD
         self.replace_on_server_calls = 0
-=======
         self.state_list_changed_calls = 0
         # Set to an exception instance to make stateListOrDisplayStateIdChanged
         # raise, for testing the deviceStartComm degradation path.
         self.state_list_changed_raises = None
->>>>>>> origin/main
 
     def updateStateOnServer(self, key, value=None, **kwargs):
         self.states[key] = value
@@ -78,10 +75,8 @@ class _FakeDevice:
     def updateStateImageOnServer(self, image):
         self.image_writes.append(image)
 
-<<<<<<< HEAD
     def replaceOnServer(self):
         self.replace_on_server_calls += 1
-=======
     def stateListOrDisplayStateIdChanged(self):
         # Fatal ordering check, first call only: if THE FIRST call for this
         # device happens after a state write, a plugin upgrade adding new
@@ -101,7 +96,6 @@ class _FakeDevice:
         self.state_list_changed_calls += 1
         if self.state_list_changed_raises is not None:
             raise self.state_list_changed_raises
->>>>>>> origin/main
 
 
 class _FakeDevices:
