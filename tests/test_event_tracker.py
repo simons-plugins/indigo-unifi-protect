@@ -1076,3 +1076,265 @@ def test_every_motion_event_type_activates_is_active(motion_type):
 
     assert changed == {cam}
     assert tracker.is_active(cam) is True
+
+
+# ---------------------------------------------------------------------
+# Issue #8: generic lifecycle families (Protect sensors) + pulse types.
+#
+# Spec-derived only -- the reference rig's /sensors, /lights, /chimes all
+# return []. The question, per workspace convention: when could this report
+# idle/no-pulse and be wrong, or bleed one device's/family's state into
+# another's?
+# ---------------------------------------------------------------------
+
+from event_tracker import (  # noqa: E402
+    FAMILY_SENSOR_ALARM,
+    FAMILY_SENSOR_LEAK,
+    FAMILY_SENSOR_MOTION,
+    FAMILY_SENSOR_TAMPER,
+)
+
+
+def test_sensor_motion_lifecycle_duplicate_end_and_stale_keepalive():
+    """sensorMotion behaves exactly like camera motion: duplicate ends are
+    no-ops, and a stale keepalive arriving after the end must NOT re-arm."""
+    tracker = EventTracker()
+    dev = "sensor-1"
+    add = {"item": {"id": "sm1", "device": dev, "type": "sensorMotion", "start": 1}}
+    end = {"item": {"id": "sm1", "device": dev, "type": "sensorMotion", "start": 1, "end": 2}}
+    stale_keepalive = {"item": {"id": "sm1", "device": dev, "type": "sensorMotion", "start": 1}}
+
+    assert tracker.handle(add) == {dev}
+    assert tracker.family_active(FAMILY_SENSOR_MOTION, dev) is True
+
+    assert tracker.handle(end) == {dev}
+    assert tracker.family_active(FAMILY_SENSOR_MOTION, dev) is False
+
+    # Duplicate end: no-op.
+    assert tracker.handle(end) == set()
+    assert tracker.family_active(FAMILY_SENSOR_MOTION, dev) is False
+
+    # Stale keepalive for the now-finished id must not re-arm.
+    assert tracker.handle(stale_keepalive) == set()
+    assert tracker.family_active(FAMILY_SENSOR_MOTION, dev) is False
+
+
+def test_sensor_alarm_captures_alarm_type_from_metadata():
+    """sensorAlarm's type union comes from metadata.alarmType.text, not
+    smartDetectTypes -- the event schema has no smartDetectTypes at all."""
+    tracker = EventTracker()
+    dev = "sensor-2"
+    add = {"item": {"id": "al1", "device": dev, "type": "sensorAlarm", "start": 1,
+                     "metadata": {"alarmType": {"text": "smoke"}}}}
+
+    changed = tracker.handle(add)
+
+    assert changed == {dev}
+    assert tracker.family_active(FAMILY_SENSOR_ALARM, dev) is True
+    assert tracker.family_types(FAMILY_SENSOR_ALARM, dev) == {"smoke"}
+
+
+def test_sensor_alarm_missing_metadata_degrades_to_empty_types_not_malformed():
+    """A malformed/missing metadata.alarmType must not discard the frame --
+    it degrades to an empty type set, same as a bad smartDetectTypes does
+    for the camera families."""
+    tracker = EventTracker()
+    dev = "sensor-2b"
+    add = {"item": {"id": "al2", "device": dev, "type": "sensorAlarm", "start": 1}}
+
+    changed = tracker.handle(add)
+
+    assert changed == {dev}
+    assert tracker.family_active(FAMILY_SENSOR_ALARM, dev) is True
+    assert tracker.family_types(FAMILY_SENSOR_ALARM, dev) == set()
+    assert tracker.malformed_count == 0
+
+
+def test_sensor_leak_and_tamper_families_are_independent_of_each_other():
+    """Two different lifecycle families on the SAME device must not bleed:
+    ending one leaves the other untouched."""
+    tracker = EventTracker()
+    dev = "sensor-3"
+    leak_add = {"item": {"id": "lk1", "device": dev, "type": "sensorWaterLeak", "start": 1,
+                          "metadata": {"sensorMountType": {"text": "leak"}}}}
+    tamper_add = {"item": {"id": "tm1", "device": dev, "type": "sensorTamper", "start": 2}}
+    leak_end = {"item": {"id": "lk1", "device": dev, "type": "sensorWaterLeak",
+                          "start": 1, "end": 3}}
+
+    tracker.handle(leak_add)
+    tracker.handle(tamper_add)
+    assert tracker.family_active(FAMILY_SENSOR_LEAK, dev) is True
+    assert tracker.family_active(FAMILY_SENSOR_TAMPER, dev) is True
+
+    tracker.handle(leak_end)
+
+    assert tracker.family_active(FAMILY_SENSOR_LEAK, dev) is False
+    assert tracker.family_active(FAMILY_SENSOR_TAMPER, dev) is True, (
+        "ending the leak event must not touch the independent tamper family"
+    )
+
+
+def test_camera_families_untouched_by_sensor_events_on_a_different_device():
+    """A sensorMotion event on one device id must never affect a camera's
+    motion/audio family, even under the same tracker instance."""
+    tracker = EventTracker()
+    camera = "cam-shared"
+    sensor = "sensor-shared"
+    tracker.handle({"item": {"id": "c1", "device": camera, "type": "smartDetectZone",
+                              "start": 1, "smartDetectTypes": ["person"]}})
+    tracker.handle({"item": {"id": "s1", "device": sensor, "type": "sensorMotion", "start": 2}})
+
+    assert tracker.is_active(camera) is True
+    assert tracker.family_active(FAMILY_SENSOR_MOTION, camera) is False
+    assert tracker.family_active(FAMILY_SENSOR_MOTION, sensor) is True
+    assert tracker.is_active(sensor) is False, (
+        "a sensorMotion event must never activate the camera-specific MOTION family"
+    )
+
+
+# -- Pulses -----------------------------------------------------------
+
+def test_pulse_dedupes_by_id_and_records_start_and_metadata():
+    tracker = EventTracker()
+    dev = "light-1"
+    frame = {"item": {"id": "p1", "device": dev, "type": "lightMotion", "start": 100}}
+
+    changed = tracker.handle(frame)
+    assert changed == {dev}
+    assert tracker.last_pulse(dev, "lightMotion") == {"start": 100, "metadata": {}}
+
+    # A repeat of the same id is a pure no-op, even with a different start.
+    repeat = {"item": {"id": "p1", "device": dev, "type": "lightMotion", "start": 999}}
+    changed = tracker.handle(repeat)
+    assert changed == set()
+    assert tracker.last_pulse(dev, "lightMotion")["start"] == 100, (
+        "a duplicate pulse id must not overwrite the recorded value"
+    )
+
+
+def test_pulse_never_becomes_a_stuck_active_anything_no_end_ever_sent():
+    """lightMotion has no `end` in the wire lifecycle at all -- it must
+    never gate any active/idle flag, on any family."""
+    tracker = EventTracker()
+    dev = "light-2"
+    tracker.handle({"item": {"id": "lm1", "device": dev, "type": "lightMotion", "start": 1}})
+
+    assert tracker.family_active(FAMILY_SENSOR_MOTION, dev) is False
+    assert tracker.family_active(FAMILY_SENSOR_LEAK, dev) is False
+    assert tracker.family_active(FAMILY_SENSOR_ALARM, dev) is False
+    assert tracker.family_active(FAMILY_SENSOR_TAMPER, dev) is False
+    assert tracker.is_active(dev) is False
+    assert tracker.audio_active(dev) is False
+
+
+def test_pulse_survives_clear_family_but_dropped_by_reset():
+    """clear_family(FAMILY_SENSOR_MOTION, dev) is called on THIS SAME
+    device while its motion family is genuinely active -- a clear_family
+    call on an unrelated, never-activated family would prove nothing (the
+    pulse store is untouched by construction either way). Activating the
+    family first and confirming clear_family actually flips it False is
+    what makes "the pulse survives it" a real assertion."""
+    tracker = EventTracker()
+    dev = "sensor-4"
+    tracker.handle({"item": {"id": "bl1", "device": dev, "type": "sensorBatteryLow",
+                              "start": 1, "metadata": {"sensorBatteryPercentage": {"number": 5}}}})
+    tracker.handle({"item": {"id": "sm1", "device": dev, "type": "sensorMotion", "start": 2}})
+    assert tracker.last_pulse(dev, "sensorBatteryLow") is not None
+    assert tracker.family_active(FAMILY_SENSOR_MOTION, dev) is True
+
+    tracker.clear_family(FAMILY_SENSOR_MOTION, dev)
+
+    assert tracker.family_active(FAMILY_SENSOR_MOTION, dev) is False, (
+        "clear_family must have actually cleared the family for this assertion to mean anything"
+    )
+    assert tracker.last_pulse(dev, "sensorBatteryLow") is not None, (
+        "clear_family must not erase pulse history"
+    )
+
+    tracker.reset()
+    assert tracker.last_pulse(dev, "sensorBatteryLow") is None, (
+        "reset must drop pulse history"
+    )
+
+
+def test_extreme_values_pulse_carries_metric_metadata():
+    tracker = EventTracker()
+    dev = "sensor-5"
+    frame = {"item": {"id": "ex1", "device": dev, "type": "sensorExtremeValues", "start": 1,
+                       "metadata": {
+                           "sensorType": {"text": "temperature"},
+                           "sensorValue": {"text": 21.5},
+                           "status": {"text": "high"},
+                       }}}
+
+    tracker.handle(frame)
+
+    pulse = tracker.last_pulse(dev, "sensorExtremeValues")
+    assert pulse["metadata"]["sensorType"]["text"] == "temperature"
+    assert pulse["metadata"]["sensorValue"]["text"] == 21.5
+
+
+def test_open_and_closed_pulses_are_tracked_as_separate_types():
+    """sensorOpened and sensorClosed are two DIFFERENT pulse types on the
+    same device -- the newer one (by wall-clock arrival) is what a caller
+    should trust, but the tracker itself just records both independently."""
+    tracker = EventTracker()
+    dev = "sensor-6"
+    tracker.handle({"item": {"id": "op1", "device": dev, "type": "sensorOpened", "start": 10,
+                              "metadata": {"sensorMountType": {"text": "door"}}}})
+    tracker.handle({"item": {"id": "cl1", "device": dev, "type": "sensorClosed", "start": 20,
+                              "metadata": {"sensorMountType": {"text": "door"}}}})
+
+    assert tracker.last_pulse(dev, "sensorOpened")["start"] == 10
+    assert tracker.last_pulse(dev, "sensorClosed")["start"] == 20
+
+
+def test_malformed_pulse_frame_counted_but_never_dropped_terminal():
+    """A pulse has no `end` to lose, so a malformed pulse frame must never
+    inflate dropped_terminal_count -- only a lost lifecycle `end` means
+    that."""
+    tracker = EventTracker()
+    changed = tracker.handle({"item": {"id": "bad1", "type": "sensorSmokeTest", "start": 1}})
+
+    assert changed == set()
+    assert tracker.malformed_count == 1
+    assert tracker.dropped_terminal_count == 0
+
+
+def test_ring_still_ignored_and_counted_sensor_types_are_not():
+    """'ring' remains the one genuinely-unsupported type; every former
+    KNOWN_UNSUPPORTED_EVENT_TYPES sensor/light entry is now a recognized
+    lifecycle or pulse type and must NOT show up in ignored_type_counts."""
+    from event_tracker import KNOWN_UNSUPPORTED_EVENT_TYPES
+
+    assert KNOWN_UNSUPPORTED_EVENT_TYPES == frozenset({"ring"})
+
+    tracker = EventTracker()
+    tracker.handle({"item": {"id": "r1", "device": "camDoor", "type": "ring", "start": 1}})
+    tracker.handle({"item": {"id": "sm1", "device": "s1", "type": "sensorMotion", "start": 1}})
+    tracker.handle({"item": {"id": "lm1", "device": "l1", "type": "lightMotion", "start": 1}})
+
+    assert tracker.ignored_type_counts == {"ring": 1}
+
+
+def test_pulse_frame_carrying_end_is_still_a_pulse():
+    """The OpenAPI spec gives every pulse type a nullable `end` field, but
+    per docs/CONTRACT.md these are one-shot notifications, not a lifecycle
+    -- a frame that happens to carry a (non-null) `end` must still be
+    recorded as a pulse via last_pulse, NOT routed through the lifecycle
+    add/finish machinery (which would silently drop it, since pulse types
+    were never added to _TYPE_TO_FAMILY)."""
+    tracker = EventTracker()
+    dev = "sensor-end"
+    frame = {"item": {"id": "op-end-1", "device": dev, "type": "sensorOpened",
+                       "start": 1, "end": 2,
+                       "metadata": {"sensorMountType": {"text": "door"}}}}
+
+    changed = tracker.handle(frame)
+
+    assert changed == {dev}
+    assert tracker.last_pulse(dev, "sensorOpened") == {
+        "start": 1, "metadata": {"sensorMountType": {"text": "door"}},
+    }
+    assert tracker.malformed_count == 0
+    assert tracker.dropped_terminal_count == 0
