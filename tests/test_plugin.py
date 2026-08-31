@@ -730,8 +730,10 @@ def test_camera_info_states_written_from_real_fixture(fake_indigo):
 
 
 def test_camera_info_states_from_hand_built_object(fake_indigo):
-    """A hand-built object exercising values not present in the fixture:
-    slowShutter video mode, LED off, OSD date ON."""
+    """A hand-built object layered on top of what the fixture already
+    covers (slowShutter video mode, LED off) to also exercise the values
+    it doesn't: hdrType == "off", isMicEnabled == False, and both OSD
+    flags True."""
     info = {
         "type": "UVC G5 Turret Ultra",
         "videoMode": "slowShutter",
@@ -788,9 +790,11 @@ def test_camera_info_states_untouched_when_info_unavailable(fake_indigo):
         assert key not in written_keys, f"{key} must not be re-written when info is unavailable"
 
 
-def test_camera_info_missing_nested_objects_defaults_booleans_false(fake_indigo):
+def test_camera_info_missing_nested_objects_are_skipped_not_fabricated(fake_indigo):
     """ledSettings/osdSettings absent entirely (not just missing keys inside
-    them) must not raise, and must read as False."""
+    them) must not raise -- and the four boolean keys they'd feed must be
+    SKIPPED, not fabricated as False. An absent reading is not the same
+    thing as a confirmed 'disabled'."""
     plug = make_plugin({})
     dev = add_camera_device(fake_indigo, plug)
     plug.camera_info = {"cam-1": {"type": "UVC G5 Bullet"}}
@@ -798,11 +802,57 @@ def test_camera_info_missing_nested_objects_defaults_booleans_false(fake_indigo)
 
     plug._apply_camera_state("cam-1", force=True)   # must not raise
 
-    assert dev.states["ledEnabled"] is False
-    assert dev.states["osdNameEnabled"] is False
-    assert dev.states["osdDateEnabled"] is False
-    assert dev.states["micEnabled"] is False
+    for key in ("micEnabled", "ledEnabled", "osdNameEnabled", "osdDateEnabled"):
+        assert key not in dev.states, f"{key} must be skipped, not fabricated as False"
     assert dev.states["cameraModel"] == "UVC G5 Bullet"
+
+
+def test_camera_info_non_dict_nested_objects_are_skipped_not_fatal(fake_indigo):
+    """A truthy non-dict `ledSettings`/`osdSettings` (a malformed camera
+    object, not merely an absent one) must not raise AttributeError out of
+    _write_states -- an uncaught exception there escapes to _pump, tears
+    the socket down, and reconnects into the same bad object forever: one
+    malformed camera killing motion for every camera on the account."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.camera_info = {"cam-1": {
+        "type": "UVC G5 Turret Ultra", "isMicEnabled": True,
+        "ledSettings": "off", "osdSettings": ["not", "a", "dict"],
+    }}
+    plug.socket = object()
+
+    plug._apply_camera_state("cam-1", force=True)   # must not raise
+
+    for key in ("ledEnabled", "osdNameEnabled", "osdDateEnabled"):
+        assert key not in dev.states, f"{key} must be skipped when its parent isn't a dict"
+    assert dev.states["cameraModel"] == "UVC G5 Turret Ultra"
+    assert dev.states["micEnabled"] is True, "a sibling valid key must still be written"
+
+
+def test_camera_info_partial_object_after_good_read_keeps_prior_string_values(fake_indigo):
+    """A partial camera object (e.g. a read that only returned some fields)
+    must not blank cameraModel/videoMode/hdrType with "" -- that would
+    contradict dev.model, which keeps the real value in this exact
+    scenario because it is only ever updated, never cleared."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.camera_info = {"cam-1": {
+        "type": "UVC G5 Turret Ultra", "videoMode": "default", "hdrType": "auto",
+    }}
+    plug.socket = object()
+    plug._apply_camera_state("cam-1", force=True)
+    assert dev.states["cameraModel"] == "UVC G5 Turret Ultra"
+    assert dev.states["videoMode"] == "default"
+    assert dev.states["hdrType"] == "auto"
+
+    # A second, partial read: type/videoMode/hdrType are all missing this
+    # time, but the object itself is still present (not None).
+    plug.camera_info = {"cam-1": {"isMicEnabled": True}}
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert dev.states["cameraModel"] == "UVC G5 Turret Ultra", "must keep the prior value"
+    assert dev.states["videoMode"] == "default", "must keep the prior value"
+    assert dev.states["hdrType"] == "auto", "must keep the prior value"
 
 
 def test_bad_mic_volume_is_skipped_not_defaulted(fake_indigo):
@@ -824,6 +874,20 @@ def test_bad_mic_volume_is_skipped_not_defaulted(fake_indigo):
     for key in ("cameraModel", "videoMode", "hdrType", "micEnabled",
                 "ledEnabled", "osdNameEnabled", "osdDateEnabled"):
         assert key in dev.states, f"{key} must still be written even when micVolume is bad"
+
+
+def test_mic_volume_bool_is_skipped_not_coerced_to_one(fake_indigo):
+    """int(True) == 1 -- a real-looking but entirely fabricated volume. A
+    bool micVolume must be skipped exactly like a non-numeric one."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.camera_info = {"cam-1": {"type": "UVC G5 Turret Ultra", "micVolume": True}}
+    plug.socket = object()
+
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert "micVolume" not in dev.states
+    assert dev.states["cameraModel"] == "UVC G5 Turret Ultra"
 
 
 def test_dev_model_set_and_replace_on_server_called_once_when_type_differs(fake_indigo):
@@ -870,13 +934,18 @@ def test_dev_model_not_touched_when_type_missing_or_empty(fake_indigo):
 
 
 def test_replace_on_server_failure_does_not_prevent_state_write(fake_indigo):
-    """Fatal-collaborator form: replaceOnServer raises. The state write
-    above it must still have happened, and the exception must not
-    propagate out of _apply_camera_state."""
+    """Fatal-collaborator form, strengthened: the raising replaceOnServer
+    fake also ASSERTS the state write has already landed at the moment
+    it's called. That pins the ordering (state write, then model update) --
+    a silent reorder fails this even though "no exception escapes" alone
+    would not catch it."""
     plug = make_plugin({})
     dev = add_camera_device(fake_indigo, plug)
 
     def boom():
+        assert dev.states.get("cameraModel") == "UVC G5 Turret Ultra", (
+            "the state write must land before replaceOnServer is ever called"
+        )
         raise RuntimeError("server busy")
 
     dev.replaceOnServer = boom
@@ -886,3 +955,41 @@ def test_replace_on_server_failure_does_not_prevent_state_write(fake_indigo):
     plug._apply_camera_state("cam-1", force=True)   # must not raise
 
     assert dev.states["cameraModel"] == "UVC G5 Turret Ultra", "state write must still land"
+
+
+def test_model_update_failure_logs_warning_once_then_debug(fake_indigo, caplog):
+    """indigo.devices.get() returns a FRESH device object on every call in
+    real Indigo, so a persistent replaceOnServer failure (e.g. a device
+    edit dialog left open) would otherwise retry -- and log -- on every
+    single frame forever, with no visible hint anything is wrong. Two
+    consecutive failures on the same device must produce exactly one
+    WARNING; the second is DEBUG.
+
+    The fake's replaceOnServer also reverts dev.model on failure, mirroring
+    what a fresh fetch from the real server would show: the failed call
+    never persisted, so the "current" model is still the old one -- which
+    is what makes the second call attempt (and fail) again at all.
+    """
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    original_model = dev.model
+
+    def boom():
+        dev.model = original_model
+        raise RuntimeError("device edit dialog is open")
+
+    dev.replaceOnServer = boom
+    plug.camera_info = {"cam-1": {"type": "UVC G5 Turret Ultra"}}
+    plug.socket = object()
+
+    with caplog.at_level("DEBUG"):
+        plug._apply_camera_state("cam-1", force=True)
+        plug._apply_camera_state("cam-1", force=True)
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"
+                and "could not update device model" in r.getMessage()]
+    debugs = [r for r in caplog.records if r.levelname == "DEBUG"
+              and "could not update device model" in r.getMessage()]
+    assert len(warnings) == 1, "exactly one WARNING for the whole failure episode"
+    assert len(debugs) == 1, "the second consecutive failure must log at DEBUG, not WARNING again"
+    assert "RuntimeError" in warnings[0].getMessage()

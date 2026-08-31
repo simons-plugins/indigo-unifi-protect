@@ -153,8 +153,8 @@ G5 Turret Ultra" instead of the generic "Protect Camera".
 Deliberately **not** available, because it needs the private (not the
 official integration) API: firmware version, camera IP, `isDark`, IR LED
 mode/level, zoom position, motion tuning, and wifi stats. See
-[`docs/API-REFERENCE.md`](./docs/API-REFERENCE.md) for the full verified
-field list.
+[`docs/API-REFERENCE.md`](./docs/API-REFERENCE.md) (added by PR #10) for
+the full verified field list.
 
 ## Latency
 
