@@ -196,6 +196,20 @@ class Plugin(indigo.PluginBase):
             )
             return
         self.cameras.setdefault(camera_id, set()).add(dev.id)
+        # States declared in Devices.xml are NOT retroactively added to
+        # devices created by an older plugin version — Indigo only reads
+        # the state list on dialog dismissal. Without this call, every write
+        # below to a state this device doesn't yet know about is silently
+        # dropped with an "ignoring update request" line in the event log
+        # (bit the 2026.3.0 upgrade live, 2026-08-31).
+        try:
+            dev.stateListOrDisplayStateIdChanged()
+        except Exception as exc:
+            self.logger.warning(
+                f"{dev.name}: could not refresh the device state list "
+                f"({type(exc).__name__}: {exc}) - states added by this "
+                f"plugin version may not update until the device is re-saved"
+            )
         # connected is DERIVED, never assumed. At this point in the lifecycle
         # Indigo has not yet started runConcurrentThread, so there is no socket
         # and the honest answer is False.
