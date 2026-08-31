@@ -224,7 +224,32 @@ class ProtectAPI:
           naming the camera.
         """
 
-    def get_rtsps_streams(self, camera_id: str) -> dict: ...
+    def get_rtsps_streams(self, camera_id: str) -> dict:
+        """GET /cameras/{id}/rtsps-stream ->
+        {"high": url|None, "medium": url|None, "low": url|None, "package": url|None}.
+        Verified live 2026-08-31: the token was identical across two calls
+        10s apart; rotation over a longer window is untested. `package` is
+        null unless the camera reports `hasPackageCamera`.
+
+        EVERY ProtectAPIError raised here -- from `_get_json` (an HTTP
+        error/transport failure, whose `.body` `_request` would otherwise
+        fill with the real response text) or this method's own shape check
+        -- is re-raised through the module-level `_redact_body(exc)` helper,
+        which copies the exception with `body=""` and everything else
+        (including `kind`) preserved. This endpoint's response can contain
+        a live-stream URL (an access token), and a malformed/error body
+        could plausibly echo one back."""
+
+    def create_rtsps_streams(self, camera_id: str, qualities: list[str]) -> dict:
+        """POST /cameras/{id}/rtsps-stream with body {"qualities": [...]}
+        (each entry one of "high"/"medium"/"low"/"package"), via `_request`.
+        CREATES streams for the requested qualities and returns the same
+        four-key object GET returns. Unverified against the reference rig
+        -- GET already returned non-null URLs there.
+
+        Same `_redact_body` treatment as get_rtsps_streams above, on every
+        ProtectAPIError this raises (the `_request` call, the JSON parse,
+        and this method's own shape check)."""
 
     def get_meta_info(self) -> dict:
         """GET /meta/info -> {'applicationVersion': '7.2.105'}.
@@ -236,6 +261,16 @@ both `check_hostname = False` and `verify_mode = ssl.CERT_NONE` (a UNVR serves a
 self-signed cert; this is the normal case, not an error).
 
 **Never log the API key**, including inside exception text or a repr.
+
+**Never log an RTSPS stream URL either** (issue #7) -- it embeds an access
+token, exactly like the API key is a credential. This applies in both
+`protect_api.py` (`get_rtsps_streams` and `create_rtsps_streams` both
+redact EVERY ProtectAPIError they raise to `body=""` via `_redact_body`,
+above) and `plugin.py` (every log line `_refresh_stream_urls` emits --
+success, warning, or error -- passes through `_assert_no_url_in_message`, checked
+against both the fresh values from the controller AND the device's
+current stored states, since the error path has no fresh response to
+check).
 
 ---
 
@@ -509,6 +544,10 @@ The declared states are exactly:
 | `osdDateEnabled` | Boolean | camera object's `osdSettings.isDateEnabled` |
 | `connected` | Boolean | **event socket** health, not the camera's |
 | `snapshotPath` | String | path written by the snapshot action |
+| `streamUrlHigh` | String | RTSPS URL, high quality; `""` only when opted out or nothing has ever been stored -- a failed refresh otherwise keeps the prior value |
+| `streamUrlMedium` | String | RTSPS URL, medium quality; same rules |
+| `streamUrlLow` | String | RTSPS URL, low quality; same rules |
+| `streamUrlPackage` | String | RTSPS URL, package-camera stream; stays `""` unless `hasPackageCamera`, same keep-prior rule otherwise |
 
 The eight camera-info states above (issue #4) are read straight from the
 cached `GET /cameras` object (`self.camera_info`), not from the WS tracker,
@@ -558,6 +597,93 @@ every single frame forever with nothing visible to say so. The plugin logs
 the first failure per device id at WARNING and every one after that at
 DEBUG, tracked in `self._model_update_warned`, the same one-per-key pattern
 `_reported_ignored_types` already uses for unrecognized event types.
+
+The four stream-URL states above (issue #7) are opt-in per device via the
+`exposeStreamUrls` checkbox (default off) -- the URL embeds an access
+token, so it is treated as a credential, not plain data.
+
+**Threading/socket safety.** `_rest` sleeps `>= MIN_REST_INTERVAL` (3s) per
+call, so nothing that runs on Indigo's main thread, or ahead of `_pump()`,
+may perform REST for this feature -- N opted-in cameras would otherwise
+block plugin startup, or delay `_pump`'s time-to-first-frame on every
+reconnect, by `>= 3N` seconds. The feature is split into a cheap half and a
+REST half accordingly:
+
+- `_prime_stream_urls(dev)` -- cheap, REST-free. Called from
+  `deviceStartComm` and, for every mapped+enabled device, from
+  `_open_socket`. Off: clears the four states immediately (see below). On:
+  adds `dev.id` to `self._stream_refresh_pending`, a set, and returns —
+  no fetch.
+- `_drain_one_pending_stream_refresh()` -- called once per `_pump()` tick,
+  after the message-handling block. Pops **at most one** pending device id
+  (skipping it if disabled or no longer mapped) and calls
+  `_refresh_stream_urls(dev)`, which is itself `_rest`-throttled — so N
+  pending devices drain at one per `~MIN_REST_INTERVAL` without ever
+  gating socket readiness. Wrapped in a broad `except Exception`: an
+  AssertionError from the leak guard, or an Indigo write error, must never
+  reach `runConcurrentThread`'s generic handler, which would tear the
+  whole event socket down and reconnect-loop forever over what is, at
+  worst, one broken camera's stream URLs. Logs
+  `f"{dev.name}: stream URL refresh failed (...) - untick 'Expose RTSPS
+  stream URLs' on this device if it persists."` and moves on.
+- `_refresh_stream_urls_sync(dev)` -- the user-initiated path
+  (`refreshStreamUrls` action, and `actionControlUniversal`'s
+  `RequestStatus` handler). Synchronous, since a human is waiting and
+  REST-blocking one action callback is expected/acceptable. Never silent:
+  opted-out logs INFO telling the user to tick the checkbox (and still
+  clears the four states); `self.api is None` logs the standard "UniFi
+  Protect is not configured" ERROR. Otherwise calls `_refresh_stream_urls`.
+- `_refresh_stream_urls(dev)` -- the shared fetch-and-write core, called
+  only from the two entry points above (never from `deviceStartComm` or
+  `_open_socket` directly):
+  - Off: unconditionally writes all four states to `""`. This is the one
+    place where "off" must actively *clear* a stored value, not just stop
+    refreshing it — leaving a stale token in the database after the user
+    opted back out would defeat the point of the checkbox.
+  - `self.api is None`: silent no-op (the pump-drain caller has no user to
+    report to; the sync caller already handled this case itself).
+  - Calls `get_rtsps_streams`. If the body has **none** of the four known
+    keys at all, that's a shape error — logs ERROR ("unexpected response
+    shape … expected high/medium/low/package"), leaves states untouched,
+    does not POST. A key that IS present but not a string (and not null)
+    is skipped with a WARNING naming it, not trusted as data.
+  - Computes `wanted = ["high", "medium", "low"]` plus `"package"` only
+    when the cached camera's `hasPackageCamera` is true, then
+    `missing = [q for q in wanted if <value for q is null/absent/invalid>]`.
+    If `missing` and the camera **is** in `self.camera_info`, POSTs
+    `create_rtsps_streams(camera_id, missing)` and merges the response
+    over the GET result for just those qualities. If the camera is **not**
+    cached (e.g. before the first camera refresh), does **not** guess —
+    logs WARNING "camera capabilities not loaded yet - streams will be
+    created on the next refresh" and leaves `missing` as-is.
+  - **Never blanks a working URL.** For each of the four qualities: if the
+    fresh value (after GET+POST) is present, use it; else if the device's
+    **current** stored state for that quality is non-empty, keep it (and
+    name the quality in a WARNING, `"...kept previous URL for: high"`);
+    only when neither exists does the state become `""`.
+  - On `ProtectAPIError` from either the GET or the POST, leaves every
+    existing state untouched and logs ERROR, described via
+    `self._describe_api_error(exc)` (issue #6) rather than a raw `str(exc)`
+    dump, same as every other camera-control error line — the outcome note
+    depends on whether anything is currently stored: `"the stored URLs may
+    now be stale"` if at least one of the four current states is
+    non-empty, else `"no URLs are stored yet"` (a URL that was never
+    fetched cannot be stale).
+  - On success, logs INFO naming only which qualities ended up present
+    (e.g. `"Side Path: stream URLs refreshed (high, medium, low)"`) —
+    never a URL. **Every** log line this method emits — the shape error,
+    the per-key WARNING, the capabilities-not-loaded WARNING, the
+    kept-previous WARNING, the success INFO, and the ProtectAPIError
+    ERROR — passes through `_assert_no_url_in_message`, which mirrors
+    `protect_api._assert_no_secret` and is checked against **both** the
+    fresh values and the device's current stored states (the error path
+    has no fresh response to check, so the current states are what could
+    leak there instead).
+  - Split out of `_refresh_stream_urls` into
+    `_fill_missing_stream_qualities` (the POST-and-merge step above) and
+    `_clean_stream_response` (the per-key shape/type validation) purely
+    for pylint's too-many-locals/branches, the same reason
+    `_camera_info_states` was split out of `_write_states`.
 
 `onOffState` (the built-in on/off state) is `motionDetected` OR (the
 per-device `audioCountsAsActivity` checkbox, default True, AND active AUDIO
@@ -756,3 +882,43 @@ cover:
 Per workspace convention, a degradation-path test must make the negative
 assertion **fatal**: to prove the tracker never consults the network, hand it a
 collaborator that raises if touched.
+
+Issue #7 (stream URLs) added, in `test_plugin.py` and `test_protect_api.py`:
+
+- opted-out (absent, `False`, `"false"`, `"False"`) writes all four states
+  `""` and never touches a fatal-collaborator API; opting out also
+  **clears** previously-populated states, not just leaves them alone
+- opted-in (`True`, `"true"`, `"True"`) writes from the GET response, a
+  null `package` becomes `""`, and neither the URL/token nor an
+  exception's leaked body ever appears in ANY log record on the success
+  path OR the error path (both also assert the expected INFO/ERROR record
+  actually exists, so the token-absence check can't pass on a silent
+  no-op)
+- a partial-null GET with a prior value: kept and named in a WARNING when
+  the camera is not cached (no guessed POST); replaced when the camera IS
+  cached and POST is issued for just the missing qualities
+- `{}` and `{"error": "x"}` bodies are shape errors (ERROR, states
+  untouched, no POST); a non-string value for a present key is skipped
+  with a WARNING naming it
+- error wording: "the stored URLs may now be stale" when something is
+  currently stored, "no URLs are stored yet" when nothing is
+- `deviceStartComm` only ever QUEUES an opted-in device
+  (`_stream_refresh_pending`) and never fetches — proven with a
+  fatal-collaborator API, regardless of whether `self.api` is even
+  configured; `_open_socket` does the same for every mapped+enabled device
+  and must never touch a `get_rtsps_streams`/`create_rtsps_streams` that
+  raises
+- the pump drain: two pending devices drain one per `_pump()` tick without
+  the socket disconnecting; a device whose `updateStatesOnServer` raises
+  is caught (fatal-collaborator form) and logs the "untick" ERROR rather
+  than escaping to `runConcurrentThread`'s generic handler; monkeypatching
+  `_assert_no_url_in_message` itself to raise is likewise caught and
+  logged, not propagated
+- the synchronous action (`refreshStreamUrls`) and `RequestStatus` paths,
+  driven through the real Indigo callbacks: opted-out logs INFO and still
+  clears the four states; unconfigured (`self.api is None`) logs the
+  standard "not configured" ERROR
+- `protect_api.get_rtsps_streams`/`create_rtsps_streams`: every
+  ProtectAPIError's `.body` is always `""` (HTTP error, transport failure,
+  or shape mismatch), tested the same way for both methods, including a
+  body deliberately constructed to contain a token

@@ -151,6 +151,18 @@ class ProtectAPIError(Exception):
         return "http"
 
 
+def _redact_body(exc: ProtectAPIError) -> ProtectAPIError:
+    """Return a copy of ``exc`` with ``body=""``, everything else preserved
+    (including ``kind``, so a caller's ``exc.kind == "auth"`` branching is
+    unaffected). Used by the RTSPS stream endpoints: ``_request`` puts the
+    real HTTP-error response text into ``.body``, but a live-stream URL (an
+    access token) could plausibly appear in either endpoint's body, and
+    that must never be readable off the exception.
+    """
+    return ProtectAPIError(str(exc), status=exc.status, body="", url=exc.url,
+                            retry_after=exc.retry_after, kind=exc.kind)
+
+
 class ProtectAPI:
     """Blocking HTTP client for the UniFi Protect integration REST API."""
 
@@ -355,16 +367,57 @@ class ProtectAPI:
     def get_rtsps_streams(self, camera_id: str) -> dict:
         """GET /cameras/{id}/rtsps-stream. Raises ProtectAPIError, including
         when the parsed body is not a JSON object.
+
+        Every ProtectAPIError raised here -- an HTTP-error/transport
+        failure from ``_get_json`` (unlike most callers, ``_request`` puts
+        the real response text into ``.body`` for those) or this method's
+        own shape check -- carries ``body=""`` instead: this endpoint's
+        response can contain a live-stream URL (an access token), and a
+        malformed body could echo one back through the exception.
         """
         path = f"/cameras/{camera_id}/rtsps-stream"
-        body = self._get_json(path)
+        try:
+            body = self._get_json(path)
+        except ProtectAPIError as exc:
+            raise _redact_body(exc) from None
         if not isinstance(body, dict):
             message = _assert_no_secret(
                 f"Unexpected response shape for {path}: expected an object",
                 self._api_key)
-            raise ProtectAPIError(message, status=None, body=str(body)[:200],
+            raise ProtectAPIError(message, status=None, body="",
                                    url=f"{self._base_url}{path}")
         return body
+
+    def create_rtsps_streams(self, camera_id: str, qualities: list[str]) -> dict:
+        """POST /cameras/{id}/rtsps-stream to create RTSPS streams for the
+        requested qualities (e.g. ``["high", "medium", "low"]``). Returns
+        the same four-key object ``get_rtsps_streams`` returns.
+
+        Unverified against the reference rig -- GET already returned three
+        non-null URLs there, so this path has never actually been
+        exercised against a live controller. Raises ProtectAPIError,
+        including when the parsed body is not a JSON object. Same
+        ``body=""`` redaction as ``get_rtsps_streams`` above, on every
+        error this raises.
+        """
+        path = f"/cameras/{camera_id}/rtsps-stream"
+        try:
+            raw = self._request("POST", path, body={"qualities": list(qualities)})
+        except ProtectAPIError as exc:
+            raise _redact_body(exc) from None
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            message = _assert_no_secret(f"Invalid JSON response for {path}: {exc}", self._api_key)
+            raise ProtectAPIError(message, status=None, body="",
+                                   url=f"{self._base_url}{path}") from None
+        if not isinstance(parsed, dict):
+            message = _assert_no_secret(
+                f"Unexpected response shape for {path}: expected an object",
+                self._api_key)
+            raise ProtectAPIError(message, status=None, body="",
+                                   url=f"{self._base_url}{path}")
+        return parsed
 
     def get_meta_info(self) -> dict:
         """GET /meta/info -> {'applicationVersion': '7.2.105'}.

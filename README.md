@@ -202,6 +202,48 @@ Verified live against a UNVR on Protect **7.2.105**, 2026-08-31: the API
 key alone authorises these writes, the same as every read in this plugin —
 no separate write credential was needed.
 
+## Live stream URLs
+
+Each camera device can optionally expose its RTSPS live-stream URLs as
+device states, for a control page or an external viewer (VLC, ffplay, a
+home-theatre system) to pull actual video rather than the periodic stills
+above.
+
+**This is off by default, and it should stay off unless you have a real use
+for it.** The URL is not just a network address — it embeds an access
+token, so anyone who can read it can stream from the camera. Indigo device
+states are readable by anything that can read the Indigo database (other
+plugins, control pages, scripts), so turning this on widens who can watch
+your camera beyond "people with the UniFi app." Tick **Expose RTSPS stream
+URLs** on the device only when something concrete needs it; unticking it
+immediately clears the stored URLs back to empty, it doesn't just stop
+refreshing them.
+
+When enabled, four states are populated: `streamUrlHigh`, `streamUrlMedium`,
+`streamUrlLow`, and `streamUrlPackage`. `streamUrlPackage` stays empty
+unless the camera reports `hasPackageCamera` — most cameras don't have a
+package-detection lens and the controller returns `null` for it.
+
+They refresh automatically after the device starts and on every event-socket
+reconnect — but not instantly: fetching a stream URL talks to the
+controller, and that happens in the background, throttled alongside every
+other request this plugin makes, so **the first URLs typically appear a
+few seconds after the plugin connects**, not the moment you tick the
+checkbox or the socket comes up. With several opted-in cameras, they fill
+in one at a time rather than all at once. If a viewer stops working, fire
+the plugin's **Refresh Stream URLs** action (or Send Status Request, which
+is synchronous and reports the outcome immediately) rather than assuming
+the URL is permanently dead: on the one console this was verified against,
+the token was identical across two calls ten seconds apart, but whether it
+rotates over a longer window (hours/days) is untested, and a stale token
+would look exactly like a broken stream. A momentary failure (e.g. a
+rate limit) never blanks a working URL — the plugin keeps whichever value
+it already had rather than clearing a stream a viewer might be using.
+
+A one-line example: copy the `streamUrlHigh` state's value and hand it
+straight to a player -- `ffplay "rtsps://192.168.0.10:7441/<token>?enableSrtp"`,
+or paste the same URL into VLC's **Open Network Stream** dialog.
+
 ## Latency
 
 Motion detection rides the Protect event WebSocket, not polling. Measured

@@ -475,3 +475,131 @@ def test_fake_api_key_never_appears_on_shape_validation_failure(monkeypatch):
     assert FAKE_KEY not in exc.body
     assert FAKE_KEY not in exc.url
     assert FAKE_KEY not in repr(exc)
+
+
+# ---------------------------------------------------------------------
+# get_rtsps_streams (issue #7) -- same body="" redaction on its own
+# shape-validation branch as create_rtsps_streams, per the threading/
+# leak review: an unexpected body (a proxy error page, a shape change)
+# could otherwise echo a URL back through .body.
+# ---------------------------------------------------------------------
+
+def test_get_rtsps_streams_parses_real_shape(monkeypatch):
+    body = json.dumps({
+        "high": "rtsps://192.0.2.1:7441/tok-high?enableSrtp",
+        "medium": "rtsps://192.0.2.1:7441/tok-medium?enableSrtp",
+        "low": "rtsps://192.0.2.1:7441/tok-low?enableSrtp",
+        "package": None,
+    }).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+
+    api = make_api()
+    result = api.get_rtsps_streams("cam1")
+
+    assert result["high"] == "rtsps://192.0.2.1:7441/tok-high?enableSrtp"
+    assert result["package"] is None
+
+
+def test_get_rtsps_streams_shape_error_body_is_never_propagated(monkeypatch):
+    """A non-dict body (e.g. a list) fails ProtectAPI's own shape check.
+    Unlike every other GET method in this module, this endpoint's shape-
+    error body must carry "" -- a malformed response here could plausibly
+    contain a URL/token, and that must never be readable off the
+    exception.
+    """
+    leaking_body = json.dumps(
+        ["rtsps://192.0.2.1:7441/SECRETTOKEN?enableSrtp"]
+    ).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(leaking_body)))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.get_rtsps_streams("cam1")
+
+    exc = excinfo.value
+    assert exc.body == ""
+    assert "SECRETTOKEN" not in str(exc)
+    assert "SECRETTOKEN" not in repr(exc)
+
+
+# ---------------------------------------------------------------------
+# create_rtsps_streams (issue #7) -- POST body, and the never-log-the-
+# token rule extended to the response BODY of a failed request, not just
+# the API key.
+# ---------------------------------------------------------------------
+
+def test_create_rtsps_streams_sends_post_with_qualities_body(monkeypatch):
+    response_body = json.dumps({
+        "high": "rtsps://192.0.2.1:7441/tok-high?enableSrtp",
+        "medium": "rtsps://192.0.2.1:7441/tok-medium?enableSrtp",
+        "low": "rtsps://192.0.2.1:7441/tok-low?enableSrtp",
+        "package": None,
+    }).encode("utf-8")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(response_body))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    result = api.create_rtsps_streams("cam1", ["high", "medium", "low"])
+
+    assert result["high"] == "rtsps://192.0.2.1:7441/tok-high?enableSrtp"
+    assert result["package"] is None
+    assert mock_urlopen.call_count == 1
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "POST"
+    assert request.full_url.endswith("/cameras/cam1/rtsps-stream")
+    assert json.loads(request.data.decode("utf-8")) == {
+        "qualities": ["high", "medium", "low"]
+    }
+
+
+def test_create_rtsps_streams_non_dict_response_raises_protect_api_error(monkeypatch):
+    body = json.dumps(["not", "a", "dict"]).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError):
+        api.create_rtsps_streams("cam1", ["high"])
+
+
+def test_create_rtsps_streams_error_body_is_never_propagated(monkeypatch):
+    """A URL/token could plausibly appear in this endpoint's error body.
+    Unlike every other method in this module, create_rtsps_streams must
+    never let that body escape via the exception -- the caller trusts
+    ProtectAPIError.body to be safe to log for every OTHER method, but not
+    for the one endpoint that can hand back a live-stream URL on failure.
+    """
+    leaking_body = b'{"error":"rtsps://192.0.2.1:7441/SECRETTOKEN?enableSrtp"}'
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(side_effect=http_error(500, body=leaking_body)))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.create_rtsps_streams("cam1", ["high"])
+
+    exc = excinfo.value
+    assert exc.body == ""
+    assert "SECRETTOKEN" not in str(exc)
+    assert "SECRETTOKEN" not in repr(exc)
+
+
+@pytest.mark.parametrize("make_error", [
+    lambda: http_error(401, body=b'{"error":"unauthorized"}'),
+    lambda: http_error(500, body=b"internal server error"),
+    lambda: url_error("Connection refused"),
+])
+def test_fake_api_key_never_appears_in_create_rtsps_streams_exception(monkeypatch, make_error):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(side_effect=make_error()))
+
+    api = make_api(api_key=FAKE_KEY)
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.create_rtsps_streams("cam1", ["high"])
+
+    exc = excinfo.value
+    assert FAKE_KEY not in str(exc)
+    assert FAKE_KEY not in exc.body
+    assert FAKE_KEY not in exc.url
+    assert FAKE_KEY not in repr(exc)

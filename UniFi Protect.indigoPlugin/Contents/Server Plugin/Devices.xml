@@ -17,6 +17,13 @@
             <Field id="audioCountsAsActivityHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
                 <Label>With this checked, the device on/off state (what a "Device turned on" trigger watches) goes on for motion, speech, or a baby crying. Unchecked, it tracks motion only. A smoke or CO alarm sound never turns it on either way - use their own states.</Label>
             </Field>
+            <Field id="exposeStreamUrls" type="checkbox" defaultValue="false">
+                <Label>Expose RTSPS stream URLs:</Label>
+                <Description>Write live-stream URLs into device states</Description>
+            </Field>
+            <Field id="exposeStreamUrlsHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+                <Label>The URLs contain an access token - anything that can read the Indigo database can read them. Leave this off unless a control page or external viewer needs to pull live video.</Label>
+            </Field>
             <Field id="SupportsOnState" type="checkbox" defaultValue="true" hidden="true">
                 <Label/>
             </Field>
@@ -147,6 +154,26 @@
                 <ValueType>String</ValueType>
                 <TriggerLabel>Snapshot Path</TriggerLabel>
                 <ControlPageLabel>Snapshot Path</ControlPageLabel>
+            </State>
+            <State id="streamUrlHigh">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Stream URL (High)</TriggerLabel>
+                <ControlPageLabel>Stream URL (High)</ControlPageLabel>
+            </State>
+            <State id="streamUrlMedium">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Stream URL (Medium)</TriggerLabel>
+                <ControlPageLabel>Stream URL (Medium)</ControlPageLabel>
+            </State>
+            <State id="streamUrlLow">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Stream URL (Low)</TriggerLabel>
+                <ControlPageLabel>Stream URL (Low)</ControlPageLabel>
+            </State>
+            <State id="streamUrlPackage">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Stream URL (Package)</TriggerLabel>
+                <ControlPageLabel>Stream URL (Package)</ControlPageLabel>
             </State>
         </States>
     </Device>
