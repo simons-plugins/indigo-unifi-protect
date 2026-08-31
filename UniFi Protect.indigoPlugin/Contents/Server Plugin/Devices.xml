@@ -297,6 +297,21 @@
                 <TriggerLabel>Last Open/Close Change</TriggerLabel>
                 <ControlPageLabel>Last Open/Close Change</ControlPageLabel>
             </State>
+            <State id="lastLeak">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Leak</TriggerLabel>
+                <ControlPageLabel>Last Leak</ControlPageLabel>
+            </State>
+            <State id="lastAlarm">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Alarm</TriggerLabel>
+                <ControlPageLabel>Last Alarm</ControlPageLabel>
+            </State>
+            <State id="lastTamper">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Tamper</TriggerLabel>
+                <ControlPageLabel>Last Tamper</ControlPageLabel>
+            </State>
             <State id="lastPoll">
                 <ValueType>String</ValueType>
                 <TriggerLabel>Last Poll</TriggerLabel>
@@ -436,6 +451,9 @@
         <ConfigUI>
             <Field id="nvrHelp" type="label">
                 <Label>Tracks the arm/disarm state of your UniFi OS console. There is only one NVR per console, so no selection is needed.</Label>
+            </Field>
+            <Field id="SupportsStatusRequest" type="checkbox" defaultValue="true" hidden="true">
+                <Label/>
             </Field>
         </ConfigUI>
         <States>

@@ -232,6 +232,15 @@ def _as_dict(value):
     return value if isinstance(value, dict) else {}
 
 
+def _is_real_number(value):
+    """True for a genuine int/float, explicitly excluding bool -- a bool IS
+    an int subclass in Python, so `isinstance(True, int)` is True and
+    `int(True) == 1` would otherwise become a real-looking but fabricated
+    reading (a battery percentage, an LED level, a volume, ...), exactly
+    the same trap `_camera_info_states` already guards for `micVolume`."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _state_or_unavailable(info, key="state"):
     """String state derived from a poll object's own field (cameraState/
     sensorState/lightState/chimeState/armStatus): STATE_UNAVAILABLE when
@@ -1066,7 +1075,7 @@ class Plugin(indigo.PluginBase):
         # here (a bug, or a fake in a test) must not raise AttributeError
         # out of a poll-failure handler, so it gets the plain fallback
         # instead of that richer formatting.
-        description = (self._describe_api_error(exc) if isinstance(exc, ProtectAPIError)
+        description = (self._describe_api_error(exc, entity=class_name) if isinstance(exc, ProtectAPIError)
                         else f"{type(exc).__name__}: {exc}")
         if key not in self._poll_failed_classes:
             self._poll_failed_classes.add(key)
@@ -1285,6 +1294,19 @@ class Plugin(indigo.PluginBase):
             return datetime.fromtimestamp(epoch_ms / 1000.0).isoformat(timespec="seconds")
         return ""
 
+    @staticmethod
+    def _newest_poll_timestamp(info, *keys):
+        """Newest of one or more poll timestamp fields (e.g. a sensor's
+        leakDetectedAt/externalLeakDetectedAt), or None if `info` is falsy
+        or none of `keys` are present/numeric. Used for the lastLeak/
+        lastAlarm/lastTamper 'last known' states -- see docs/CONTRACT.md on
+        the recovery limitation these exist to at least make visible."""
+        if not info:
+            return None
+        values = [info.get(key) for key in keys]
+        real = [value for value in values if isinstance(value, (int, float))]
+        return max(real) if real else None
+
     def _apply_polled_write(self, dev, write_fn, *args):
         """Every per-device write for the new (issue #8) device classes goes
         through here. A write failure (a bad Indigo state value, a server
@@ -1329,15 +1351,28 @@ class Plugin(indigo.PluginBase):
         stale pulse wins forever whenever openStatusChangedAt is null,
         since `None` compares as "always older" against a real timestamp --
         the fallback makes the override self-expire at the next poll like
-        every other pulse override in this module. Returns
-        (is_open, winning_timestamp_ms) -- the timestamp doubles as
-        lastOpenChange."""
+        every other pulse override in this module.
+
+        That poll-baseline fallback is a COMPARISON ANCHOR ONLY -- it is
+        our own poll cadence, not a fact about the device, and must never
+        be reported as `lastOpenChange` itself: doing so made
+        `lastOpenChange` advance by one poll interval every cycle forever
+        whenever `openStatusChangedAt` was null, even though nothing about
+        the sensor had changed. Returns (is_open, reportable_ms), where
+        `reportable_ms` is `None` unless the winning timestamp came from a
+        REAL source -- `openStatusChangedAt` itself, or an actual
+        `sensorOpened`/`sensorClosed` pulse -- so callers can leave
+        `lastOpenChange` untouched (never fabricate a "changed at" out of
+        nothing but our own polling clock).
+        """
         is_open = bool(info.get("isOpened")) if info else False
         changed_at = info.get("openStatusChangedAt") if info else None
         if isinstance(changed_at, (int, float)):
             winning_ms = changed_at
+            reportable_ms = changed_at
         else:
             winning_ms = self._device_last_poll_ms.get(sensor_id)
+            reportable_ms = None
 
         for pulse_type, value in (("sensorOpened", True), ("sensorClosed", False)):
             pulse = self.tracker.last_pulse(sensor_id, pulse_type)
@@ -1346,13 +1381,14 @@ class Plugin(indigo.PluginBase):
                 continue
             if winning_ms is None or start > winning_ms:
                 winning_ms = start
+                reportable_ms = start
                 is_open = value
             else:
                 self.logger.debug(
                     f"sensor {sensor_id}: discarding {pulse_type} pulse (start={start}) - "
                     f"older than the poll baseline ({winning_ms})"
                 )
-        return is_open, winning_ms
+        return is_open, reportable_ms
 
     def _sensor_battery_low(self, sensor_id, info):
         """batteryLow = poll batteryStatus.isLow OR a sensorBatteryLow pulse
@@ -1381,7 +1417,7 @@ class Plugin(indigo.PluginBase):
         value = None
         if info:
             raw = _as_dict(_as_dict(info.get("stats")).get(metric_key)).get("value")
-            if isinstance(raw, (int, float)):
+            if _is_real_number(raw):
                 value = float(raw)
 
         pulse = self.tracker.last_pulse(sensor_id, "sensorExtremeValues")
@@ -1394,7 +1430,7 @@ class Plugin(indigo.PluginBase):
                     sensor_type = _as_dict(metadata.get("sensorType")).get("text")
                     if sensor_type == metric_key:
                         raw = _as_dict(metadata.get("sensorValue")).get("text")
-                        if isinstance(raw, (int, float)):
+                        if _is_real_number(raw):
                             value = float(raw)
                 else:
                     self.logger.debug(
@@ -1402,6 +1438,21 @@ class Plugin(indigo.PluginBase):
                         f"(start={start}) - older than the poll baseline ({last_poll_ms})"
                     )
         return value
+
+    def _sensor_last_motion_ms(self, sensor_id, info):
+        """Merges the tracker's own last_family_ms(FAMILY_SENSOR_MOTION,
+        ...) with the poll's motionDetectedAt (newest wins) -- mirrors
+        _light_last_motion_ms's poll+pulse merge. Without this, lastMotion
+        reads "" after every plugin restart even though the poll object
+        carries a real motionDetectedAt timestamp, because the tracker
+        (pure in-memory state) has no memory of events from before this
+        run started."""
+        tracker_ms = self.tracker.last_family_ms(FAMILY_SENSOR_MOTION, sensor_id)
+        poll_ms = info.get("motionDetectedAt") if info else None
+        if isinstance(poll_ms, (int, float)) and (
+                not isinstance(tracker_ms, (int, float)) or poll_ms > tracker_ms):
+            return poll_ms
+        return tracker_ms if isinstance(tracker_ms, (int, float)) else None
 
     def _write_sensor_states(self, dev, sensor_id, connected, force, poll_timestamp_ms):
         info = self.sensor_info.get(sensor_id)
@@ -1417,7 +1468,7 @@ class Plugin(indigo.PluginBase):
         alarm_active = self.tracker.family_active(FAMILY_SENSOR_ALARM, sensor_id) if connected else False
         alarm_types = self.tracker.family_types(FAMILY_SENSOR_ALARM, sensor_id) if connected else set()
         tamper_active = self.tracker.family_active(FAMILY_SENSOR_TAMPER, sensor_id) if connected else False
-        last_motion_ms = self.tracker.last_family_ms(FAMILY_SENSOR_MOTION, sensor_id)
+        last_motion_ms = self._sensor_last_motion_ms(sensor_id, info)
 
         states = [
             {"key": "motionDetected", "value": motion_active},
@@ -1448,7 +1499,13 @@ class Plugin(indigo.PluginBase):
             states.append({"key": "isOpen", "value": is_open})
             states.append({"key": "batteryLow", "value": battery_low})
             states.append({"key": "mountType", "value": mount_type})
-            states.append({"key": "lastOpenChange", "value": self._iso_or_empty(open_change_ms)})
+            # open_change_ms is None unless the winning timestamp was REAL
+            # (openStatusChangedAt itself, or an actual pulse) -- never the
+            # internal poll-baseline fallback. Omitted, not written as "",
+            # when there is nothing real to report, so the state is simply
+            # never re-written every poll interval for no reason.
+            if open_change_ms is not None:
+                states.append({"key": "lastOpenChange", "value": self._iso_or_empty(open_change_ms)})
             if temperature is not None:
                 states.append({"key": "temperature", "value": temperature})
             if humidity is not None:
@@ -1456,8 +1513,36 @@ class Plugin(indigo.PluginBase):
             if light_level is not None:
                 states.append({"key": "lightLevel", "value": light_level})
 
+            # Recovery limitation (see docs/CONTRACT.md and the README
+            # banner): the poll object has no "currently active" flag for
+            # leak/alarm/tamper, only a *DetectedAt timestamp -- so after a
+            # plugin restart, leakDetected/alarmTriggered/tampered read
+            # False until a NEW live event arrives, even if the sensor's
+            # last-reported condition was still active. Rather than
+            # fabricate a currently-active guess from a stale timestamp,
+            # these three timestamps are surfaced as their own states so
+            # the information is at least visible. Skipped (not written as
+            # "") when the poll never reported one.
+            last_leak_ms = self._newest_poll_timestamp(
+                info, "leakDetectedAt", "externalLeakDetectedAt")
+            if last_leak_ms is not None:
+                states.append({"key": "lastLeak", "value": self._iso_or_empty(last_leak_ms)})
+            last_alarm_ms = self._newest_poll_timestamp(info, "alarmTriggeredAt")
+            if last_alarm_ms is not None:
+                states.append({"key": "lastAlarm", "value": self._iso_or_empty(last_alarm_ms)})
+            last_tamper_ms = self._newest_poll_timestamp(info, "tamperingDetectedAt")
+            if last_tamper_ms is not None:
+                states.append({"key": "lastTamper", "value": self._iso_or_empty(last_tamper_ms)})
+
+            # The OpenAPI spec marks batteryStatus "[DEPRECATED] Use
+            # wirelessConnectionState.batteryStatus instead" -- but
+            # `wirelessConnectionState` does not appear anywhere else in
+            # the spec (no schema defines it). Real firmware may still
+            # populate this "deprecated" field, or may have already moved
+            # to the undocumented one; this is a likely first hardware-
+            # report item once a real Protect sensor is available.
             battery_pct = _as_dict(info.get("batteryStatus")).get("percentage")
-            if isinstance(battery_pct, (int, float)):
+            if _is_real_number(battery_pct):
                 # batteryLevel is Indigo's NATIVE property (SupportsBatteryLevel
                 # in Devices.xml) -- deliberately NOT in the `states` batch
                 # above; writing it needs its own updateStateOnServer call.
@@ -1557,11 +1642,14 @@ class Plugin(indigo.PluginBase):
             states.append({"key": "lightMode",
                             "value": _as_dict(info.get("lightModeSettings")).get("mode") or ""})
             try:
-                states.append({"key": "ledLevel",
-                                "value": int(_as_dict(info.get("lightDeviceSettings"))["ledLevel"])})
+                led_level = _as_dict(info.get("lightDeviceSettings"))["ledLevel"]
+                if isinstance(led_level, bool):
+                    # int(True) == 1 -- a real-looking but fabricated LED level.
+                    raise TypeError("ledLevel must not be a bool")
+                states.append({"key": "ledLevel", "value": int(led_level)})
             except (KeyError, TypeError, ValueError):
-                # Missing or unparseable -- skipped, not defaulted to 0, same
-                # rule as camera micVolume.
+                # Missing, a bool, or otherwise unparseable -- skipped, not
+                # defaulted to 0, same rule as camera micVolume.
                 pass
 
         if poll_timestamp_ms is not None:
@@ -1597,7 +1685,10 @@ class Plugin(indigo.PluginBase):
                 try:
                     cached = self._rest(self.api.get_light, light_id)
                 except ProtectAPIError as exc:
-                    self.logger.error(f"{dev.name}: could not read the light to toggle it ({exc})")
+                    self.logger.error(
+                        f"{dev.name}: could not read the light to toggle it "
+                        f"({self._describe_api_error(exc, entity='light')})"
+                    )
                     return
                 self.light_info[light_id] = cached
             force_enabled = not bool((cached or {}).get("isLightForceEnabled"))
@@ -1608,7 +1699,9 @@ class Plugin(indigo.PluginBase):
             patch_response = self._rest(self.api.patch_light, light_id,
                                          {"isLightForceEnabled": force_enabled})
         except ProtectAPIError as exc:
-            self.logger.error(f"{dev.name}: could not set light ({exc})")
+            self.logger.error(
+                f"{dev.name}: could not set light ({self._describe_api_error(exc, entity='light')})"
+            )
             return
 
         # The PATCH itself succeeded -- merge its response (which may be
@@ -1624,7 +1717,8 @@ class Plugin(indigo.PluginBase):
             info = self._rest(self.api.get_light, light_id)
         except ProtectAPIError as exc:
             self.logger.error(
-                f"{dev.name}: force flag set, but could not re-read the light ({exc}) - "
+                f"{dev.name}: force flag set, but could not re-read the light "
+                f"({self._describe_api_error(exc, entity='light')}) - "
                 "states may be stale until the next poll"
             )
             info = None
@@ -1665,7 +1759,9 @@ class Plugin(indigo.PluginBase):
             response = self._rest(self.api.patch_light, light_id,
                                    {"lightDeviceSettings": {"ledLevel": level}})
         except ProtectAPIError as exc:
-            self.logger.error(f"{dev.name}: could not set LED level ({exc})")
+            self.logger.error(
+                f"{dev.name}: could not set LED level ({self._describe_api_error(exc, entity='light')})"
+            )
             return
 
         cached = self.light_info.get(light_id) or {}
@@ -1682,7 +1778,8 @@ class Plugin(indigo.PluginBase):
                 info = self._rest(self.api.get_light, light_id)
             except ProtectAPIError as exc:
                 self.logger.error(
-                    f"{dev.name}: LED level set, but could not re-read the light ({exc}) - "
+                    f"{dev.name}: LED level set, but could not re-read the light "
+                    f"({self._describe_api_error(exc, entity='light')}) - "
                     "states may be stale until the next poll"
                 )
                 info = None
@@ -1717,7 +1814,11 @@ class Plugin(indigo.PluginBase):
             ring_settings = info.get("ringSettings") or []
             if ring_settings and isinstance(ring_settings[0], dict):
                 try:
-                    states.append({"key": "ringVolume", "value": int(ring_settings[0]["volume"])})
+                    volume = ring_settings[0]["volume"]
+                    if isinstance(volume, bool):
+                        # int(True) == 1 -- a real-looking but fabricated volume.
+                        raise TypeError("volume must not be a bool")
+                    states.append({"key": "ringVolume", "value": int(volume)})
                 except (KeyError, TypeError, ValueError):
                     pass
         if poll_timestamp_ms is not None:
@@ -1742,20 +1843,45 @@ class Plugin(indigo.PluginBase):
             self.logger.error(f"{dev.name}: volume {volume} is out of range (must be 0-100).")
             return
 
-        cached = self.chime_info.get(chime_id) or {}
-        ring_settings = cached.get("ringSettings") or []
+        # Never guess before a poll: if nothing is cached yet (e.g. right
+        # after startup or a poll failure), read the chime first rather
+        # than reporting "no ringSettings" without having actually looked
+        # -- mirrors the light Toggle path's same rule.
+        cached = self.chime_info.get(chime_id)
+        if cached is None:
+            try:
+                cached = self._rest(self.api.get_chime, chime_id)
+            except ProtectAPIError as exc:
+                self.logger.error(
+                    f"{dev.name}: could not read the chime to set its volume "
+                    f"({self._describe_api_error(exc, entity='chime')})"
+                )
+                return
+            self.chime_info[chime_id] = cached
+
+        ring_settings = (cached or {}).get("ringSettings") or []
         if not ring_settings:
             self.logger.error(
                 f"{dev.name}: this chime has no ringSettings (no paired doorbell cameras) - "
                 "cannot set volume."
             )
             return
-        new_settings = [dict(entry, volume=volume) for entry in ring_settings]
+        # The PATCH item schema is additionalProperties: false, unlike the
+        # GET schema -- echoing a cached entry wholesale (which could carry
+        # extra fields, e.g. a future API version) can be rejected by the
+        # controller. Send only the four documented ringSettings keys.
+        new_settings = [
+            {"cameraId": entry.get("cameraId"), "repeatTimes": entry.get("repeatTimes"),
+             "ringtoneId": entry.get("ringtoneId"), "volume": volume}
+            for entry in ring_settings if isinstance(entry, dict)
+        ]
 
         try:
             response = self._rest(self.api.patch_chime, chime_id, {"ringSettings": new_settings})
         except ProtectAPIError as exc:
-            self.logger.error(f"{dev.name}: could not set chime volume ({exc})")
+            self.logger.error(
+                f"{dev.name}: could not set chime volume ({self._describe_api_error(exc, entity='chime')})"
+            )
             return
 
         if isinstance(response, dict) and response:
@@ -1765,7 +1891,8 @@ class Plugin(indigo.PluginBase):
                 info = self._rest(self.api.get_chime, chime_id)
             except ProtectAPIError as exc:
                 self.logger.error(
-                    f"{dev.name}: chime volume set, but could not re-read the chime ({exc}) - "
+                    f"{dev.name}: chime volume set, but could not re-read the chime "
+                    f"({self._describe_api_error(exc, entity='chime')}) - "
                     "states may be stale until the next poll"
                 )
                 info = None
@@ -1814,7 +1941,11 @@ class Plugin(indigo.PluginBase):
             states.append({"key": "breachDetectedAt",
                             "value": self._iso_or_empty(arm_mode.get("breachDetectedAt"))})
             try:
-                states.append({"key": "breachEventCount", "value": int(arm_mode.get("breachEventCount", 0))})
+                breach_count = arm_mode.get("breachEventCount", 0)
+                if isinstance(breach_count, bool):
+                    # int(True) == 1 -- a real-looking but fabricated count.
+                    raise TypeError("breachEventCount must not be a bool")
+                states.append({"key": "breachEventCount", "value": int(breach_count)})
             except (TypeError, ValueError):
                 pass
         if poll_timestamp_ms is not None:
@@ -1867,7 +1998,7 @@ class Plugin(indigo.PluginBase):
         try:
             info = self._rest(self.api.get_sensor, sensor_id)
         except ProtectAPIError as exc:
-            self.logger.error(f"{dev.name}: could not refresh ({exc})")
+            self.logger.error(f"{dev.name}: could not refresh ({self._describe_api_error(exc, entity='sensor')})")
             return
         # A successful single-device read is as good evidence of recovery
         # as a successful list poll -- clear the same guard so a user who
@@ -1894,7 +2025,7 @@ class Plugin(indigo.PluginBase):
         try:
             info = self._rest(self.api.get_light, light_id)
         except ProtectAPIError as exc:
-            self.logger.error(f"{dev.name}: could not refresh ({exc})")
+            self.logger.error(f"{dev.name}: could not refresh ({self._describe_api_error(exc, entity='light')})")
             return
         self._clear_poll_failure("light")
         self.light_info[light_id] = info
@@ -1914,7 +2045,7 @@ class Plugin(indigo.PluginBase):
         try:
             info = self._rest(self.api.get_chime, chime_id)
         except ProtectAPIError as exc:
-            self.logger.error(f"{dev.name}: could not refresh ({exc})")
+            self.logger.error(f"{dev.name}: could not refresh ({self._describe_api_error(exc, entity='chime')})")
             return
         self._clear_poll_failure("chime")
         self.chime_info[chime_id] = info
@@ -1930,7 +2061,7 @@ class Plugin(indigo.PluginBase):
         try:
             info = self._rest(self.api.get_nvr)
         except ProtectAPIError as exc:
-            self.logger.error(f"{dev.name}: could not refresh ({exc})")
+            self.logger.error(f"{dev.name}: could not refresh ({self._describe_api_error(exc, entity='nvr')})")
             return
         self._clear_poll_failure("nvr")
         self.nvr_info = info
@@ -2003,7 +2134,7 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _describe_api_error(exc):
+    def _describe_api_error(exc, entity="camera"):
         """One line of actionable text for a ProtectAPIError, keyed on
         ``exc.kind`` -- shared by every camera control action's error log
         plus ``_refresh_camera_info``, so what a given failure MEANS is
@@ -2011,6 +2142,13 @@ class Plugin(indigo.PluginBase):
         formatting its own ``str(exc)`` HTTP-status-and-body dump.
         Deliberately NOT used by ``takeSnapshot``/``discoverCameras``,
         whose existing wording predates this and is untouched.
+
+        ``entity`` (default ``"camera"``, so every existing camera-only
+        caller is unaffected) names the noun in the ``not_found``/``shape``
+        wording below -- issue #8's sensor/light/chime/NVR poll,
+        RequestStatus, and action paths pass their own class name
+        ("sensor"/"light"/"chime"/"nvr") so a sensor's 404 doesn't get
+        told to "reselect the camera".
 
         Definite outcomes (auth, not_found, bad_request) name the fix.
         Uncertain outcomes (transport, server, shape) say so explicitly
@@ -2031,13 +2169,13 @@ class Plugin(indigo.PluginBase):
                 text += f" - retry in {exc.retry_after:.0f}s"
             return text
         if exc.kind == "not_found":
-            return ("camera not found on the controller (removed or re-adopted?) - "
+            return (f"{entity} not found on the controller (removed or re-adopted?) - "
                     "reselect it in the device settings")
         if exc.kind in ("transport", "server"):
             return (f"controller unreachable or errored ({exc}) - outcome unknown, "
                     "states will update on the next refresh")
         if exc.kind == "shape":
-            return "applied, but the response was unusable - refreshing camera info"
+            return f"applied, but the response was unusable - refreshing {entity} info"
         if exc.kind == "bad_request":
             issues = exc.issues
             return "refused by the controller: " + ("; ".join(issues) if issues else str(exc))
