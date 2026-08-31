@@ -305,35 +305,7 @@ def test_device_stop_removes_by_device_id_not_by_current_props(fake_indigo):
 # Static wiring: the failure mode Indigo reports without naming the culprit
 # ---------------------------------------------------------------------
 
-def test_every_written_state_is_declared_and_legal(fake_indigo):
-    """Indigo rejects an undeclared or illegally-named state with
-    `LowLevelBadParameterError -- illegal XML tag name character`, and the error
-    does NOT say which key was wrong. Catch it here instead of on jarvis.
-
-    Drives a real motion cycle so the states written only on a live event
-    (personDetected, lastMotion, ...) are actually exercised -- a regex over the
-    source misses them, which is exactly how this gap hides.
-    """
-    import re
-    import xml.etree.ElementTree as ET
-    from pathlib import Path
-
-    devices_xml = (Path(__file__).parent.parent / "UniFi Protect.indigoPlugin"
-                   / "Contents" / "Server Plugin" / "Devices.xml")
-    declared = {s.get("id") for s in ET.parse(devices_xml).findall(".//State")}
-    declared.add("onOffState")   # built-in, supplied by SupportsOnState
-
-    for state_id in declared:
-        assert re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", state_id), (
-            f"state id {state_id!r} is illegal: ASCII letters/digits only, "
-            "must start with a letter, underscores forbidden"
-        )
-    assert "batteryLevel" not in declared, (
-        "batteryLevel is reserved - Indigo silently routes writes to the native "
-        "property and the state never appears"
-    )
-
-    plug = make_plugin({})
+def _scenario_camera(fake_indigo, plug):
     dev = add_camera_device(fake_indigo, plug)
     plug.socket = object()          # make _is_connected() true
     plug.tracker.handle({"type": "add", "item": {
@@ -356,17 +328,161 @@ def test_every_written_state_is_declared_and_legal(fake_indigo):
         "osdSettings": {"isNameEnabled": True, "isDateEnabled": True},
     }}
     plug._apply_camera_state("cam-1", force=True)
+    return dev, {"snapshotPath"}   # action-only, never written by the event path
 
-    written = {entry["key"] for batch in dev.state_writes for entry in batch}
-    undeclared = written - declared
-    assert not undeclared, f"plugin writes states not declared in Devices.xml: {undeclared}"
 
-    # snapshotPath is written by the takeSnapshot ACTION, not by the event
-    # path, so a motion cycle legitimately never touches it.
-    never_written = declared - written - {"snapshotPath"}
-    assert not never_written, (
-        f"declared but never written during a full motion cycle: {never_written}"
+def _scenario_sensor(fake_indigo, plug):
+    from conftest import _FakeDevice
+    dev = _FakeDevice(2001, name="Front Door", device_type_id="protectSensor",
+                       plugin_props={"sensorId": "sensor-1"})
+    fake_indigo.devices.add(dev)
+    plug.sensors = {"sensor-1": {dev.id}}
+    plug.socket = object()
+    plug.tracker.handle({"item": {"id": "sm1", "device": "sensor-1",
+                                   "type": "sensorMotion", "start": 1}})
+    plug.tracker.handle({"item": {"id": "sl1", "device": "sensor-1", "type": "sensorWaterLeak",
+                                   "start": 2, "metadata": {"sensorMountType": {"text": "leak"}}}})
+    plug.tracker.handle({"item": {"id": "sa1", "device": "sensor-1", "type": "sensorAlarm",
+                                   "start": 3, "metadata": {"alarmType": {"text": "smoke"}}}})
+    plug.tracker.handle({"item": {"id": "st1", "device": "sensor-1", "type": "sensorTamper",
+                                   "start": 4}})
+    plug.sensor_info = {"sensor-1": {
+        "id": "sensor-1", "state": "CONNECTED", "mountType": "door",
+        "isOpened": True, "openStatusChangedAt": 5,
+        "batteryStatus": {"isLow": True, "percentage": 55},
+        "stats": {
+            "temperature": {"value": 21.5}, "humidity": {"value": 40.0},
+            "light": {"value": 100.0},
+        },
+    }}
+    plug._apply_sensor_state("sensor-1", force=True, poll_timestamp_ms=1787756557000)
+    return dev, set()
+
+
+def _scenario_light(fake_indigo, plug):
+    from conftest import _FakeDevice
+    dev = _FakeDevice(2002, name="Floodlight", device_type_id="protectLight",
+                       plugin_props={"lightId": "light-1"})
+    fake_indigo.devices.add(dev)
+    plug.lights = {"light-1": {dev.id}}
+    plug.socket = object()
+    plug.light_info = {"light-1": {
+        "id": "light-1", "state": "CONNECTED", "isLightOn": True, "isDark": True,
+        "isLightForceEnabled": True, "isPirMotionDetected": True,
+        "lightModeSettings": {"mode": "motion"},
+        "lightDeviceSettings": {"ledLevel": 3},
+        "lastMotion": 1787756557000,
+    }}
+    plug._apply_light_state("light-1", force=True, poll_timestamp_ms=1787756558000)
+    return dev, set()
+
+
+def _scenario_chime(fake_indigo, plug):
+    from conftest import _FakeDevice
+    dev = _FakeDevice(2003, name="Front Chime", device_type_id="protectChime",
+                       plugin_props={"chimeId": "chime-1"})
+    fake_indigo.devices.add(dev)
+    plug.chimes = {"chime-1": {dev.id}}
+    plug.socket = object()
+    plug.chime_info = {"chime-1": {
+        "id": "chime-1", "state": "CONNECTED", "cameraIds": ["cam-1"],
+        "ringSettings": [{"cameraId": "cam-1", "repeatTimes": 1,
+                           "ringtoneId": "r1", "volume": 42}],
+    }}
+    plug._apply_chime_state("chime-1", force=True, poll_timestamp_ms=1787756559000)
+    return dev, set()
+
+
+def _scenario_nvr(fake_indigo, plug):
+    from conftest import _FakeDevice
+    dev = _FakeDevice(2004, name="UNVR", device_type_id="protectNvr", plugin_props={})
+    fake_indigo.devices.add(dev)
+    plug.nvrs = {"nvr": {dev.id}}
+    plug.socket = object()
+    plug.nvr_info = {
+        "id": "nvr1", "modelKey": "nvr", "name": "UNVR", "type": "UNVRINSTANT",
+        "armMode": {"status": "disabled", "armedAt": 1000, "breachDetectedAt": 2000,
+                     "breachEventCount": 1},
+    }
+    plug._protect_version = "7.2.105"
+    plug._apply_nvr_state(force=True, poll_timestamp_ms=1787756560000)
+    return dev, set()
+
+
+_SCENARIOS = {
+    "protectCamera": _scenario_camera,
+    "protectSensor": _scenario_sensor,
+    "protectLight": _scenario_light,
+    "protectChime": _scenario_chime,
+    "protectNvr": _scenario_nvr,
+}
+
+
+def test_every_written_state_is_declared_and_legal(fake_indigo):
+    """Indigo rejects an undeclared or illegally-named state with
+    `LowLevelBadParameterError -- illegal XML tag name character`, and the error
+    does NOT say which key was wrong. Catch it here instead of on jarvis.
+
+    Iterates every <Device> in Devices.xml (issue #8), driving one
+    realistic scenario per device type so the states written only on a
+    live event (personDetected, lastMotion, isOpen, ...) are actually
+    exercised -- a regex over the source misses them, which is exactly
+    how this gap hides.
+    """
+    import re
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+
+    devices_xml = (Path(__file__).parent.parent / "UniFi Protect.indigoPlugin"
+                   / "Contents" / "Server Plugin" / "Devices.xml")
+    device_elements = ET.parse(devices_xml).findall(".//Device")
+    all_declared = {s.get("id") for d in device_elements for s in d.findall("./States/State")}
+    all_declared.add("onOffState")   # built-in, supplied by SupportsOnState
+
+    for state_id in all_declared:
+        assert re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", state_id), (
+            f"state id {state_id!r} is illegal: ASCII letters/digits only, "
+            "must start with a letter, underscores forbidden"
+        )
+    assert "batteryLevel" not in all_declared, (
+        "batteryLevel is reserved - Indigo silently routes writes to the native "
+        "property and the state never appears as a declared <State>"
     )
+    assert set(_SCENARIOS) == {d.get("id") for d in device_elements}, (
+        "every <Device> in Devices.xml needs a scenario above, or this test "
+        "silently stops covering it"
+    )
+
+    # onOffState is built-in for relay devices and for sensor devices with
+    # SupportsOnState -- protectChime/protectNvr are `type="custom"` with
+    # neither, so they never get one.
+    _HAS_ON_OFF_STATE = {"protectCamera", "protectSensor", "protectLight"}
+
+    for device_elem in device_elements:
+        type_id = device_elem.get("id")
+        declared = {s.get("id") for s in device_elem.findall("./States/State")}
+        if type_id in _HAS_ON_OFF_STATE:
+            declared.add("onOffState")
+
+        plug = make_plugin({})
+        dev, exempt = _SCENARIOS[type_id](fake_indigo, plug)
+
+        written = {entry["key"] for batch in dev.state_writes for entry in batch}
+        # batteryLevel is protectSensor's one NATIVE-property write
+        # (SupportsBatteryLevel) -- it is never a declared <State> (asserted
+        # above) so it must be excluded here too, or it would show up as
+        # "undeclared".
+        written_states = written - {"batteryLevel"}
+
+        undeclared = written_states - declared
+        assert not undeclared, (
+            f"{type_id}: plugin writes states not declared in Devices.xml: {undeclared}"
+        )
+
+        never_written = declared - written_states - exempt
+        assert not never_written, (
+            f"{type_id}: declared but never written by its scenario: {never_written}"
+        )
 
 
 def test_snapshot_path_state_is_written_by_the_action(fake_indigo, tmp_path):
