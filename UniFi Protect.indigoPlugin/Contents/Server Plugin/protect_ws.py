@@ -1,9 +1,16 @@
-"""Stdlib-only WebSocket client for the UniFi Protect event stream.
+"""Stdlib-only WebSocket client for UniFi Protect's plain-JSON sockets.
 
 Speaks plain RFC 6455 (text opcode 0x1, no compression) to
-``/proxy/protect/integration/v1/subscribe/events``, authenticated with the
-same ``X-API-KEY`` header used for the REST API. Handshake and frame-reader
-lifted from ``docs/ws_probe.py``, which was proven live against this server.
+``/proxy/protect/integration/v1/subscribe/events`` by default, authenticated
+with the same ``X-API-KEY`` header used for the REST API. Handshake and
+frame-reader lifted from ``docs/ws_probe.py``, which was proven live against
+this server.
+
+Issue #18 reuses this same class for the sibling
+``/subscribe/devices`` socket via the ``path``/``label`` constructor kwargs
+(both default to the original events-socket values, so every pre-existing
+caller is unaffected) -- the two sockets share an identical handshake and
+frame format, just a different path and a different label in log/error text.
 """
 
 from __future__ import annotations
@@ -41,17 +48,23 @@ def _assert_no_secret(text: str, secret: str) -> str:
 
 
 class ProtectEventSocket:
-    """Blocking, stdlib-only WebSocket client for /subscribe/events.
+    """Blocking, stdlib-only WebSocket client for /subscribe/events (the
+    default) or, via the `path`/`label` kwargs, /subscribe/devices
+    (issue #18) -- both sockets share an identical handshake and frame
+    format.
 
     Not thread-safe. One instance is driven by one thread.
     """
 
     def __init__(self, host: str, api_key: str, verify_ssl: bool = False,
-                 logger: Optional[logging.Logger] = None) -> None:
+                 logger: Optional[logging.Logger] = None,
+                 path: str = _HANDSHAKE_PATH, label: str = "event") -> None:
         self._host = host
         self._api_key = api_key
         self._verify_ssl = verify_ssl
         self._logger = logger or logging.getLogger(__name__)
+        self._path = path
+        self._label = label
         self._sock: Optional[ssl.SSLSocket] = None
         self._buffer = b""
         self._last_frame_at: Optional[float] = None
@@ -86,11 +99,11 @@ class ProtectEventSocket:
             raw = socket.create_connection((self._host, 443), timeout=15)
             sock = ctx.wrap_socket(raw, server_hostname=self._host)
         except OSError as exc:
-            raise ConnectionError(f"Protect event socket connect failed: {exc}") from None
+            raise ConnectionError(f"Protect {self._label} socket connect failed: {exc}") from None
 
         nonce = base64.b64encode(os.urandom(16)).decode()
         request = (
-            f"GET {_HANDSHAKE_PATH} HTTP/1.1\r\n"
+            f"GET {self._path} HTTP/1.1\r\n"
             f"Host: {self._host}\r\n"
             f"Upgrade: websocket\r\n"
             f"Connection: Upgrade\r\n"
@@ -105,20 +118,20 @@ class ProtectEventSocket:
             while b"\r\n\r\n" not in buf:
                 chunk = sock.recv(4096)
                 if not chunk:
-                    raise ConnectionError("Protect event socket closed during handshake")
+                    raise ConnectionError(f"Protect {self._label} socket closed during handshake")
                 buf += chunk
         except (OSError, socket.timeout) as exc:
             sock.close()
             if isinstance(exc, ConnectionError):
                 raise
-            raise ConnectionError(f"Protect event socket handshake failed: {exc}") from None
+            raise ConnectionError(f"Protect {self._label} socket handshake failed: {exc}") from None
 
         head, _, rest = buf.partition(b"\r\n\r\n")
         status_line = head.split(b"\r\n", 1)[0]
         if b"101" not in status_line:
             sock.close()
             message = _assert_no_secret(
-                f"Protect event socket handshake rejected: "
+                f"Protect {self._label} socket handshake rejected: "
                 f"{status_line.decode(errors='replace')}", self._api_key)
             raise ConnectionError(message)
 
@@ -155,7 +168,7 @@ class ProtectEventSocket:
         no errno, is normal and returns None).
         """
         if self._sock is None:
-            raise ConnectionError("Protect event socket is not connected")
+            raise ConnectionError(f"Protect {self._label} socket is not connected")
 
         deadline = time.monotonic() + timeout
         while True:
@@ -174,12 +187,12 @@ class ProtectEventSocket:
                         # no FIN/RST. Only a bare settimeout() expiry (no
                         # errno set) is a normal idle tick.
                         raise ConnectionError(
-                            f"Protect event socket read failed: {exc}") from None
+                            f"Protect {self._label} socket read failed: {exc}") from None
                     return None
                 except OSError as exc:
-                    raise ConnectionError(f"Protect event socket read failed: {exc}") from None
+                    raise ConnectionError(f"Protect {self._label} socket read failed: {exc}") from None
                 if not chunk:
-                    raise ConnectionError("Protect event socket closed by peer")
+                    raise ConnectionError(f"Protect {self._label} socket closed by peer")
                 self._buffer += chunk
                 continue
 
@@ -187,7 +200,7 @@ class ProtectEventSocket:
             self._last_frame_at = time.monotonic()
 
             if opcode == _OP_CLOSE:
-                raise ConnectionError("Protect event socket received a close frame")
+                raise ConnectionError(f"Protect {self._label} socket received a close frame")
             if opcode == _OP_PING:
                 self._send_frame(_OP_PONG, payload)
                 continue
@@ -309,7 +322,7 @@ class ProtectEventSocket:
 
         if length > _MAX_FRAME_PAYLOAD:
             raise ConnectionError(
-                f"Protect event socket declared a {length}-byte frame payload, "
+                f"Protect {self._label} socket declared a {length}-byte frame payload, "
                 f"exceeding the {_MAX_FRAME_PAYLOAD}-byte cap -- treating the "
                 f"stream as corrupt/desynced rather than buffering it")
 
@@ -334,7 +347,7 @@ class ProtectEventSocket:
         """Send one masked client frame (RFC6455 SS5.3 -- client frames MUST
         be masked or a compliant server may drop the connection)."""
         if self._sock is None:
-            raise ConnectionError("Protect event socket is not connected")
+            raise ConnectionError(f"Protect {self._label} socket is not connected")
 
         length = len(payload)
         fin_and_opcode = 0x80 | (opcode & 0x0F)
@@ -350,4 +363,4 @@ class ProtectEventSocket:
         try:
             self._sock.sendall(header + mask_key + masked_payload)
         except OSError as exc:
-            raise ConnectionError(f"Protect event socket write failed: {exc}") from None
+            raise ConnectionError(f"Protect {self._label} socket write failed: {exc}") from None

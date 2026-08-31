@@ -150,6 +150,16 @@ real hardware state with a fabricated `False`/`""`. `dev.model` is also kept
 in sync with the camera's hardware type, so the device list shows e.g. "UVC
 G5 Turret Ultra" instead of the generic "Protect Camera".
 
+Since v2026.8.0 (issue #18), these hardware/config states also update
+**live**: the plugin keeps a second, independent WebSocket
+(`/subscribe/devices`) open alongside the events socket above, and applies a
+camera/sensor/light/chime/NVR config change (e.g. flipping the status LED
+from the UniFi app) the moment the controller pushes it, rather than waiting
+for the next 60s poll. `connected` still means the **events** socket only —
+losing the device socket only makes hardware/config states as stale as they
+were before this feature existed (the 60s poll cadence); it never touches
+motion, audio, or `connected`.
+
 Deliberately **not** available, because it needs the private (not the
 official integration) API: firmware version, camera IP, `isDark`, IR LED
 mode/level, zoom position, motion tuning, and wifi stats. See

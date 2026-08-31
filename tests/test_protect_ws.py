@@ -473,3 +473,68 @@ def test_send_ping_pong_response_advances_last_frame_at():
     ws.read_message(timeout=0.05)
     assert ws.last_frame_at is not None
     assert before is None or ws.last_frame_at >= before
+
+
+# ---------------------------------------------------------------------
+# path/label (issue #18) -- the class is reused for /subscribe/devices
+# ---------------------------------------------------------------------
+
+def test_default_path_and_label_are_unchanged():
+    """Existing callers (the events socket) must be byte-identical: no
+    path/label kwargs passed, so both must default to the original values."""
+    ws = ProtectEventSocket("192.0.2.1", "fake-api-key")
+    assert ws._path == "/proxy/protect/integration/v1/subscribe/events"  # pylint: disable=protected-access
+    assert ws._label == "event"  # pylint: disable=protected-access
+
+
+def test_custom_path_lands_in_the_handshake_get_line(monkeypatch):
+    import protect_ws as protect_ws_module
+
+    class _FakeTLSSocket:
+        def __init__(self):
+            self.sent = b""
+
+        def settimeout(self, _t):
+            pass
+
+        def sendall(self, data):
+            self.sent += data
+
+        def recv(self, _n):
+            return b"HTTP/1.1 101 Switching Protocols\r\n\r\n"
+
+        def close(self):
+            pass
+
+    fake_sock = _FakeTLSSocket()
+
+    class _FakeCtx:
+        def wrap_socket(self, _raw, server_hostname=None):
+            return fake_sock
+
+    monkeypatch.setattr(protect_ws_module.ssl, "create_default_context", lambda: _FakeCtx())
+    monkeypatch.setattr(
+        protect_ws_module.socket, "create_connection", lambda addr, timeout=None: object())
+
+    ws = ProtectEventSocket(
+        "192.0.2.1", "fake-api-key",
+        path="/proxy/protect/integration/v1/subscribe/devices", label="device",
+    )
+    ws.connect()
+
+    request = fake_sock.sent.decode()
+    assert request.startswith("GET /proxy/protect/integration/v1/subscribe/devices HTTP/1.1\r\n")
+
+
+def test_custom_label_appears_in_error_text():
+    ws = make_socket()
+    ws._label = "device"  # pylint: disable=protected-access
+    ws._sock = None  # pylint: disable=protected-access
+    with pytest.raises(ConnectionError, match="Protect device socket"):
+        ws.read_message(timeout=0.01)
+
+
+def test_custom_label_set_via_constructor_appears_in_error_text():
+    ws = ProtectEventSocket("192.0.2.1", "fake-api-key", label="device")
+    with pytest.raises(ConnectionError, match="Protect device socket"):
+        ws.send_ping()

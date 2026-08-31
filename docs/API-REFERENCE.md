@@ -79,7 +79,7 @@ the spec (see below the table):
 | `/v1/files/{fileType}` | GET, POST | no |
 | `/v1/alarm-manager/webhook/{id}` | POST | no |
 | `/v1/subscribe/events` | GET (WS upgrade) | ✅ the only motion source |
-| `/v1/subscribe/devices` | GET (WS upgrade) | no — see below |
+| `/v1/subscribe/devices` | GET (WS upgrade) | ✅ issue #18 — see below |
 | `/v1/users` *(undocumented)* | GET | no |
 | `/v1/bridges` *(undocumented)* | GET | no — returns `[]` on reference rig |
 
@@ -181,9 +181,25 @@ All three frame types are a `oneOf` across every device `modelKey` the spec
 knows about: `nvr, camera, chime, light, viewer, speaker, bridge, sensor,
 aiprocessor, aiport, linkstation`.
 
-Not used by the plugin yet. It is the natural live source for camera `state`
-transitions (rather than polling `GET /cameras`) and for future Protect
-sensor readings (issue #8) — worth revisiting if either of those get built.
+**Used by the plugin since issue #18** (v2026.8.0) as a second, independent
+push source alongside `/subscribe/events`: a `runConcurrentThread`-owned
+`ProtectEventSocket` instance (the same class, just a different `path`/
+`label`) is opened right after the events socket in `_open_socket`, polled
+in the same `_pump()` tick, and routed through `device_router.py`
+(`DeviceUpdateRouter.route()` + `merge_update()`) into the existing
+camera/sensor/light/chime/nvr caches — see `docs/CONTRACT.md`'s "second
+socket" section for the full design. It replaces the previous need to wait
+for the 60s poll (issue #8) to see a config/state change (e.g. a status LED
+flipped from the UniFi app, or a camera's `state` transitioning) — a
+successful `update`/`add`/`remove` frame updates Indigo state immediately.
+
+It does **not** replace the poll: chimes and the NVR have no other live
+feed, sensors/lights still need it for measurements the socket doesn't
+push, and the socket's own retry/backoff is independent of (and may be
+down while) the poll keeps working. It also does **not** affect
+`connected` or camera motion in any way — those remain entirely driven by
+`/subscribe/events`; losing the device socket only means config/state
+states go back to being poll-only (60s) freshness until it reconnects.
 
 ## Writes — VERIFIED 2026-08-31 on 7.2.105
 
