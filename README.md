@@ -279,11 +279,24 @@ open/closed/battery-low/extreme-value/PIR-motion "pulse" notifications) --
 the poll is what keeps everything else (temperature, battery percentage,
 light mode, chime ring settings, ...) current, and it's also what
 corrects a live motion flag that's gotten stuck (if Protect's own poll
-answer says motion has stopped, that wins). A poll failure logs one ERROR
-per class per outage (not once a minute), keeps every last-known value,
-and marks that class's own state string (`sensorState`/`lightState`/
-`chimeState`) `"unavailable"` -- it never fabricates a fresh-looking
-False/empty value.
+answer says motion has stopped, that wins).
+
+A poll failure logs one ERROR per class per outage (not once a minute, and
+one INFO when it recovers), and PROACTIVELY marks that class's own state
+string (`sensorState`/`lightState`/`chimeState`/`armStatus`) `"unavailable"`
+-- every other value for that class (temperature, isOpen, ring volume, ...)
+is left exactly where it last was, not re-read from a stale cache and not
+blanked either. The same happens if a device that's still configured in
+Indigo simply stops appearing in Protect's list (removed, or the console
+briefly returned an empty list) -- a WARNING names the device, and its
+values are held the same way. Before the very first poll ever completes
+(a brand-new device, or one added while the controller was down), the
+plugin writes only what it can genuinely vouch for -- lifecycle-driven
+booleans and "unavailable" -- and never fabricates a fresh-looking
+False/0/empty value for anything poll-derived. `connected` always reflects
+the event socket itself, independent of whether polling is succeeding --
+a device won't get stuck reporting disconnected just because its first
+poll after a reconnect happened to fail.
 
 ### Protect Sensor
 
