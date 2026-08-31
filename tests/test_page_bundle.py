@@ -9,12 +9,26 @@ those two files honest -- see CLAUDE.md for the sync step.
 
 from pathlib import Path
 
+import plugin as plugin_module
+
 REPO_ROOT = Path(__file__).parent.parent
 SOURCE = REPO_ROOT / "pages" / "cameras.html"
 BUNDLED = (
     REPO_ROOT / "UniFi Protect.indigoPlugin" / "Contents" / "Resources"
     / "pages" / "cameras.html"
 )
+
+
+def test_bundled_path_matches_plugin_modules_constants():
+    """Guards plugin.py's hardcoded WEB_PAGE_BUNDLE_DIR/WEB_PAGE_FILENAME
+    constants against a future bundle rename: if either ever changes, this
+    must be the file that actually moves, or _sync_web_page would be
+    installing/comparing against the wrong path with nothing to catch it."""
+    constant_path = (
+        REPO_ROOT / plugin_module.WEB_PAGE_BUNDLE_DIR / "Contents" / "Resources"
+        / "pages" / plugin_module.WEB_PAGE_FILENAME
+    )
+    assert constant_path == BUNDLED
 
 
 def test_bundled_cameras_page_matches_repo_source():

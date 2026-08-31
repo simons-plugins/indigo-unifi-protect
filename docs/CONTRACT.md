@@ -891,6 +891,36 @@ are written together in one batched call —
 (`MotionSensorTripped`/`MotionSensor`) tracks `onOffState`, not
 `motionDetected` alone.
 
+### Web page sync (issue #27)
+
+`_sync_web_page` installs/updates the bundled `pages/cameras.html` into
+`Web Assets/static/pages/` — on `startup()` and on every `closedPrefsConfigUi`
+save where `managePage` is on (not just an off→on transition: the sync is
+order-independent and idempotent, so re-running it on every save is safe and
+also gives a failed sync a retry path). It must **never raise out of
+startup**: the whole body is one `try/except`, and every failure path is a
+WARNING naming the destination path and that the plugin will retry at the
+next config save or plugin restart.
+
+- Byte-compares source and destination before writing; identical bytes is a
+  DEBUG no-op, never a write.
+- Writes atomically (`tmp` + `os.replace`), and on any exception during the
+  attempt, guard-removes the `.tmp` file (its own `try/except OSError: pass`)
+  so a failed write never leaves a `cameras.html.tmp` orphan in the
+  web-served directory.
+- An empty bundled source (`source_bytes == b""`) is refused with a WARNING
+  rather than installed — a truncated/corrupt bundle must not clobber a
+  working installed page.
+- When `managePage` is off, no write happens, but a read-only,
+  best-effort check (`_warn_if_managed_page_is_stale`) still compares the
+  two files and logs **one INFO** if they differ, naming the bundled
+  version and pointing at re-ticking the checkbox or hand-editing. Any
+  exception in that off-path check is DEBUG only — an opted-out user must
+  not get WARNINGs about a file the plugin isn't managing.
+- The catch-all WARNING points at the bundled copy inside the plugin
+  bundle (`Contents/Resources/pages/cameras.html`), not `pages/cameras.html`
+  in the repo — a zip-installed user has no `pages/` directory.
+
 ### Actions (issue #6) — the plugin's first write path
 
 Five `Actions.xml` entries, all `deviceFilter="self.protectCamera"`,

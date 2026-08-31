@@ -433,17 +433,18 @@ class Plugin(indigo.PluginBase):
     def closedPrefsConfigUi(self, valuesDict, userCancelled):
         if userCancelled:
             return
-        # Captured before anything below changes self.pluginPrefs's meaning,
-        # so ticking the box in this same dialog session takes effect
-        # immediately rather than waiting for the next restart (issue #27).
-        page_was_managed = _truthy(self.pluginPrefs.get("managePage"))
         self.debug = valuesDict.get("showDebugInfo", False)
         self.host = valuesDict.get("host", "").strip()
         self.api_key = valuesDict.get("apiKey", "").strip()
         self.verify_ssl = valuesDict.get("verifySSL", False)
         self._rebuild_client()
-        if _truthy(valuesDict.get("managePage")) and not page_was_managed:
-            self._sync_web_page(valuesDict)
+        # Every save re-syncs (issue #27) rather than only on an off->on
+        # transition: it's order-independent (works whether Indigo has
+        # already folded valuesDict into self.pluginPrefs by the time this
+        # runs or not -- evidence says it has, which made a transition
+        # guard here never fire), and _sync_web_page is itself a no-op
+        # when the pref is off or the installed copy already matches.
+        self._sync_web_page(valuesDict)
         # Do NOT close the socket here. This runs on Indigo's UI thread, and
         # ProtectEventSocket is single-threaded by contract: closing an fd that
         # runConcurrentThread is blocked reading is genuinely unsafe, not merely
@@ -2575,31 +2576,66 @@ class Plugin(indigo.PluginBase):
             )
         return self._snapshot_dir
 
+    @staticmethod
+    def _web_page_paths(install):
+        source = os.path.join(
+            install, "Plugins", WEB_PAGE_BUNDLE_DIR, "Contents",
+            "Resources", "pages", WEB_PAGE_FILENAME,
+        )
+        dest_dir = os.path.join(install, "Web Assets", "static", "pages")
+        return source, dest_dir, os.path.join(dest_dir, WEB_PAGE_FILENAME)
+
+    def _warn_if_managed_page_is_stale(self):
+        """Issue #27 (X3): pref is OFF, so no write happens -- but a stale
+        installed page is worth one INFO. Read-only and best-effort: any
+        failure here (missing bundle, permissions, whatever) is DEBUG only,
+        because an opted-out user must not get WARNINGs about a file the
+        plugin isn't managing.
+        """
+        try:
+            install = indigo.server.getInstallFolderPath()
+            source, _dest_dir, dest = self._web_page_paths(install)
+            if not (os.path.isfile(source) and os.path.isfile(dest)):
+                return
+            with open(source, "rb") as handle:
+                source_bytes = handle.read()
+            with open(dest, "rb") as handle:
+                dest_bytes = handle.read()
+            if source_bytes != dest_bytes:
+                self.logger.info(
+                    f"Cameras page management is off, and the installed page "
+                    f"({dest}) differs from the bundled one (v{self.pluginVersion}) - "
+                    "update it by hand, or re-tick 'Manage the Cameras web page' "
+                    "to have the plugin do it."
+                )
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.debug(f"Could not check the installed Cameras page for staleness: {exc}")
+
     def _sync_web_page(self, prefs=None):
         """Issue #27: install/update the bundled Cameras page into Web
-        Assets on startup (and when the pref is switched on), so users stop
-        manually copying it after every change.
+        Assets on startup and on every prefs save, so users stop manually
+        copying it after every change.
 
         Must NEVER raise out of startup: the whole body is one try/except,
-        and every failure path -- missing bundle, unreadable/unwritable
-        destination -- is a WARNING naming the destination path so the user
-        can copy the file by hand instead. Paths are resolved lazily here,
-        never in __init__ or at module scope: Indigo exec()s plugin.py as a
-        string, so __file__ does not exist (see _get_snapshot_dir).
+        and every failure path -- missing bundle, empty bundle, unreadable/
+        unwritable destination -- is a WARNING naming the destination path
+        and the retry path, so the user can copy the file by hand instead.
+        When the pref is off, no write happens, but `_warn_if_managed_page_
+        is_stale` still flags a stale installed copy at INFO. Paths are
+        resolved lazily here, never in __init__ or at module scope: Indigo
+        exec()s plugin.py as a string, so __file__ does not exist (see
+        _get_snapshot_dir).
         """
         prefs = self.pluginPrefs if prefs is None else prefs
         if not _truthy(prefs.get("managePage")):
+            self._warn_if_managed_page_is_stale()
             return
 
         dest = None
+        tmp = None
         try:
             install = indigo.server.getInstallFolderPath()
-            source = os.path.join(
-                install, "Plugins", WEB_PAGE_BUNDLE_DIR, "Contents",
-                "Resources", "pages", WEB_PAGE_FILENAME,
-            )
-            dest_dir = os.path.join(install, "Web Assets", "static", "pages")
-            dest = os.path.join(dest_dir, WEB_PAGE_FILENAME)
+            source, dest_dir, dest = self._web_page_paths(install)
 
             if not os.path.isfile(source):
                 self.logger.warning(
@@ -2611,6 +2647,14 @@ class Plugin(indigo.PluginBase):
 
             with open(source, "rb") as handle:
                 source_bytes = handle.read()
+
+            if not source_bytes:
+                self.logger.warning(
+                    f"Bundled Cameras page at {source} is empty (truncated or "
+                    f"corrupt) - refusing to install it over {dest}. "
+                    "Reinstalling the plugin should restore the bundled copy."
+                )
+                return
 
             dest_bytes = None
             if os.path.isfile(dest):
@@ -2626,17 +2670,25 @@ class Plugin(indigo.PluginBase):
             with open(tmp, "wb") as handle:
                 handle.write(source_bytes)
             os.replace(tmp, dest)
+            tmp = None  # installed -- nothing left to clean up
 
             self.logger.info(
                 f"Installed/updated the Cameras page in Web Assets (v{self.pluginVersion} "
                 "-> managed by the plugin; untick 'Manage the Cameras web page' to hand-edit it)"
             )
         except Exception as exc:  # pylint: disable=broad-except
+            if tmp is not None:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
             where = dest or f"Web Assets/static/pages/{WEB_PAGE_FILENAME}"
             self.logger.warning(
-                f"Could not install/update the Cameras page at {where}: {exc}. "
-                "Copy pages/cameras.html there by hand, or untick 'Manage the "
-                "Cameras web page' to stop the plugin trying."
+                f"Could not install/update the Cameras page at {where}: {exc}. Copy "
+                "the bundled copy (Contents/Resources/pages/cameras.html inside "
+                "the plugin bundle) there by hand, or untick 'Manage the Cameras "
+                "web page' to stop the plugin trying. The plugin will retry at "
+                "the next config save or plugin restart."
             )
 
     # ------------------------------------------------------------------
