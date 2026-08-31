@@ -8,7 +8,9 @@ object carries no motion field and `GET /events` returns 404.
 
 What that costs, stated plainly because it shapes every automation written
 against this plugin: Indigo booleans cannot express "unknown". When the socket
-is down this plugin forces `motionDetected` False and `connected` False. It
+is down this plugin forces `motionDetected` False and `connected` False --
+and, identically, `audioDetected` plus the four specific audio states
+(speechDetected/babyCryDetected/smokeAlarmDetected/coAlarmDetected). It
 does NOT have a way to say "I cannot tell" in the motion state itself.
 
     Any trigger that acts on motion MUST gate on `connected` first.
@@ -23,7 +25,7 @@ from datetime import datetime
 
 import indigo
 
-from event_tracker import EventTracker, KNOWN_UNSUPPORTED_EVENT_TYPES
+from event_tracker import EventTracker, KNOWN_UNSUPPORTED_EVENT_TYPES, MISSING_TYPE_KEY
 from protect_api import ProtectAPI, ProtectAPIError
 from protect_ws import ProtectEventSocket
 
@@ -78,6 +80,22 @@ STATE_UNAVAILABLE = "unavailable"
 # Under Indigo's "Web Assets/images", so snapshots survive plugin upgrades and
 # are servable to control pages at /images/<SNAPSHOT_SUBDIR>/...
 SNAPSHOT_SUBDIR = "unifi-protect"
+
+
+def _truthy(value, default=True):
+    """Coerce a pluginProps checkbox value to bool.
+
+    Indigo can hand a checkbox prop back as the STRING "false" rather than
+    the bool False (see heatmiser's `_coerce_bool`, indigo-matter's
+    `export_dialog_mixin._truthy`), and `bool("false")` is True -- so a
+    naive `.get(key, True)` would silently ignore a user unchecking the
+    box. None (the prop was never set) resolves to `default`.
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
 
 
 class Plugin(indigo.PluginBase):
@@ -364,17 +382,23 @@ class Plugin(indigo.PluginBase):
         supported type (doorbell ring, Protect sensor) is expected and
         unremarkable -- log it at DEBUG. Anything else is either a genuinely
         new event type or a parsing gap and is worth a bug report -- log it
-        at WARNING."""
+        at WARNING. Both include the first camera id seen sending it, so the
+        log line points somewhere useful."""
         for event_type in self.tracker.ignored_type_counts:
             if event_type in self._reported_ignored_types:
                 continue
             self._reported_ignored_types.add(event_type)
+            sample_device = self.tracker.ignored_type_samples.get(event_type, "unknown")
+            if event_type == MISSING_TYPE_KEY:
+                what = "event frames with no `type` field"
+            else:
+                what = f"'{event_type}' event frames"
             if event_type in KNOWN_UNSUPPORTED_EVENT_TYPES:
-                self.logger.debug(f"Ignoring '{event_type}' event frames - not supported yet")
+                self.logger.debug(f"Ignoring {what} - not supported yet (e.g. device {sample_device})")
             else:
                 self.logger.warning(
-                    f"Ignoring event frames of unknown type '{event_type}' - not treated as "
-                    "motion. Please report this on GitHub with a debug capture."
+                    f"Ignoring {what} - not treated as motion (e.g. device {sample_device}). "
+                    "Please report this on GitHub with a debug capture."
                 )
 
     def _close_socket(self):
@@ -400,7 +424,9 @@ class Plugin(indigo.PluginBase):
     def _mark_all_disconnected(self):
         """A dead socket means motion is unknown. Indigo booleans cannot say
         that, so motion goes False and `connected` goes False alongside it --
-        automations are expected to gate on the latter."""
+        the same forced-False rule covers `audioDetected` and the four
+        specific audio states too, for the same reason. Automations are
+        expected to gate on `connected`."""
         for camera_id in list(self.cameras):
             self.tracker.clear_camera(camera_id)
             self._apply_camera_state(camera_id, connected=False, force=True)
@@ -442,7 +468,7 @@ class Plugin(indigo.PluginBase):
         # checkbox or not: an alarm is not presence, and folding it into
         # onOffState would make a "device turned on" trigger fire on a smoke
         # alarm, burying a real alert under a routine motion notification.
-        counts_as_activity = dev.pluginProps.get("audioCountsAsActivity", True)
+        counts_as_activity = _truthy(dev.pluginProps.get("audioCountsAsActivity"))
         audio_presence = bool(counts_as_activity and PRESENCE_AUDIO_TYPES.intersection(audio_types))
         on_state = motion_active or audio_presence
 

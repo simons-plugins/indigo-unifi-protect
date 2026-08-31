@@ -15,7 +15,7 @@
                 <Description>Speech or a baby crying turns the device on, like motion</Description>
             </Field>
             <Field id="audioCountsAsActivityHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
-                <Label>The device on/off state (what a "Device turned on" trigger watches) goes on for motion, speech, or a baby crying. A smoke or CO alarm sound never turns it on - use their own states instead.</Label>
+                <Label>With this checked, the device on/off state (what a "Device turned on" trigger watches) goes on for motion, speech, or a baby crying. Unchecked, it tracks motion only. A smoke or CO alarm sound never turns it on either way - use their own states.</Label>
             </Field>
             <Field id="SupportsOnState" type="checkbox" defaultValue="true" hidden="true">
                 <Label/>

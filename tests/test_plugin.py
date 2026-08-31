@@ -480,13 +480,16 @@ def test_speech_counts_as_activity_by_default(fake_indigo):
     assert dev.image_writes[-1] == indigo.kStateImageSel.MotionSensorTripped
 
 
-def test_speech_with_checkbox_off_does_not_count_as_activity(fake_indigo):
+@pytest.mark.parametrize("off_value", [False, "false"])
+def test_speech_with_checkbox_off_does_not_count_as_activity(fake_indigo, off_value):
     """audioCountsAsActivity=False must exclude speech from onOffState
     without suppressing speechDetected itself -- the checkbox governs the
-    presence rollup, not the specific state."""
+    presence rollup, not the specific state. Indigo can hand this prop back
+    as the bool False OR the string "false" -- bool("false") is True, so
+    the string form is the actual regression this guards against."""
     plug = make_plugin({})
     dev = add_camera_device_with_props(
-        fake_indigo, plug, {"audioCountsAsActivity": False})
+        fake_indigo, plug, {"audioCountsAsActivity": off_value})
     plug.socket = object()
     _handle_audio(plug, "cam-1", "a1", ["alrmSpeak"])
 
@@ -496,22 +499,89 @@ def test_speech_with_checkbox_off_does_not_count_as_activity(fake_indigo):
     assert dev.states["onOffState"] is False, "checkbox off must exclude speech from onOffState"
 
 
-def test_smoke_alarm_never_counts_as_activity_even_with_checkbox_on(fake_indigo):
-    """A smoke/CO alarm sound must NEVER contribute to onOffState, checkbox
-    or not -- folding it in would make a 'device turned on' trigger fire on
-    a smoke alarm, burying a real alert under a routine motion notification.
-    """
+@pytest.mark.parametrize("on_value", [True, "true"])
+def test_speech_counts_as_activity_when_checkbox_explicitly_on(fake_indigo, on_value):
+    """Mirrors the checkbox-off test: an explicit bool True OR the string
+    "true" must both still count speech as activity."""
     plug = make_plugin({})
-    dev = add_camera_device(fake_indigo, plug)   # audioCountsAsActivity defaults True
+    dev = add_camera_device_with_props(
+        fake_indigo, plug, {"audioCountsAsActivity": on_value})
     plug.socket = object()
-    _handle_audio(plug, "cam-1", "a1", ["alrmSmoke"])
+    _handle_audio(plug, "cam-1", "a1", ["alrmSpeak"])
 
     plug._apply_camera_state("cam-1", force=True)
 
-    assert dev.states["smokeAlarmDetected"] is True
+    assert dev.states["onOffState"] is True
+
+
+def test_checkbox_off_still_allows_motion_to_turn_on_the_device(fake_indigo):
+    """The checkbox only ever excludes AUDIO from onOffState -- it must
+    never become 'disable the sensor'. A person motion event with the
+    checkbox off must still turn the device on."""
+    plug = make_plugin({})
+    dev = add_camera_device_with_props(
+        fake_indigo, plug, {"audioCountsAsActivity": False})
+    plug.socket = object()
+    plug.tracker.handle({"type": "add", "item": {
+        "id": "z1", "device": "cam-1", "type": "smartDetectZone",
+        "start": 1, "smartDetectTypes": ["person"]}})
+
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert dev.states["motionDetected"] is True
+    assert dev.states["onOffState"] is True
+
+
+@pytest.mark.parametrize("audio_type,state_key", [
+    ("alrmSmoke", "smokeAlarmDetected"),
+    ("alrmCmonx", "coAlarmDetected"),
+])
+def test_alarm_sounds_never_count_as_activity_even_with_checkbox_on(fake_indigo, audio_type, state_key):
+    """Neither smoke nor CO alarm sounds may ever contribute to onOffState,
+    checkbox or not -- folding either in would make a 'device turned on'
+    trigger fire on a real alarm, burying it under a routine motion
+    notification."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)   # audioCountsAsActivity defaults True
+    plug.socket = object()
+    _handle_audio(plug, "cam-1", "a1", [audio_type])
+
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert dev.states[state_key] is True
     assert dev.states["onOffState"] is False, (
-        "a smoke alarm sound must never turn the device on, checkbox or not"
+        "an alarm sound must never turn the device on, checkbox or not"
     )
+
+
+def test_baby_cry_sets_its_own_state_and_counts_as_activity(fake_indigo):
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.socket = object()
+    _handle_audio(plug, "cam-1", "a1", ["alrmBabyCry"])
+
+    plug._apply_camera_state("cam-1", force=True)
+
+    assert dev.states["babyCryDetected"] is True
+    assert dev.states["speechDetected"] is False
+    assert dev.states["onOffState"] is True
+
+
+def test_mixed_smart_detect_types_does_not_crash_write_states(fake_indigo):
+    """A wire frame with a non-string smartDetectTypes element must not
+    escape into _write_states' sorted()/",".join() and raise -- that would
+    tear the event socket down and wipe every camera's live state, the
+    opposite of what trap 3 exists to prevent."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.tracker.handle({"type": "add", "item": {
+        "id": "a1", "device": "cam-1", "type": "smartAudioDetect",
+        "start": 1, "smartDetectTypes": ["alrmSpeak", 3, {"x": 1}, None]}})
+
+    plug._apply_camera_state("cam-1", force=True)   # must not raise
+
+    assert dev.states["speechDetected"] is True
 
 
 def test_unclassified_audio_is_audio_detected_but_no_specific_type(fake_indigo):
