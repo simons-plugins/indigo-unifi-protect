@@ -45,8 +45,9 @@ that turns the camera devices into something you can actually look at:
 - **Camera config** — status LED, mic (with volume), video mode, HDR, and
   OSD name/date, polled every 5s. These are the states the plugin pushes
   live over `/subscribe/devices` (issue #18, 2026.8.0+); against an older
-  plugin the states simply don't exist yet, so the page shows nothing for
-  them rather than a confident "off".
+  plugin the states simply don't exist yet — and until the plugin's first
+  real camera read they hold Indigo's type defaults — so in both cases the
+  page shows nothing rather than a confident "off".
 
 It also does two things deliberately:
 

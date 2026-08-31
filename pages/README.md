@@ -44,8 +44,9 @@ blob URL, because an `<img src>` tag cannot carry an Authorization header.
 - Live motion / person / vehicle / animal state, polled every 5s
 - Camera config — status LED, mic (with volume), video mode, HDR, and OSD
   name/date — polled every 5s. Values are live-pushed by the plugin
-  (>= 2026.8.0, issue #18); on an older plugin the states don't exist yet,
-  so the page shows nothing for them rather than a confident "off"
+  (>= 2026.8.0, issue #18); on an older plugin — or before the plugin's
+  first real camera read — the values aren't readings, so the page shows
+  nothing rather than a confident "off"
 
 Two things it does on purpose:
 

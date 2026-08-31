@@ -560,6 +560,7 @@ function chip(label) {
 function renderStates(dev) {
   const box = $("states");
   box.innerHTML = "";
+  $("configStates").innerHTML = "";
   if (!dev) return;
   const s = dev.states || {};
   const connected = s.connected === true;
@@ -591,21 +592,34 @@ function renderStates(dev) {
 
   // Camera config states (ledEnabled, videoMode, hdrType, micEnabled,
   // micVolume, osdNameEnabled, osdDateEnabled) are push-live over the
-  // /subscribe/devices socket since 2026.8.0 (issue #18). An older plugin
-  // never writes these keys at all, so presence-test every one of them:
-  // a missing key means "unknown", not "off", and rendering a confident
-  // off for an absent key would be a lie. Render nothing for a missing key.
+  // /subscribe/devices socket since 2026.8.0 (issue #18). A simple
+  // `"ledEnabled" in s` guard is NOT enough here: Indigo materialises
+  // every state declared in Devices.xml with its type default (false/0),
+  // so on any plugin >= 2026.8.0 the keys always exist and a value the
+  // plugin deliberately never wrote is indistinguishable from a real
+  // "off"/0. The plugin itself skips-not-defaults these keys
+  // (_camera_info_states), so the page must not re-fabricate them.
+  // cameraModel is the tell: it is also skipped-not-defaulted and only
+  // ever written from a real camera read -- until it is non-empty, the
+  // config values are Indigo defaults, not readings, and rendering them
+  // as confident off/0% would be a lie. Older plugins never declare the
+  // keys at all, which the same gate covers.
   const cfg = $("configStates");
-  cfg.innerHTML = "";
+  const cfgKnown = typeof s.cameraModel === "string" && !!s.cameraModel;
 
-  if ("ledEnabled" in s) {
+  if (cfgKnown && "ledEnabled" in s) {
     cfg.appendChild(pill(s.ledEnabled ? "Status LED on" : "Status LED off", !!s.ledEnabled));
   }
 
-  if ("micEnabled" in s) {
+  if (cfgKnown && "micEnabled" in s) {
     let micLabel = "Mic off";
     if (s.micEnabled) {
-      micLabel = (typeof s.micVolume === "number") ? `Mic ${s.micVolume}%` : "Mic on";
+      // micVolume 0 is ambiguous even after a real read: Indigo's integer
+      // default and "the controller omitted micVolume" both look like 0.
+      // "Mic on" is the honest rendering there; a real, written volume
+      // > 0 gets the percentage.
+      micLabel = (typeof s.micVolume === "number" && s.micVolume > 0)
+        ? `Mic ${s.micVolume}%` : "Mic on";
     }
     cfg.appendChild(pill(micLabel, !!s.micEnabled));
   }
@@ -617,7 +631,7 @@ function renderStates(dev) {
     cfg.appendChild(chip("HDR: " + s.hdrType));
   }
 
-  if ("osdNameEnabled" in s || "osdDateEnabled" in s) {
+  if (cfgKnown && ("osdNameEnabled" in s || "osdDateEnabled" in s)) {
     const parts = [];
     if (s.osdNameEnabled) parts.push("name");
     if (s.osdDateEnabled) parts.push("date");
