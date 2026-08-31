@@ -248,7 +248,7 @@ class ProtectAPI:
             message = _assert_no_secret(
                 f"Unexpected response shape for {path}: expected an object",
                 self._api_key)
-            raise ProtectAPIError(message, status=None, body=str(body)[:200],
+            raise ProtectAPIError(message, status=None, body="",
                                    url=f"{self._base_url}{path}")
         return body
 
@@ -355,6 +355,11 @@ class ProtectAPI:
     def get_rtsps_streams(self, camera_id: str) -> dict:
         """GET /cameras/{id}/rtsps-stream. Raises ProtectAPIError, including
         when the parsed body is not a JSON object.
+
+        Like create_rtsps_streams, the shape-validation error here carries
+        body="" rather than the actual response text: this endpoint's
+        response can contain a live-stream URL (an access token), and a
+        malformed body could echo one back through the exception.
         """
         path = f"/cameras/{camera_id}/rtsps-stream"
         body = self._get_json(path)

@@ -189,15 +189,19 @@ def _camera_info_states(info):
     return states
 
 
-def _assert_no_url_in_message(message, streams):
+def _assert_no_url_in_message(message, *value_sources):
     """Defensive guard for issue #7, mirroring protect_api.py's
-    ``_assert_no_secret``: the RTSPS stream URLs embed an access token and
-    must never reach the Event Log. Called on the one log line
-    ``_refresh_stream_urls`` builds from a live response.
+    ``_assert_no_secret``: an RTSPS stream URL embeds an access token and
+    must never reach the Event Log. Every log line this feature emits
+    passes through here -- callers pass every dict of quality->value they
+    touched (fresh values from the controller AND the device's current
+    stored states), because on the error path there is no fresh response
+    to check and the CURRENT states are what could leak instead.
     """
-    for value in streams.values():
-        if isinstance(value, str) and value and value in message:
-            raise AssertionError("a stream URL must never appear in a log message")
+    for source in value_sources:
+        for value in source.values():
+            if isinstance(value, str) and value and value in message:
+                raise AssertionError("a stream URL must never appear in a log message")
     return message
 
 
@@ -219,6 +223,11 @@ class Plugin(indigo.PluginBase):
         # Duplicate command, and a 1:1 dict silently freezes the loser forever.
         self.cameras = {}
         self.camera_info = {}
+
+        # Device ids awaiting a stream-URL refresh (issue #7), drained one
+        # per _pump tick. Populated cheaply (no REST) by deviceStartComm and
+        # _open_socket -- see _prime_stream_urls.
+        self._stream_refresh_pending = set()
 
         self._last_rest_call = 0.0
         self._reconnect_requested = False
@@ -309,9 +318,11 @@ class Plugin(indigo.PluginBase):
         # Indigo has not yet started runConcurrentThread, so there is no socket
         # and the honest answer is False.
         self._apply_camera_state(camera_id, force=True)
-        # REST, not the event socket -- fine to call before the socket
-        # exists. Throttled by _rest like every other REST call.
-        self._refresh_stream_urls(dev)
+        # Cheap only (issue #7) -- this runs on Indigo's main thread, and
+        # _rest sleeps >= MIN_REST_INTERVAL per call, so doing REST here for
+        # N opted-in cameras would block plugin startup for >= 3N seconds.
+        # The actual fetch happens later via the _pump drain.
+        self._prime_stream_urls(dev)
 
     def deviceStopComm(self, dev):
         # Remove by device id, not by the camera id in props: if the user just
@@ -504,14 +515,14 @@ class Plugin(indigo.PluginBase):
         self._refresh_camera_info()
         for camera_id in list(self.cameras):
             self._apply_camera_state(camera_id, force=True)
-            # One extra throttled REST call per opted-in camera device on
-            # every reconnect (issue #7) -- a device that has never asked
-            # for stream URLs costs nothing here, since _refresh_stream_urls
-            # returns immediately for it.
+            # Cheap only (issue #7), same reasoning as deviceStartComm --
+            # REST happens later via the _pump drain, never here, or it
+            # would delay _pump's time-to-first-frame by >= 3s per
+            # opted-in camera on every single reconnect.
             for dev_id in sorted(self.cameras.get(camera_id, ())):
                 dev = indigo.devices.get(dev_id, None)
                 if dev is not None and dev.enabled:
-                    self._refresh_stream_urls(dev)
+                    self._prime_stream_urls(dev)
 
     def _pump(self):
         last_ping = time.monotonic()
@@ -534,6 +545,11 @@ class Plugin(indigo.PluginBase):
                     self._apply_camera_state(camera_id)
                 self._report_dropped_frames()
                 self._report_ignored_types()
+
+            # One pending stream-URL refresh per tick (issue #7). REST-
+            # throttled by _rest, so N pending devices drain at one per
+            # ~MIN_REST_INTERVAL without ever gating socket readiness.
+            self._drain_one_pending_stream_refresh()
 
             # Active liveness probe. See PING_INTERVAL above for why silence
             # alone cannot be trusted as a death signal.
@@ -755,7 +771,7 @@ class Plugin(indigo.PluginBase):
                 return
             self._refresh_camera_info()
             self._apply_camera_state(camera_id, force=True)
-            self._refresh_stream_urls(dev)
+            self._refresh_stream_urls_sync(dev)
             self.logger.info(
                 f"{dev.name}: refreshed (event socket "
                 f"{'connected' if self._is_connected() else 'DOWN'})"
@@ -1117,32 +1133,166 @@ class Plugin(indigo.PluginBase):
     # The RTSPS URL embeds an access token: treat it like a credential.
     # Turning the per-device checkbox off must remove it from the Indigo
     # database, not merely stop refreshing it.
+    #
+    # REST for this feature happens ONLY from _drain_one_pending_stream_
+    # refresh (called once per _pump tick) or from a user-initiated,
+    # synchronous call (the refreshStreamUrls action, Send Status Request).
+    # deviceStartComm and _open_socket only ever call the cheap, REST-free
+    # _prime_stream_urls -- both run somewhere a >= 3s-per-call REST throttle
+    # cannot be allowed to block (the main thread, or ahead of _pump).
     # ------------------------------------------------------------------
 
     def refreshStreamUrls(self, action, dev):
-        self._refresh_stream_urls(dev)
+        self._refresh_stream_urls_sync(dev)
 
-    def _refresh_stream_urls(self, dev):
-        """Write the four RTSPS stream-URL states for one camera device.
-
-        Opt-in via the `exposeStreamUrls` checkbox. When it is off (the
-        default), all four states are forced to "" and nothing is
-        requested from the controller -- turning the box off must clear
-        the token from the database, not just stop updating it.
-
-        When it is on: GET the current streams; if every quality comes
-        back null, POST to create them (package only when the cached
-        camera object says hasPackageCamera). Never logs a URL -- only
-        which qualities came back present. A request failure leaves the
-        existing states untouched, since a transient error blanking a
-        stream a viewer is actively using would be worse than a stale one.
-        """
+    def _stream_urls_exposed(self, dev):
         expose = dev.pluginProps.get("exposeStreamUrls", False)
         if isinstance(expose, str):
             expose = expose.strip().lower() == "true"
-        if not expose:
-            dev.updateStatesOnServer(
-                [{"key": key, "value": ""} for key in STREAM_URL_STATES.values()])
+        return bool(expose)
+
+    def _clear_stream_urls(self, dev):
+        dev.updateStatesOnServer(
+            [{"key": key, "value": ""} for key in STREAM_URL_STATES.values()])
+
+    def _current_stream_state_values(self, dev):
+        return {quality: dev.states.get(key, "") for quality, key in STREAM_URL_STATES.items()}
+
+    def _prime_stream_urls(self, dev):
+        """Cheap, REST-free half of the stream-URL lifecycle. Off: clears
+        the four states immediately, so unticking the checkbox removes the
+        token from the database without waiting for a pump tick. On:
+        queues the device for _drain_one_pending_stream_refresh."""
+        if not self._stream_urls_exposed(dev):
+            self._clear_stream_urls(dev)
+            return
+        self._stream_refresh_pending.add(dev.id)
+
+    def _drain_one_pending_stream_refresh(self):
+        """Pop at most one pending device id and refresh its stream URLs.
+
+        Wrapped broadly on purpose: an AssertionError from the leak guard,
+        or an Indigo write error, must never reach runConcurrentThread's
+        generic exception handler -- that would tear the whole event socket
+        down and reconnect-loop forever over what is, at worst, one broken
+        camera's stream URLs. ProtectAPIError is already handled (and
+        logged) inside _refresh_stream_urls without raising; this catches
+        everything else.
+        """
+        if not self._stream_refresh_pending:
+            return
+        dev_id = self._stream_refresh_pending.pop()
+        dev = indigo.devices.get(dev_id, None)
+        if dev is None or not dev.enabled:
+            return
+        camera_id = dev.pluginProps.get("cameraId", "")
+        if dev.id not in self.cameras.get(camera_id, ()):
+            return  # no longer mapped -- device re-pointed or removed
+        try:
+            self._refresh_stream_urls(dev)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.error(
+                f"{dev.name}: stream URL refresh failed ({type(exc).__name__}: {exc}) - "
+                "untick 'Expose RTSPS stream URLs' on this device if it persists."
+            )
+
+    def _refresh_stream_urls_sync(self, dev):
+        """User-initiated refresh (the refreshStreamUrls action, and Send
+        Status Request via actionControlUniversal) -- there is a user
+        watching the Event Log for the result, so every outcome is
+        reported, never silent, unlike the pump-drain path."""
+        if not self._stream_urls_exposed(dev):
+            self._clear_stream_urls(dev)
+            self.logger.info(
+                f"{dev.name}: stream URLs are not exposed for this device - tick "
+                "'Expose RTSPS stream URLs' in the device settings."
+            )
+            return
+        if self.api is None:
+            self.logger.error(
+                "UniFi Protect is not configured; cannot refresh stream URLs."
+            )
+            return
+        self._refresh_stream_urls(dev)
+
+    def _clean_stream_response(self, dev, response, current):
+        """Validate one rtsps-stream response body against the four known
+        quality keys. A key present with a non-string, non-null value is a
+        shape surprise, not real data -- skip it with a WARNING naming it,
+        rather than trust it. A key absent from the response is simply
+        absent from the returned dict, identically to an explicit null, for
+        every caller below."""
+        cleaned = {}
+        for quality in STREAM_URL_STATES:
+            if quality not in response:
+                continue
+            value = response[quality]
+            if value is not None and not isinstance(value, str):
+                self.logger.warning(_assert_no_url_in_message(
+                    f"{dev.name}: stream URL response had a non-string value for "
+                    f"'{quality}' - skipping it", current))
+                continue
+            cleaned[quality] = value
+        return cleaned
+
+    def _log_stream_error(self, dev, exc, current):
+        note = "the stored URLs may now be stale" if any(current.values()) \
+            else "no URLs are stored yet"
+        self.logger.error(_assert_no_url_in_message(
+            f"{dev.name}: could not refresh stream URLs ({exc}) - {note}.", current))
+
+    def _fill_missing_stream_qualities(self, dev, camera_id, cleaned, missing, current):
+        """POST to create the qualities still missing after GET, but only
+        when this camera's capabilities are cached -- a guessed POST before
+        the first camera refresh could request a quality the camera
+        doesn't support. Split out of _refresh_stream_urls because pylint
+        already flags that method for too-many-locals/branches (the same
+        reason _camera_info_states was split out of _write_states).
+
+        Returns the (possibly merged) `cleaned` dict, or None if a
+        ProtectAPIError was already logged and the caller should abort
+        without writing any state.
+        """
+        if camera_id not in self.camera_info:
+            self.logger.warning(
+                f"{dev.name}: camera capabilities not loaded yet - streams "
+                "will be created on the next refresh."
+            )
+            return cleaned
+        try:
+            created = self._rest(self.api.create_rtsps_streams, camera_id, missing)
+        except ProtectAPIError as exc:
+            self._log_stream_error(dev, exc, current)
+            return None
+        created_cleaned = self._clean_stream_response(dev, created, current)
+        for quality in missing:
+            if created_cleaned.get(quality) is not None:
+                cleaned[quality] = created_cleaned[quality]
+        return cleaned
+
+    def _refresh_stream_urls(self, dev):
+        """Fetch and write the four RTSPS stream-URL states for one camera
+        device. Callers on the async/pump path have no user to report to,
+        so the opt-out and self.api-is-None cases are re-checked here
+        defensively and handled silently; _refresh_stream_urls_sync handles
+        them loudly before ever calling in.
+
+        GET the current streams; validate the response shape and per-key
+        types; for each quality still missing (null/absent/invalid) that is
+        actually wanted (package only when the cached camera reports
+        hasPackageCamera), POST to create it -- but only when this camera's
+        capabilities are cached at all, since a guessed POST before the
+        first camera refresh could request a quality the camera doesn't
+        support. A quality that is still empty after all that falls back to
+        whatever was already stored, rather than blanking a URL a viewer
+        may be actively using; only a quality with nothing stored either
+        becomes "". Every log line here -- success, warning, or error --
+        goes through _assert_no_url_in_message against both the fresh and
+        the current values, since the error path has no fresh response to
+        check.
+        """
+        if not self._stream_urls_exposed(dev):
+            self._clear_stream_urls(dev)
             return
         if self.api is None:
             return
@@ -1151,26 +1301,56 @@ class Plugin(indigo.PluginBase):
         if not camera_id:
             return
 
+        current = self._current_stream_state_values(dev)
+
         try:
             streams = self._rest(self.api.get_rtsps_streams, camera_id)
-            if all(streams.get(quality) is None for quality in STREAM_URL_STATES):
-                qualities = ["high", "medium", "low"]
-                info = self.camera_info.get(camera_id) or {}
-                if info.get("hasPackageCamera"):
-                    qualities.append("package")
-                streams = self._rest(self.api.create_rtsps_streams, camera_id, qualities)
         except ProtectAPIError as exc:
-            self.logger.error(
-                f"{dev.name}: could not refresh stream URLs ({exc}) - the "
-                "stored URLs may now be stale."
-            )
+            self._log_stream_error(dev, exc, current)
             return
 
-        present = sorted(quality for quality in STREAM_URL_STATES if streams.get(quality))
+        if not any(quality in streams for quality in STREAM_URL_STATES):
+            self.logger.error(_assert_no_url_in_message(
+                f"{dev.name}: unexpected response shape for stream URLs - expected "
+                "high/medium/low/package", current))
+            return
+
+        cleaned = self._clean_stream_response(dev, streams, current)
+
+        wanted = ["high", "medium", "low"]
+        info = self.camera_info.get(camera_id)
+        if info and info.get("hasPackageCamera"):
+            wanted.append("package")
+        missing = [quality for quality in wanted if cleaned.get(quality) is None]
+
+        if missing:
+            cleaned = self._fill_missing_stream_qualities(dev, camera_id, cleaned, missing, current)
+            if cleaned is None:
+                return
+
+        final = {}
+        kept = []
+        for quality in STREAM_URL_STATES:
+            value = cleaned.get(quality)
+            if value:
+                final[quality] = value
+            elif current.get(quality):
+                final[quality] = current[quality]
+                kept.append(quality)
+            else:
+                final[quality] = ""
+
+        if kept:
+            self.logger.warning(_assert_no_url_in_message(
+                f"{dev.name}: stream URL refresh kept previous URL for: "
+                f"{', '.join(sorted(kept))}", current, final))
+
+        present = sorted(quality for quality, value in final.items() if value)
         self.logger.info(_assert_no_url_in_message(
-            f"{dev.name}: stream URLs refreshed ({', '.join(present)})", streams))
+            f"{dev.name}: stream URLs refreshed ({', '.join(present)})", current, final))
+
         dev.updateStatesOnServer([
-            {"key": key, "value": streams.get(quality) or ""}
+            {"key": key, "value": final[quality]}
             for quality, key in STREAM_URL_STATES.items()
         ])
 

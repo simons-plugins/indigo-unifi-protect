@@ -146,6 +146,7 @@ def _install_fake_indigo():
     fake.Dict = dict
     fake.List = list
     fake.kStateImageSel = _StateImageSel
+    fake.kUniversalAction = _UniversalAction
     sys.modules["indigo"] = fake
     return fake
 
