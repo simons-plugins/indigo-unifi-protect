@@ -72,11 +72,13 @@ class ProtectAPIError(Exception):
             failure when ``status`` is ``None``.
         url: The request URL. Never contains the API key -- the key travels
             only in the ``X-API-KEY`` header, never in the URL.
-        kind: Coarse failure category derived from ``status``, so callers
-            can react without hardcoding numeric codes:
+        kind: Coarse failure category, so callers can react without
+            hardcoding numeric codes. Derived from ``status`` by default:
             "auth" (401/403), "not_found" (404), "rate_limited" (429),
             "bad_request" (400), "server" (5xx), "transport" (status is
-            None), "http" (any other non-2xx status).
+            None), "http" (any other non-2xx status). A caller may pass
+            ``kind`` explicitly to override this -- used for "shape"
+            (a 2xx response whose body isn't the object it claims to be).
         retry_after: Seconds to wait before retrying, parsed from the
             response's ``Retry-After`` header when present (most relevant
             for ``kind == "rate_limited"``). ``None`` when absent or
@@ -85,13 +87,52 @@ class ProtectAPIError(Exception):
 
     def __init__(self, message: str, status: Optional[int] = None,
                  body: str = "", url: str = "",
-                 retry_after: Optional[float] = None) -> None:
+                 retry_after: Optional[float] = None,
+                 kind: Optional[str] = None) -> None:
         super().__init__(message)
         self.status = status
         self.body = body
         self.url = url
         self.retry_after = retry_after
-        self.kind = self._classify(status)
+        self.kind = kind if kind is not None else self._classify(status)
+
+    @property
+    def issues(self) -> list[str]:
+        """Field-level validation issues from an AJV_PARSE_ERROR body, e.g.
+
+            {"issues": [{"instancePath": "/videoMode",
+                         "message": "must be equal to one of the allowed values"}]}
+
+        Formatted as ``"<instancePath>: <message>"`` per issue
+        (``instancePath`` defaults to ``"/"`` when empty). Lazily computed
+        from ``body`` on every access rather than cached -- this is a
+        rarely-read diagnostic, not a hot path.
+
+        When ``body`` has no usable ``issues`` list but does have a string
+        ``error`` (e.g. a 404's ``{"error":"Entity 'camera' not found",
+        "name":"NOT_FOUND"}``), returns ``[error]`` -- the controller's own
+        one-line explanation is still worth surfacing even outside the AJV
+        shape. Returns ``[]`` only when ``body`` isn't a JSON object, or is
+        one with neither an ``issues`` list nor a string ``error`` (a body
+        the server didn't send as JSON, or one with nothing to say).
+        """
+        try:
+            parsed = json.loads(self.body)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(parsed, dict):
+            return []
+        issues = parsed.get("issues")
+        if not isinstance(issues, list):
+            error = parsed.get("error")
+            return [error] if isinstance(error, str) and error else []
+        result = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            path = issue.get("instancePath") or "/"
+            result.append(f"{path}: {issue.get('message', '')}")
+        return result
 
     @staticmethod
     def _classify(status: Optional[int]) -> str:
@@ -125,24 +166,37 @@ class ProtectAPI:
             self._ctx.check_hostname = False
             self._ctx.verify_mode = ssl.CERT_NONE
 
-    def _get(self, path: str, params: Optional[dict[str, str]] = None) -> bytes:
-        """Issue a GET request and return the raw response body.
+    def _request(self, method: str, path: str, params: Optional[dict[str, str]] = None,
+                 body: Optional[dict] = None) -> bytes:
+        """Issue an HTTP request and return the raw response body.
+
+        ``body``, when given, is JSON-encoded and sent with a
+        ``Content-Type: application/json`` / ``Accept: application/json``
+        request -- used by ``patch_camera``. ``_get`` is a thin wrapper over
+        this with no body, kept as its own method so existing callers and
+        tests are unaffected.
 
         Raises ProtectAPIError on any non-2xx response or transport failure.
         """
         url = f"{self._base_url}{path}"
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
-        request = urllib.request.Request(url, headers={"X-API-KEY": self._api_key})
+        headers = {"X-API-KEY": self._api_key}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+            headers["Accept"] = "application/json"
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=self._timeout,
                                          context=self._ctx) as response:
                 return response.read()
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
+            resp_body = exc.read().decode("utf-8", errors="replace")
             retry_after = _parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
             message = _assert_no_secret(f"HTTP {exc.code} for {path}", self._api_key)
-            raise ProtectAPIError(message, status=exc.code, body=body, url=url,
+            raise ProtectAPIError(message, status=exc.code, body=resp_body, url=url,
                                    retry_after=retry_after) from None
         except urllib.error.URLError as exc:
             message = _assert_no_secret(
@@ -151,6 +205,13 @@ class ProtectAPI:
         except OSError as exc:
             message = _assert_no_secret(f"Connection failure for {path}: {exc}", self._api_key)
             raise ProtectAPIError(message, status=None, body=str(exc), url=url) from None
+
+    def _get(self, path: str, params: Optional[dict[str, str]] = None) -> bytes:
+        """Issue a GET request and return the raw response body.
+
+        Raises ProtectAPIError on any non-2xx response or transport failure.
+        """
+        return self._request("GET", path, params=params)
 
     def _get_json(self, path: str, params: Optional[dict[str, str]] = None) -> Any:
         raw = self._get(path, params=params)
@@ -190,6 +251,51 @@ class ProtectAPI:
             raise ProtectAPIError(message, status=None, body=str(body)[:200],
                                    url=f"{self._base_url}{path}")
         return body
+
+    def patch_camera(self, camera_id: str, body: dict) -> dict:
+        """PATCH /cameras/{id}. A partial body is accepted; the response is
+        the FULL camera object (same shape as ``get_camera``), which callers
+        use to refresh their cached copy without a separate GET.
+
+        Raises ProtectAPIError, including:
+
+        - when the parsed body is not a JSON object -- callers can rely on
+          the return value actually being a ``dict``, mirroring
+          ``get_camera``.
+        - when it IS a dict but not recognizably the camera object --
+          checked as ``parsed.get("id") == camera_id and
+          isinstance(parsed.get("featureFlags"), dict)``. A 200 that passes
+          the plain dict check but fails this one (e.g. a proxy wrapper like
+          ``{"id": "cam-1"}`` with none of the real fields) would otherwise
+          replace the caller's cache with a near-empty object, blanking
+          every hardware state and making every later capability gate lie.
+          Raised with ``kind="shape"`` so callers can react distinctly from
+          an actual 400/404 refusal.
+
+        On a 400 (bad request), the server's AJV validation issues -- if
+        any -- are on the raised error's ``issues`` property.
+        """
+        path = f"/cameras/{camera_id}"
+        raw = self._request("PATCH", path, body=body)
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            message = _assert_no_secret(f"Invalid JSON response for {path}: {exc}", self._api_key)
+            raise ProtectAPIError(message, status=None, body=raw[:200].decode(
+                "utf-8", errors="replace"), url=f"{self._base_url}{path}") from None
+        if not isinstance(parsed, dict):
+            message = _assert_no_secret(
+                f"Unexpected response shape for {path}: expected an object",
+                self._api_key)
+            raise ProtectAPIError(message, status=None, body=str(parsed)[:200],
+                                   url=f"{self._base_url}{path}")
+        if not (parsed.get("id") == camera_id and isinstance(parsed.get("featureFlags"), dict)):
+            message = _assert_no_secret(
+                f"Unexpected response shape for {path}: expected the camera object",
+                self._api_key)
+            raise ProtectAPIError(message, status=None, kind="shape",
+                                   body=str(parsed)[:200], url=f"{self._base_url}{path}")
+        return parsed
 
     def get_snapshot(self, camera_id: str, high_quality: bool = False,
                       supports_high_quality: Optional[bool] = None) -> bytes:

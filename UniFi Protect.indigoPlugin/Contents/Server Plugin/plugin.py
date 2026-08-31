@@ -77,6 +77,28 @@ PRESENCE_AUDIO_TYPES = frozenset({"alrmSpeak", "alrmBabyCry"})
 # a trigger reading it would see "not DISCONNECTED" and believe things are fine.
 STATE_UNAVAILABLE = "unavailable"
 
+# Protect's published OpenAPI enum for videoMode (issue #6). Only "default",
+# "sport", and "slowShutter" have been observed on the reference rig; the
+# rest come from the spec, unverified on the wire. Used only as the
+# getVideoModeList dynamic-list fallback when a camera's own
+# featureFlags.videoModes isn't cached yet -- the PATCH itself is always
+# validated against the camera's own list, never this one.
+VIDEO_MODE_SPEC_ENUM = (
+    "default", "highFps", "sport", "slowShutter", "lprReflex", "lprNoneReflex",
+)
+
+# Legal ConfigUI values for the other four control actions (issue #6 review).
+# Checked in the callback, not just trusted from the dialog -- a scripter can
+# call executeAction() directly and supply anything, e.g. mode="ON" (which
+# `mode == "on"` would silently read as False/off and log success).
+LED_MODES = ("on", "off", "toggle")
+OSD_TOGGLE_VALUES = ("unchanged", "on", "off")
+OVERLAY_LOCATIONS = (
+    "unchanged", "topLeft", "topMiddle", "topRight",
+    "bottomLeft", "bottomMiddle", "bottomRight",
+)
+HDR_TYPES = ("auto", "on", "off")
+
 # Under Indigo's "Web Assets/images", so snapshots survive plugin upgrades and
 # are servable to control pages at /images/<SNAPSHOT_SUBDIR>/...
 SNAPSHOT_SUBDIR = "unifi-protect"
@@ -301,6 +323,35 @@ class Plugin(indigo.PluginBase):
             return False, valuesDict, errors
         return True, valuesDict
 
+    def validateActionConfigUi(self, valuesDict, typeId, deviceId):
+        """The one check that can't be a gate in the callback: whether the
+        DIALOG's own fields make sense before anything is sent anywhere.
+        Capability gating (hasLedStatus, hasHdr, ...) happens in the action
+        callback instead, because it depends on the camera object, not on
+        what the user typed here.
+        """
+        errors = indigo.Dict()
+        if typeId == "setOsdOverlay":
+            fields = ("showName", "showDate", "showLogo", "overlayLocation")
+            if all(valuesDict.get(field, "unchanged") == "unchanged" for field in fields):
+                message = "Select at least one field to change - all are Unchanged."
+                for field in fields:
+                    errors[field] = message
+        elif typeId == "setMicVolume":
+            try:
+                volume = int(valuesDict.get("micVolume", ""))
+            except (TypeError, ValueError):
+                errors["micVolume"] = "Enter a whole number from 0 to 100."
+            else:
+                if not 0 <= volume <= 100:
+                    errors["micVolume"] = "Must be between 0 and 100."
+        elif typeId == "setVideoMode":
+            if not valuesDict.get("videoMode", "").strip():
+                errors["videoMode"] = "Select a video mode."
+        if errors:
+            return False, valuesDict, errors
+        return True, valuesDict
+
     def getCameraList(self, filter="", valuesDict=None, typeId="", targetId=0):
         if not self.api:
             return [("", "Plugin not configured")]
@@ -326,6 +377,40 @@ class Plugin(indigo.PluginBase):
         if kind == "auth":
             return "API key rejected - check the plugin config"
         return "Error - see the Event Log"
+
+    def getVideoModeList(self, filter="", valuesDict=None, typeId="", targetId=0):
+        """Video mode menu for setVideoMode's ConfigUI, scoped to the target
+        device's actual camera capability (issue #6). When the camera isn't
+        cached yet -- a brand new device, or no GET /cameras since plugin
+        start -- falls back to Protect's published OpenAPI enum with each
+        label marked "(unverified)" so the user isn't misled into thinking
+        every listed mode is confirmed to work on their hardware. The PATCH
+        itself is still validated against the camera's real list in
+        setVideoMode, so a stale/unverified pick here is refused there, not
+        silently accepted.
+        """
+        camera_id = self._camera_id_for_target(targetId)
+        info = self.camera_info.get(camera_id) if camera_id else None
+        modes = (info.get("featureFlags") or {}).get("videoModes") if info else None
+        if modes:
+            return [(mode, mode) for mode in modes]
+        return [(mode, f"{mode} (unverified)") for mode in VIDEO_MODE_SPEC_ENUM]
+
+    def _camera_id_for_target(self, target_id):
+        """Resolve an Indigo device id (a dynamic-list method's targetId) to
+        the Protect camera id it's configured for. Returns None if the
+        device doesn't exist, hasn't been assigned a camera yet, or simply
+        has no `cameraId` key in its pluginProps at all -- this method does
+        NOT check the device's plugin id; a device belonging to a different
+        plugin degrades harmlessly through that last case instead, since it
+        has no such key either. Callers treat every case above as
+        "unknown"."""
+        if not target_id:
+            return None
+        dev = indigo.devices.get(target_id, None)
+        if dev is None:
+            return None
+        return dev.pluginProps.get("cameraId", "") or None
 
     # ------------------------------------------------------------------
     # Event socket
@@ -708,6 +793,280 @@ class Plugin(indigo.PluginBase):
             )
         return self._snapshot_dir
 
+    # ------------------------------------------------------------------
+    # Camera control actions (issue #6) -- the plugin's first write path.
+    #
+    # Every action shares one shape: resolve the camera and its cached
+    # object via _resolve_camera (which also refreshes once if it isn't
+    # cached yet), gate on the matching featureFlags entry where one
+    # exists, build a partial PATCH body, and hand it to _patch_camera.
+    # A refused PATCH is an ERROR in the Event Log naming what was
+    # attempted and what the controller said was wrong -- camera_info is
+    # only ever replaced by a 2xx response.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _describe_api_error(exc):
+        """One line of actionable text for a ProtectAPIError, keyed on
+        ``exc.kind`` -- shared by every camera control action's error log
+        plus ``_refresh_camera_info``, so what a given failure MEANS is
+        answered identically everywhere instead of every call site
+        formatting its own ``str(exc)`` HTTP-status-and-body dump.
+        Deliberately NOT used by ``takeSnapshot``/``discoverCameras``,
+        whose existing wording predates this and is untouched.
+
+        Definite outcomes (auth, not_found, bad_request) name the fix.
+        Uncertain outcomes (transport, server, shape) say so explicitly
+        rather than implying a write failed when it may well have landed --
+        ``_patch_camera`` additionally re-refreshes camera_info on those
+        three so state catches up to whatever actually happened, instead of
+        waiting for the plugin's next scheduled refresh.
+        """
+        if exc.kind == "auth":
+            text = ("UniFi Protect rejected the API key. Regenerate it in UniFi OS "
+                    "(Settings > Control Plane > Integrations) and update the plugin config")
+            if exc.status == 403:
+                text += " or the key lacks permission for this operation"
+            return text + "."
+        if exc.kind == "rate_limited":
+            text = "rate limited by the controller"
+            if exc.retry_after is not None:
+                text += f" - retry in {exc.retry_after:.0f}s"
+            return text
+        if exc.kind == "not_found":
+            return ("camera not found on the controller (removed or re-adopted?) - "
+                    "reselect it in the device settings")
+        if exc.kind in ("transport", "server"):
+            return (f"controller unreachable or errored ({exc}) - outcome unknown, "
+                    "states will update on the next refresh")
+        if exc.kind == "shape":
+            return "applied, but the response was unusable - refreshing camera info"
+        if exc.kind == "bad_request":
+            issues = exc.issues
+            return "refused by the controller: " + ("; ".join(issues) if issues else str(exc))
+        return str(exc)
+
+    def _resolve_camera(self, dev, what):
+        """Common precheck for every camera control action: resolve the
+        camera id, confirm the plugin is configured, and return the cached
+        camera object -- refreshing once if it isn't cached yet. Returns
+        (camera_id, info), or None after already logging exactly why
+        nothing can proceed, so every action gets identical, specific error
+        text instead of duplicating this four times over.
+
+        When the refresh itself fails, ``_refresh_camera_info`` has already
+        logged the cause (via ``_describe_api_error``) as its own ERROR
+        record -- this method's own message stays generic for that case.
+        When the refresh SUCCEEDS but the camera id still isn't in the
+        result, that's a different, more specific fact (the camera is
+        genuinely gone from the controller, not merely unreachable right
+        now) and gets its own distinct wording.
+        """
+        camera_id = dev.pluginProps.get("cameraId", "")
+        if not camera_id:
+            self.logger.error(f"{dev.name}: {what} - no camera selected.")
+            return None
+        if not self.api:
+            self.logger.error(f"UniFi Protect is not configured; cannot {what.lower()}.")
+            return None
+        info = self.camera_info.get(camera_id)
+        if info is None:
+            refreshed = self._refresh_camera_info()
+            info = self.camera_info.get(camera_id)
+            if info is None:
+                if refreshed:
+                    self.logger.error(
+                        f"{dev.name}: {what} - camera {camera_id} is not on the controller - "
+                        "reselect the camera in the device settings."
+                    )
+                else:
+                    self.logger.error(
+                        f"{dev.name}: {what} - camera info unavailable, cannot verify capability."
+                    )
+                return None
+        return camera_id, info
+
+    def _patch_camera(self, dev, camera_id, body, what, outcome):
+        """Shared PATCH path for every camera control action below.
+
+        ``outcome`` is the human-readable result logged on success (e.g.
+        "off" for setStatusLed, "sport" for setVideoMode) -- built by the
+        caller, the only one that knows what the PATCH actually meant.
+
+        On success, replaces the cached camera object with the full PATCH
+        response and re-applies device state so the issue #4 hardware/
+        config states update immediately instead of waiting for the next
+        GET /cameras refresh -- that re-apply is itself wrapped, because the
+        PATCH already landed on the camera even if Indigo's own state
+        update then fails, and that must not look like nothing happened.
+
+        On a refused/errored PATCH, camera_info is left untouched -- the
+        error is not new information about the camera's actual state -- and
+        described via ``_describe_api_error``. A shape/transport/server
+        error additionally triggers a real GET refresh, since the write may
+        have applied even though this response couldn't confirm it. Never
+        raises.
+        """
+        try:
+            info = self._rest(self.api.patch_camera, camera_id, body)
+        except ProtectAPIError as exc:
+            self.logger.error(f"{dev.name}: {what} - {self._describe_api_error(exc)}")
+            if exc.kind in ("shape", "transport", "server"):
+                self._refresh_camera_info()
+            return
+        self.camera_info[camera_id] = info
+        try:
+            self._apply_camera_state(camera_id, force=True)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: must not escape
+            self.logger.error(
+                f"{dev.name}: {what} applied on the camera, but the Indigo state update "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
+            self.logger.debug("state update after PATCH traceback", exc_info=True)
+            return
+        self.logger.info(f"{dev.name}: {what} -> {outcome}")
+
+    def setStatusLed(self, action, dev):
+        resolved = self._resolve_camera(dev, "Set Status LED")
+        if resolved is None:
+            return
+        camera_id, info = resolved
+        if not (info.get("featureFlags") or {}).get("hasLedStatus"):
+            self.logger.error(
+                f"{dev.name}: Set Status LED - camera does not report a status LED "
+                "(featureFlags.hasLedStatus)."
+            )
+            return
+        mode = action.props.get("mode")
+        if mode not in LED_MODES:
+            self.logger.error(
+                f"{dev.name}: Set Status LED - invalid mode {mode!r} "
+                f"(must be one of {', '.join(LED_MODES)})."
+            )
+            return
+        if mode == "toggle":
+            # The cache can be days stale -- it only ever updates from this
+            # plugin's own writes and periodic refreshes, not from changes
+            # made in the UniFi app. Re-read before inverting so toggle
+            # inverts the camera's REAL current state, not a stale guess.
+            try:
+                info = self._rest(self.api.get_camera, camera_id)
+            except ProtectAPIError as exc:
+                self.logger.error(
+                    f"{dev.name}: Set Status LED - {self._describe_api_error(exc)}"
+                )
+                return
+            self.camera_info[camera_id] = info
+            enabled = not bool((info.get("ledSettings") or {}).get("isEnabled"))
+        else:
+            enabled = mode == "on"
+        self._patch_camera(dev, camera_id, {"ledSettings": {"isEnabled": enabled}},
+                            "Set Status LED", "on" if enabled else "off")
+
+    @staticmethod
+    def _describe_osd_outcome(osd):
+        """"name on, date off" style summary of an osdSettings PATCH body,
+        for the success log -- built in the same field order setOsdOverlay
+        checks them in, so the order is stable and matches the dialog."""
+        labels = (("isNameEnabled", "name"), ("isDateEnabled", "date"),
+                  ("isLogoEnabled", "logo"))
+        parts = [f"{label} {'on' if osd[key] else 'off'}" for key, label in labels
+                 if key in osd]
+        if "overlayLocation" in osd:
+            parts.append(f"location {osd['overlayLocation']}")
+        return ", ".join(parts)
+
+    def setOsdOverlay(self, action, dev):
+        resolved = self._resolve_camera(dev, "Set OSD Overlay")
+        if resolved is None:
+            return
+        camera_id, _info = resolved
+        props = action.props
+        for field, allowed in (("showName", OSD_TOGGLE_VALUES), ("showDate", OSD_TOGGLE_VALUES),
+                                ("showLogo", OSD_TOGGLE_VALUES),
+                                ("overlayLocation", OVERLAY_LOCATIONS)):
+            value = props.get(field)
+            if value not in allowed:
+                self.logger.error(
+                    f"{dev.name}: Set OSD Overlay - invalid {field} {value!r} "
+                    f"(must be one of {', '.join(allowed)})."
+                )
+                return
+        osd = {}
+        if props["showName"] != "unchanged":
+            osd["isNameEnabled"] = props["showName"] == "on"
+        if props["showDate"] != "unchanged":
+            osd["isDateEnabled"] = props["showDate"] == "on"
+        if props["showLogo"] != "unchanged":
+            osd["isLogoEnabled"] = props["showLogo"] == "on"
+        if props["overlayLocation"] != "unchanged":
+            osd["overlayLocation"] = props["overlayLocation"]
+        if not osd:
+            # validateActionConfigUi rejects this in the dialog, but a
+            # scripter can call executeAction directly and skip the dialog
+            # entirely -- an empty PATCH is not a no-op worth sending.
+            self.logger.error(f"{dev.name}: Set OSD Overlay - nothing selected to change.")
+            return
+        self._patch_camera(dev, camera_id, {"osdSettings": osd}, "Set OSD Overlay",
+                            self._describe_osd_outcome(osd))
+
+    def setVideoMode(self, action, dev):
+        resolved = self._resolve_camera(dev, "Set Video Mode")
+        if resolved is None:
+            return
+        camera_id, info = resolved
+        video_mode = action.props.get("videoMode", "")
+        modes = (info.get("featureFlags") or {}).get("videoModes") or []
+        if video_mode not in modes:
+            self.logger.error(
+                f"{dev.name}: Set Video Mode - '{video_mode}' is not one of this "
+                f"camera's supported modes ({', '.join(modes) or 'none reported'})."
+            )
+            return
+        self._patch_camera(dev, camera_id, {"videoMode": video_mode}, "Set Video Mode",
+                            video_mode)
+
+    def setHdrMode(self, action, dev):
+        resolved = self._resolve_camera(dev, "Set HDR Mode")
+        if resolved is None:
+            return
+        camera_id, info = resolved
+        if not (info.get("featureFlags") or {}).get("hasHdr"):
+            self.logger.error(
+                f"{dev.name}: Set HDR Mode - camera does not support HDR (featureFlags.hasHdr)."
+            )
+            return
+        hdr_type = action.props.get("hdrType")
+        if hdr_type not in HDR_TYPES:
+            self.logger.error(
+                f"{dev.name}: Set HDR Mode - invalid hdrType {hdr_type!r} "
+                f"(must be one of {', '.join(HDR_TYPES)})."
+            )
+            return
+        self._patch_camera(dev, camera_id, {"hdrType": hdr_type}, "Set HDR Mode", hdr_type)
+
+    def setMicVolume(self, action, dev):
+        resolved = self._resolve_camera(dev, "Set Microphone Volume")
+        if resolved is None:
+            return
+        camera_id, info = resolved
+        if not (info.get("featureFlags") or {}).get("hasMic"):
+            self.logger.error(
+                f"{dev.name}: Set Microphone Volume - camera has no microphone "
+                "(featureFlags.hasMic)."
+            )
+            return
+        try:
+            volume = int(action.props.get("micVolume", ""))
+        except (TypeError, ValueError):
+            self.logger.error(f"{dev.name}: Set Microphone Volume - not a whole number.")
+            return
+        if not 0 <= volume <= 100:
+            self.logger.error(f"{dev.name}: Set Microphone Volume - must be 0-100.")
+            return
+        self._patch_camera(dev, camera_id, {"micVolume": volume}, "Set Microphone Volume",
+                            str(volume))
+
     def refreshCameras(self, action):
         self._refresh_camera_info()
 
@@ -738,17 +1097,22 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
 
     def _refresh_camera_info(self):
+        """Refresh self.camera_info from a real GET /cameras. Returns True
+        on success, False on any failure (including "not configured") --
+        callers that need to distinguish "the id isn't in a fresh read" from
+        "the read itself failed" (e.g. _resolve_camera) rely on this."""
         if not self.api:
-            return
+            return False
         try:
             cameras = self._rest(self.api.get_cameras)
         except ProtectAPIError as exc:
-            self.logger.error(f"Could not refresh cameras: {exc}")
+            self.logger.error(f"Could not refresh cameras: {self._describe_api_error(exc)}")
             # Deliberately leave camera_info untouched: replacing good data with
             # {} would silently downgrade every cameraState to "unavailable".
-            return
+            return False
         self.camera_info = {c["id"]: c for c in cameras if c.get("id")}
         self.logger.debug(f"refreshed {len(self.camera_info)} camera(s)")
+        return True
 
     def _rest(self, func, *args, **kwargs):
         """Call a ProtectAPI method, never faster than MIN_REST_INTERVAL.
