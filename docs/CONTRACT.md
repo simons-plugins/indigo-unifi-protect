@@ -753,18 +753,25 @@ isinstance(parsed.get("featureFlags"), dict)` — raising
 been accepted and cached, blanking every hardware state and making every
 later capability gate lie "camera does not support X".
 
-**`_describe_api_error(exc)` maps `exc.kind` to one line of actionable
-Event Log text**, shared by `_patch_camera`'s error log and
+**`_describe_api_error(exc, entity="camera")` maps `exc.kind` to one line
+of actionable Event Log text**, shared by `_patch_camera`'s error log and
 `_refresh_camera_info`'s (NOT used by `takeSnapshot`/`discoverCameras`,
-whose existing wording predates this):
+whose existing wording predates this). `entity` names the noun in the
+`not_found`/`shape` wording -- the default keeps every existing
+camera-only caller's wording unchanged; issue #8's sensor/light/chime/NVR
+poll, RequestStatus, and action-error paths pass their own class name
+(`"sensor"`/`"light"`/`"chime"`/`"nvr"`) so e.g. a sensor 404 says "sensor
+not found", not "camera not found" (this was a real gap: the method was
+camera-only text applied verbatim to every device class' poll failures
+until `entity` was added):
 
 | `exc.kind` | Wording |
 |---|---|
 | `auth` | "UniFi Protect rejected the API key. Regenerate it in UniFi OS (Settings > Control Plane > Integrations) and update the plugin config" — a 403 specifically appends "or the key lacks permission for this operation" |
 | `rate_limited` | "rate limited by the controller" + " - retry in {N}s" when `retry_after` is known |
-| `not_found` | "camera not found on the controller (removed or re-adopted?) - reselect it in the device settings" |
+| `not_found` | "{entity} not found on the controller (removed or re-adopted?) - reselect it in the device settings" |
 | `transport` / `server` | "controller unreachable or errored ({exc}) - outcome unknown, states will update on the next refresh" — deliberately does NOT say "refused": the write may well have landed |
-| `shape` | "applied, but the response was unusable - refreshing camera info" |
+| `shape` | "applied, but the response was unusable - refreshing {entity} info" |
 | `bad_request` | "refused by the controller: " + the AJV `issues`, or `str(exc)` if there are none |
 
 On `shape`, `transport`, or `server` — the three kinds where the PATCH's
@@ -922,3 +929,531 @@ Issue #7 (stream URLs) added, in `test_plugin.py` and `test_protect_api.py`:
   ProtectAPIError's `.body` is always `""` (HTTP error, transport failure,
   or shape mismatch), tested the same way for both methods, including a
   body deliberately constructed to contain a token
+---
+
+## Issue #8: sensors, lights, chimes, NVR
+
+> **UNVERIFIED -- spec-derived.** Everything in this section (except the
+> NVR's `armMode` fields, which were captured live) is built from Protect's
+> published OpenAPI 3.1 spec (v6.2.83), not from a real device. The
+> reference rig's `GET /sensors`, `GET /lights`, and `GET /chimes` all
+> return `[]` -- there is nothing to capture against. Do not "fix" this
+> code to match a hunch about real hardware behavior without a debug
+> capture backing it; file a bug with one instead.
+
+### `event_tracker.py`: generic lifecycle families + pulses
+
+Four new **lifecycle** families, each routed by `item.type` exactly like
+MOTION/AUDIO (`add`/`update` keepalive/`update`-with-`end`, traps 1 and 2
+apply identically):
+
+| `item.type` | Internal family (`FAMILY_*` constant) | Per-event type source |
+|---|---|---|
+| `sensorMotion` | `FAMILY_SENSOR_MOTION` ("sensorMotion") | none (always empty) |
+| `sensorWaterLeak` | `FAMILY_SENSOR_LEAK` ("sensorLeak") | none |
+| `sensorAlarm` | `FAMILY_SENSOR_ALARM` ("sensorAlarm") | `metadata.alarmType.text` |
+| `sensorTamper` | `FAMILY_SENSOR_TAMPER` ("sensorTamper") | none |
+
+Reached via the generic methods, not per-family wrappers: `family_active(family,
+device_id)`, `family_types(family, device_id)`, `last_family_ms(family,
+device_id)`, `clear_family(family, device_id)`. `is_active`/`detect_types`/
+`audio_active`/etc. are unchanged and are NOT reimplemented on top of the
+generic methods -- they predate this generalization and share the same
+underlying per-family storage, so the two APIs can never disagree.
+
+Six **pulse** types -- fire-once notifications, never an active/idle span
+(the OpenAPI spec gives each a nullable `end`, but the type's own
+description is a point-in-time notice, e.g. "has entered an open state",
+not a lifecycle): `sensorOpened`, `sensorClosed`, `sensorBatteryLow`,
+`sensorExtremeValues`, `sensorSmokeTest`, `lightMotion`. Any `add`/`update`
+frame of a pulse type is recorded via `last_pulse(device_id, pulse_type) ->
+{"start": epoch_ms|None, "metadata": dict}` and reports the device
+changed; a repeat of the same event id is a no-op, deduped against the
+**same** finished-id cache lifecycle events use (event ids are globally
+unique across the whole schema, so sharing is safe). Pulses **survive**
+`clear_family`/`clear_camera` (they are a history, not live state) and are
+**dropped** by `reset()`.
+
+`KNOWN_UNSUPPORTED_EVENT_TYPES` now holds only `"ring"` -- every other
+previously-unsupported type is a recognized family or pulse.
+
+### `protect_api.py`: new methods
+
+```python
+def _request(self, method: str, path: str, params=None, body=None) -> Any: ...
+    # General GET/PATCH (or any verb) helper, added because this branch's
+    # base did not yet have one. Issue #6 (stacked earlier, rebased in
+    # later) is expected to add a method with this exact signature -- on
+    # rebase, prefer #6's and drop this one if they are equivalent.
+
+def get_sensors(self) -> list[dict]: ...
+def get_sensor(self, sensor_id: str) -> dict: ...
+def patch_sensor(self, sensor_id: str, body: dict) -> dict: ...
+
+def get_lights(self) -> list[dict]: ...
+def get_light(self, light_id: str) -> dict: ...
+def patch_light(self, light_id: str, body: dict) -> dict: ...
+
+def get_chimes(self) -> list[dict]: ...
+def get_chime(self, chime_id: str) -> dict: ...
+def patch_chime(self, chime_id: str, body: dict) -> dict: ...
+
+def get_nvr(self) -> dict: ...
+    # GET /nvrs. Live-verified 2026-08-31 on 7.2.105: returns a SINGLE
+    # OBJECT, not an array -- matching the OpenAPI spec's response schema
+    # for this path (`nvr`, not `array<nvr>`) despite the plural path name.
+    # Tolerates a one-element list defensively; raises on [], a
+    # multi-element list, or any other non-dict/non-list shape.
+```
+
+Every method follows the same shape-validation and error style as
+`get_cameras`/`get_camera`.
+
+**`ProtectAPIError.kind` now accepts an explicit override** (`kind=` on the
+constructor) in addition to the existing status-derived classification --
+a response that parses as JSON but is the wrong shape (an empty list, a
+multi-element list, a non-dict) is not really an HTTP problem, so
+`_expect_dict`/`_expect_list_of_dicts` and `get_nvr`'s one-element-list
+check all raise with `kind="shape"` explicitly rather than the misleading
+`"transport"` a `status=None` would otherwise imply. `plugin.py`'s
+poll-failure guard (below) keys on this.
+
+### Live NVR facts (verified 2026-08-31, UNVR 7.2.105)
+
+`GET /nvrs` returns:
+
+```json
+{"id": "...", "modelKey": "nvr", "name": "...", "type": "UNVRINSTANT",
+ "guid": "...", "mac": "...",
+ "doorbellSettings": {...},
+ "armMode": {"status": "disabled", "armedAt": null, "willBeArmedAt": null,
+             "breachDetectedAt": null, "breachEventCount": 0,
+             "breachTriggerEventId": null, "breachEventId": null}}
+```
+
+`armMode`, `type`, `guid`, and `mac` are **not** in the OpenAPI spec --
+observed-only. `armMode` may be absent entirely on some Protect versions;
+tolerate both a dict and its absence.
+
+### `plugin.py`: device classes
+
+Registries mirror `self.cameras`/`self.camera_info`: `self.sensors`,
+`self.sensor_info`, `self.lights`, `self.light_info`, `self.chimes`,
+`self.chime_info`, and `self.nvrs`/`self.nvr_info` (`self.nvrs` is keyed by
+the NVR's own id once a poll has learned it, or the literal string `"nvr"`
+before that -- `_rekey_nvr()` moves the device-id set across on first
+successful poll).
+
+**A poll bug must never be able to kill the motion socket.** Every
+per-device write for these four classes goes through
+`_apply_polled_write(dev, write_fn, *args)`, which wraps the call in
+`try/except Exception`, logs `ERROR "{dev.name}: could not apply polled
+state (...) - the event socket is unaffected"` + a DEBUG traceback, and
+continues to the next device. `_apply_sensor_state`/`_apply_light_state`/
+`_apply_chime_state`/`_apply_nvr_state` all route through it, which also
+covers `_mark_all_disconnected` (it calls these same methods) without any
+separate wrapping there. Each class's poll FETCH is *also* wrapped in a
+broad `except Exception`, not just `ProtectAPIError` -- a non-ProtectAPIError
+bug reaching `_poll_devices`/`_pump`/`runConcurrentThread` would be
+mistaken for an event-socket fault and tear the camera connection down for
+a completely unrelated reason. This is not theoretical: `(info or
+{}).get("batteryStatus", {}).get("percentage")` does **not** guard a JSON
+`batteryStatus: null` -- the key is *present*, so the `{}` default never
+applies, and `.get("percentage")` on `None` raised `AttributeError` right
+out of `_write_sensor_states`, into `_open_socket`/`runConcurrentThread`'s
+generic handler, logged as a socket error, and reconnected forever. The
+`_as_dict(value)` helper (`value if isinstance(value, dict) else {}`)
+fixes every such nested-object read across sensor/light/chime/nvr, and
+also guards a wrong-type value (e.g. a list), not just null.
+
+**Polling** (`_poll_devices()`, `DEVICE_POLL_INTERVAL = 60.0`): called from
+`_pump()` when due, and from `_open_socket()` right after
+`_refresh_camera_info()` -- but ONLY when at least one non-camera device is
+registered, so an API that raises if touched is never touched with only
+cameras present. Each registered class costs one throttled REST call
+(`_rest` enforces `MIN_REST_INTERVAL = 3.0s`), so a full poll cycle inside
+`_pump()` can block that loop for up to *N* × 3s; any WS frames that
+arrive meanwhile simply queue in the socket's own read buffer -- an
+accepted trade against a second thread. Each poll's own wall-clock anchor
+(`now_ms`) is captured **before** the REST request goes out, not after it
+returns -- a live pulse arriving mid-request must never be mistaken for
+older than a poll that, from the pulse's point of view, hasn't finished
+yet -- and `_device_last_poll_ms[protect_id]` is advanced only **after**
+that device's write is attempted, never before.
+
+A poll failure (`ProtectAPIError` OR any other `Exception` from the fetch)
+does not merely skip the write: `_mark_class_unavailable(registry,
+state_key)` PROACTIVELY writes `{state_key: "unavailable", connected:
+<current>}` to every registered device of that class -- nothing else,
+`lastPoll` untouched, poll-derived fields left at whatever they last were.
+A stale `"CONNECTED"` sitting there through an outage with no signal
+anything is wrong is exactly the failure mode this exists to prevent.
+The failure guard is keyed on `(class_name, exc.kind)` (falling back to
+`type(exc).__name__` for a non-`ProtectAPIError`) via
+`_report_poll_failure`/`_clear_poll_failure`/`_describe_api_error` -- ERROR
+once per (class, kind) per outage, DEBUG for repeats, and INFO once on
+recovery (`"{class} polling recovered"`). A successful single-device
+`RequestStatus` also clears the guard for that class.
+
+**A registered id absent from a successful list poll** (the reference
+rig's actual behaviour: `GET /sensors` returns `[]`) is handled the same
+way as a device the list poll never mentions at all: `_warn_absent_from_list`
+logs `WARNING` once per `(class, protect_id)` absence-episode ("removed
+from Protect, or the API returned an empty list; keeping last-known
+values"), `self.sensor_info`/etc. simply has no entry for that id (the
+cache is rebuilt wholesale from each successful list, not merged), and the
+resulting `_write_*_states` call naturally takes the same "no info" path
+described below -- `*State=unavailable` + `connected`, `lastPoll`
+untouched, `_device_last_poll_ms` not advanced. Cleared
+(`_clear_absent_from_list`) the moment the id reappears in a later list.
+
+**Never a fabricated value before the first poll.** Every poll-derived
+state key (`isOpen`, `batteryLow`, `mountType`, `temperature`/`humidity`/
+`lightLevel`, `lastOpenChange`, native `batteryLevel`; a light's
+`isLightOn`/`isDark`/`forceEnabled`/`lightMode`/`ledLevel`; a chime's
+`pairedCameraCount`/`ringVolume`; an NVR's `nvrName`/`nvrModel`/
+`protectVersion`/`armedAt`/`breachDetectedAt`/`breachEventCount`) is
+gated on `if info:` in its `_write_*_states` and simply **omitted** from
+the batch -- not written as `False`/`0`/`""` -- whenever there is no cache
+yet (brand-new device before the first poll, a REST failure that never
+populated the cache, or an id absent from a list). This is what fixed
+"every restart fires 'Floodlight turned off'": `onOffState` for a light IS
+`isLightOn`, purely poll-derived with no lifecycle fallback at all, so it
+used to be written `False` unconditionally the instant `deviceStartComm`
+ran, before any poll had ever told the plugin the light's real state.
+Lifecycle booleans (`motionDetected`/`leakDetected`/`alarmTriggered`+
+`alarmType`/`tampered`, and light's `pirMotionDetected`) are the one
+exception -- they come from the tracker, not the poll cache, so `False` is
+genuine information ("no event has happened yet") even with zero polls,
+and are always written. `sensorState`/`lightState`/`chimeState`/
+`armStatus` (`_state_or_unavailable`/inline equivalent) and `connected`
+are likewise always written, `STATE_UNAVAILABLE` covering the no-info
+case -- and, since `.get(key, default)` only substitutes when the key is
+*absent*, not when it is present-but-`null`, these use `info.get(key) or
+STATE_UNAVAILABLE`, never the two-arg form, so a JSON `null` can never
+land in what Indigo declares as a String state.
+
+**Reconciliation** (poll is authoritative for measurements/flags; between
+polls, the live event stream drives the boolean):
+
+- Sensor `motionDetected`: driven live by `family_active(FAMILY_SENSOR_MOTION,
+  ...)`. At poll time, if the poll's own `isMotionDetected` is `False`
+  while the tracker still thinks it's active, the tracker is corrected
+  (`clear_family`, DEBUG-logged) -- never the other direction. The reverse
+  disagreement (poll says active, tracker idle -- a lost `add` frame would
+  look like this) is DEBUG-logged but NOT corrected; the tracker is
+  trusted.
+- Sensor `isOpen`: the poll's `isOpened`, overridden by whichever of a
+  `sensorOpened`/`sensorClosed` pulse has a newer `start` than the poll's
+  own `openStatusChangedAt` (and than each other, if both exist) -- or,
+  when `openStatusChangedAt` is `null` (both entries in
+  `tests/fixtures/sensors_spec.json` have it null, so this is not an edge
+  case), versus `_device_last_poll_ms[sensor_id]` instead. Without that
+  fallback, a `null` `openStatusChangedAt` compares as "always older" than
+  any real timestamp, so a single stale pulse would win FOREVER instead of
+  self-expiring at the next poll like every other override in this
+  module. The poll-baseline fallback is a COMPARISON ANCHOR ONLY and is
+  never itself reported: `lastOpenChange` is written only when the
+  winning timestamp is a REAL one -- `openStatusChangedAt` itself, or an
+  actual `sensorOpened`/`sensorClosed` pulse -- and is simply omitted
+  (not written as `""`, not re-written) otherwise. An earlier version
+  reported the poll-baseline fallback as `lastOpenChange` directly, which
+  made it advance by one poll interval every cycle forever even when
+  nothing about the sensor had changed. Every pulse that loses this
+  comparison is DEBUG-logged with both timestamps.
+- Sensor `batteryLow`: poll's `batteryStatus.isLow`, OR a `sensorBatteryLow`
+  pulse newer than `_device_last_poll_ms[sensor_id]` -- self-expiring,
+  since the next poll always advances that timestamp. A losing pulse is
+  DEBUG-logged the same way.
+- Sensor `temperature`/`humidity`/`lightLevel`: poll's `stats.<metric>.value`,
+  immediately overridden by a `sensorExtremeValues` pulse for the matching
+  metric (`metadata.sensorType.text` -- `"light"` maps to the `lightLevel`
+  state) newer than `_device_last_poll_ms` -- same self-expiring pattern,
+  same DEBUG log on a loss.
+- Light `pirMotionDetected`: treated like a sensor lifecycle boolean (see
+  disconnect rule below) -- forced `False` when the socket is down.
+  Otherwise, the poll's `isPirMotionDetected`, overridden `True` by a
+  `lightMotion` pulse newer than `_device_last_poll_ms[light_id]` (a
+  losing pulse DEBUG-logged).
+- Light `lastMotion`: the newer of the poll's own `lastMotion` field and a
+  `lightMotion` pulse's `start`.
+
+**Disconnect rule, extended**: on socket loss, sensor
+`motionDetected`/`leakDetected`/`alarmTriggered`+`alarmType`/`tampered`
+and light `pirMotionDetected` go `False` (`alarmType` goes `""`) with
+`connected` `False` -- the same honesty rule as camera motion, because
+these are the fields driven by the live event stream. Everything else on
+sensors/lights (`isOpen`, `batteryLow`, `temperature`, `isLightOn`, ...)
+and everything on chimes/NVR is REST-poll-derived and is **kept** at its
+last-known value, exactly like a camera's `cameraModel`/`videoMode`
+survive a socket loss. `connected` on every new device type reflects the
+same event-socket health signal as a camera's `connected`
+(`_is_connected()`), even for chimes/NVR, which have no live feed of their
+own -- there is one connectivity concept in this plugin, not a per-class
+one. `_open_socket()` re-applies `connected=True` explicitly for every
+registered sensor/light/chime/NVR device right after the handshake,
+regardless of whether the poll that follows succeeds -- without this, a
+failing first poll after reconnect could leave these devices reporting
+`connected=False` (stuck from the prior disconnect) even though the event
+socket, which is what `connected` actually means here, is genuinely back
+up.
+
+**Recovery limitation (documented, not fixed -- there is no fix available
+from this API):** after a plugin restart, `leakDetected`/`alarmTriggered`+
+`alarmType`/`tampered` read `False` until a NEW live event arrives, even
+if the sensor's last-reported condition was still active when the plugin
+went down. The poll object carries only a `*DetectedAt`/`alarmTriggeredAt`
+timestamp for these three, never a "currently active" flag the way
+`isOpened`/`isMotionDetected` exist for open/motion -- so there is no
+honest way to reconstruct "is it STILL leaking/alarming/tampered right
+now" from a poll alone, and the plugin does not guess. What it does
+instead: `lastLeak` (newest of `leakDetectedAt`/`externalLeakDetectedAt`),
+`lastAlarm` (`alarmTriggeredAt`), and `lastTamper` (`tamperingDetectedAt`)
+surface those raw poll timestamps as their own String states (ISO or
+omitted when the poll never reported one) so the information is at least
+visible, even while the boolean itself is silent. Sensor `isOpen` and
+light `pirMotionDetected` do NOT have this gap -- the poll gives a real
+current-state field for both (`isOpened`, `isPirMotionDetected`), so no
+information is lost across a restart there.
+
+**`primaryState` resolution** (`protectSensor` only): `"auto"` (default)
+maps mount type to a boolean via `SENSOR_MOUNT_PRIMARY_STATE` --
+`door`/`window`/`garage` -> `isOpen`, `leak` -> `leakDetected`, `none` (or
+anything unrecognized) -> `motionDetected`. Any other explicit choice
+(`open`/`motion`/`leak`/`alarm`) wins outright. `onOffState` itself follows
+the same "never fabricated" rule as every other poll-derived key: if the
+resolved primary is `"open"` and there is no poll cache yet, `onOffState`
+is omitted entirely rather than written `False` -- `"motion"`/`"leak"`/
+`"alarm"` are lifecycle booleans and are always safe to write.
+
+**`actionControlDevice`** (protectLight only -- the only new device type
+that declares TurnOn/TurnOff/Toggle): the `PATCH .../lights/{id}` (body
+`{"isLightForceEnabled": <bool>}`) and the re-`GET` are two SEPARATE
+`try`/`except` blocks, not one. A PATCH failure logs `"could not set
+light"`; a GET failure AFTER a successful PATCH logs a different message
+-- `"force flag set, but could not re-read the light (...) - states may be
+stale until the next poll"` -- because the light genuinely did change,
+only the re-read failed, and merges the (possibly partial) PATCH response
+into the cache immediately so that fact isn't lost even if the GET never
+lands. Toggle, if nothing is cached yet (e.g. right after startup), GETs
+the light first rather than guessing `isLightForceEnabled` is `False`.
+"Off" only clears the force flag -- the floodlight's own motion mode, if
+any, can still turn it on.
+
+**`setLightLevel`/`setChimeVolume`** merge `{**cached, **response}` from
+the PATCH into the existing cache rather than replacing it wholesale --
+some PATCH endpoints return only the changed subset, and replacing the
+cache with a partial object would silently drop every other previously-
+known field. A `None`/empty PATCH response is still treated as a success
+(not an error) and triggers a re-`GET` for an authoritative view instead
+of guessing the new shape; a failure on that re-`GET` logs "...set, but
+could not re-read... - states may be stale until the next poll" the same
+way the light-action path does.
+
+`setChimeVolume` specifically: on a cache miss (nothing in `chime_info`
+yet -- before the first poll, or after a poll failure), it `GET`s the
+chime FIRST, mirroring the light Toggle path's same rule -- "no
+ringSettings" is only ever reported after an actual read, never guessed
+from an empty cache. The PATCH body sends only the four documented
+`ringSettings` keys (`cameraId`, `repeatTimes`, `ringtoneId`, `volume`)
+per entry, dropping anything else a cached entry might carry: the PATCH
+item schema is `additionalProperties: false` while the GET schema is not,
+so echoing a cached entry wholesale can be rejected by the controller.
+
+**`actionControlUniversal` RequestStatus**, every new type: an immediate
+single-device `GET` (not the batch `GET .../sensors` etc.) + state write,
+mirroring the camera path's `_refresh_camera_info()` + `_apply_camera_state`,
+and clears that class's poll-failure guard on success.
+
+### State tables
+
+**protectSensor** (`type="sensor"`, no subType -- one device tracks up to
+five different physical sensor kinds):
+
+| State | Type | Source |
+|---|---|---|
+| `isOpen` | Boolean | poll `isOpened`, pulse-overridden (see above) |
+| `motionDetected` | Boolean | `family_active(FAMILY_SENSOR_MOTION, ...)` |
+| `leakDetected` | Boolean | `family_active(FAMILY_SENSOR_LEAK, ...)` |
+| `alarmTriggered` | Boolean | `family_active(FAMILY_SENSOR_ALARM, ...)` |
+| `alarmType` | String | `family_types(FAMILY_SENSOR_ALARM, ...)`, comma-joined |
+| `tampered` | Boolean | `family_active(FAMILY_SENSOR_TAMPER, ...)` |
+| `batteryLow` | Boolean | poll `batteryStatus.isLow`, pulse-overridden |
+| `temperature`/`humidity`/`lightLevel` | Number | poll `stats.*.value`, pulse-overridden; omitted (not `0`) when unknown |
+| `mountType` | String | poll `mountType` |
+| `sensorState` | String | poll `state`, or `STATE_UNAVAILABLE` |
+| `connected` | Boolean | event socket health |
+| `lastMotion` | String | ISO or `""`; `_sensor_last_motion_ms` merges the tracker's `last_family_ms(FAMILY_SENSOR_MOTION, ...)` with the poll's `motionDetectedAt` (newest wins) -- without the poll side, this read `""` after every restart |
+| `lastOpenChange` | String | ISO, omitted (not `""`, never re-written) unless the `isOpen` reconciliation's winning timestamp was REAL (`openStatusChangedAt` or an actual pulse) -- the internal poll-baseline fallback must never be reported |
+| `lastLeak` | String | ISO, omitted if null; newest of poll `leakDetectedAt`/`externalLeakDetectedAt` -- see "Recovery limitation" above |
+| `lastAlarm` | String | ISO, omitted if null; poll `alarmTriggeredAt` -- see "Recovery limitation" above |
+| `lastTamper` | String | ISO, omitted if null; poll `tamperingDetectedAt` -- see "Recovery limitation" above |
+| `lastPoll` | String | ISO, only present on a poll-triggered write |
+| *(native)* `batteryLevel` | -- | poll `batteryStatus.percentage`, via `updateStateOnServer` -- **not** a `<State>`. The OpenAPI spec marks `batteryStatus` "[DEPRECATED] Use wirelessConnectionState.batteryStatus instead", but `wirelessConnectionState` appears nowhere else in the spec -- real firmware may still populate this field, or may already use the undocumented one; a likely first hardware-report item |
+
+**protectLight** (`type="relay"`): `onOffState` = `isLightOn`.
+
+| State | Type | Source |
+|---|---|---|
+| `isDark` | Boolean | poll `isDark` |
+| `pirMotionDetected` | Boolean | poll `isPirMotionDetected`, pulse-overridden; disconnect-forced False |
+| `forceEnabled` | Boolean | poll `isLightForceEnabled` |
+| `ledLevel` | Integer | poll `lightDeviceSettings.ledLevel`; skipped if unparseable |
+| `lightMode` | String | poll `lightModeSettings.mode` |
+| `lightState` | String | poll `state`, or `STATE_UNAVAILABLE` |
+| `connected` | Boolean | event socket health |
+| `lastMotion` | String | ISO or `""` (see reconciliation above) |
+| `lastPoll` | String | ISO, poll-triggered writes only |
+
+**protectChime** (`type="custom"`):
+
+| State | Type | Source |
+|---|---|---|
+| `chimeState` | String | poll `state`, or `STATE_UNAVAILABLE` |
+| `pairedCameraCount` | Integer | `len(cameraIds)` |
+| `ringVolume` | Integer | first `ringSettings` entry's `volume`; omitted if no entries |
+| `connected` | Boolean | event socket health |
+| `lastPoll` | String | ISO, poll-triggered writes only |
+
+**protectNvr** (`type="custom"`, no device picker -- one NVR per console):
+
+| State | Type | Source |
+|---|---|---|
+| `nvrName` | String | poll `name` |
+| `nvrModel` | String | poll `type` (observed-only field); omitted if absent |
+| `protectVersion` | String | `GET /meta/info` (`applicationVersion`), refreshed alongside each NVR poll |
+| `armStatus` | String | `armMode.status`, or `STATE_UNAVAILABLE` if `armMode`/`nvr_info` absent |
+| `armedAt` | String | ISO or `""` |
+| `breachDetectedAt` | String | ISO or `""` |
+| `breachEventCount` | Integer | `armMode.breachEventCount` |
+| `connected` | Boolean | event socket health |
+| `lastPoll` | String | ISO, poll-triggered writes only |
+
+No actions -- arm/disarm is not in the published integration API.
+
+### Testing
+
+`tests/fixtures/{sensors,lights,chimes,nvrs}_spec.json` (spec-derived, see
+`tests/fixtures/README.md`). Per workspace convention, the adversarial
+question is "when could this report idle/unavailable/kept and be wrong?":
+
+- fatal-collaborator: `_poll_devices()` with only cameras registered never
+  touches any non-camera API method; with exactly one sensor registered,
+  only `get_sensors` is touched
+- a poll failure keeps every last-known value, marks the class's own state
+  string `"unavailable"`, never writes `lastPoll`, and logs ERROR exactly
+  once across two consecutive failures
+- `primaryState=auto` picks the right boolean per mount type, and an
+  explicit choice overrides mount type
+- `isOpen` reconciliation both directions: a pulse newer than the poll's
+  `openStatusChangedAt` wins; a poll newer than the pulse wins
+- a poll's `isMotionDetected: false` clears a tracker family stuck active
+  from a lost `end` frame
+- `batteryLevel` lands as a native single-key write, never inside the
+  batched `updateStatesOnServer` call
+- disconnect forces sensor lifecycle booleans and light `pirMotionDetected`
+  False while keeping poll-derived values (`temperature`, `onOffState`)
+- light TurnOn does PATCH-then-GET in that order; a refused PATCH logs
+  ERROR and leaves every state untouched (proven with a `get_light` that
+  raises if called)
+- `setChimeVolume` on a chime with no `ringSettings` errors without
+  calling `patch_chime`
+- NVR `armStatus` reads `"unavailable"` both before any poll and when
+  `armMode` itself is absent from a present `nvr_info`
+- declared-vs-written, extended to iterate every `<Device>` in Devices.xml
+  (not just the camera), with `batteryLevel` explicitly exempted from both
+  the "undeclared" and "never written" checks since it is a native
+  property, never a `<State>`
+
+#### Round-2 review coverage (silent-failure hunter + test analyst)
+
+- fatal-collaborator, driven through `_pump`'s own poll tick (not calling
+  `_poll_devices` directly): a sensor device whose `updateStatesOnServer`
+  raises never escapes into `_pump`/`runConcurrentThread`, the socket
+  stays open, and the light device polled in the same cycle still gets
+  its write; a non-`ProtectAPIError` raised by a fake `get_sensors` is
+  caught the same way
+- `batteryStatus: null` (both the JSON-null case and a wrong-type value)
+  never raises, and `batteryLevel` is simply skipped
+- a poll failure now WRITES `{class}State="unavailable"` + `connected`
+  (rewritten from an earlier version of this test that asserted NO new
+  write happened at all, which blessed the actual bug -- a stale
+  `"CONNECTED"` surviving an outage with no signal anything was wrong);
+  every other poll-derived key and `lastPoll` are proven untouched by
+  diffing the exact key set of the failure's write batch
+- a registered id absent from a successful list poll: WARNING once,
+  `*State=unavailable`+`connected` only, `mountType`/`lastPoll` kept; the
+  guard clears the moment the id reappears (proven by polling empty twice,
+  then present, then empty again, expecting exactly 2 WARNINGs total)
+- before the first poll: a sensor writes only its lifecycle booleans +
+  `connected` + `sensorState="unavailable"` (no `isOpen`/`batteryLow`/
+  `mountType`/measurements/`batteryLevel`); a light writes no `onOffState`
+  and none of `isDark`/`forceEnabled`/`lightMode`/`ledLevel` either; a
+  sensor with `primaryState=open` and no cache omits `onOffState` entirely
+  (never fabricates `False`)
+- `_open_socket` re-applies `connected=True` for a registered sensor with
+  `_poll_devices` AND `_refresh_camera_info` both stubbed to no-ops, so
+  only the explicit reapply can be responsible for the write
+- `isOpen`/`sensorState`/`armStatus` never receive a bare `None` when the
+  corresponding poll field is present-but-null
+- DEBUG fires with both timestamps when a stale pulse is discarded
+  (`sensorOpened` vs a newer poll baseline), and when a poll disagrees
+  with an idle tracker (`isMotionDetected: true`, tracker idle)
+- `batteryLow` pulse override is proven to clear at the NEXT poll (not
+  merely "a poll clears it eventually") using deterministic epoch-ms
+  timestamps throughout, since two real `_poll_sensors()` calls back to
+  back would make "the next poll is later than the pulse" a race against
+  test execution speed
+- `sensorExtremeValues` updates `temperature` and (`sensorType.text ==
+  "light"`) `lightLevel`
+- `isOpen` with both `sensorOpened`/`sensorClosed` pulses present, in each
+  handling order, always resolves to whichever has the truly newest
+  `start`, and `lastOpenChange` matches that timestamp
+- all four `tests/fixtures/*_spec.json` fixtures are loaded and driven
+  through their `_write_*_states`, asserting on the fixture's own `state`/
+  `armMode.status` field rather than a hardcoded value
+- a pulse frame carrying a non-null `end` (the OpenAPI spec's own nullable
+  `end` on every pulse type) is still recorded via `last_pulse`, not
+  routed through the lifecycle add/finish machinery
+- disconnect additionally asserts `alarmTriggered`/`tampered` go `False`
+  and `alarmType` clears to `""`
+- `primaryState="leak"`/`"motion"` each drive `onOffState` end-to-end, not
+  just their own boolean state
+- light TurnOn/Off/Toggle: a GET failure after a successful PATCH merges
+  the PATCH response and logs the "force flag set, but could not re-read"
+  message, never "could not set light"; Toggle with an empty cache GETs
+  before guessing; `setLightLevel`/`setChimeVolume` merge a partial PATCH
+  response instead of replacing the cache, and treat an empty/`None`
+  response as success followed by a re-GET
+- two outages with a recovery in between log exactly two ERRORs and one
+  INFO ("... polling recovered"); `RequestStatus` for each of the four
+  types calls only the single-device GET, with a fatal fake proving the
+  list method is never touched
+- `batteryLevel`'s declared-vs-written exemption in
+  `test_every_written_state_is_declared_and_legal` is scoped to
+  `protectSensor` only, so another type accidentally writing it would
+  still be caught as undeclared
+
+#### Round-3 review coverage (final code-quality pass, PR #15)
+
+- `lastOpenChange` is never written across three consecutive polls with a
+  null `openStatusChangedAt` and no pulses (the fabrication bug); a real
+  `openStatusChangedAt` still writes it once
+- `_describe_api_error`'s default `entity="camera"` keeps existing
+  camera-only wording unchanged; a sensor 404 says "sensor not found", not
+  "camera not found"
+- `Devices.xml`: all four issue #8 device types (`protectSensor`,
+  `protectLight`, `protectChime`, `protectNvr`) declare the hidden
+  `SupportsStatusRequest` field
+- `setChimeVolume` on a cache miss `GET`s the chime before ever reporting
+  "no ringSettings"; the PATCH body carries only the four documented
+  `ringSettings` keys, dropping any extra field a cached entry might carry
+- a bool battery percentage is skipped, not written as a fabricated
+  battery level
+- sensor `lastMotion` merges the poll's `motionDetectedAt` with the
+  tracker's own timestamp (newest wins), proven both when only the poll
+  has one (post-restart) and when the tracker's is newer
+- `lastLeak`/`lastAlarm`/`lastTamper` are written from the poll's own
+  timestamps and skipped when null; a dedicated test pins the recovery
+  limitation directly: `leakDetected` reads `False` post-restart while
+  `lastLeak` still shows the poll's `leakDetectedAt`

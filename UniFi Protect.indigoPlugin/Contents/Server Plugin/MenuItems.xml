@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <MenuItems>
 	<MenuItem id="discoverCameras">
-		<Name>Discover Cameras</Name>
+		<Name>Discover Devices</Name>
         <CallbackMethod>discoverCameras</CallbackMethod>
 	</MenuItem>
 	<MenuItem id="sep1"/>

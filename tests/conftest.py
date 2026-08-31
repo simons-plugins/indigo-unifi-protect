@@ -45,13 +45,14 @@ class _OrderingViolation(BaseException):
 class _FakeDevice:
     """Just enough of an Indigo device to record what a plugin writes to it."""
 
-    def __init__(self, dev_id, name="Camera", plugin_props=None, enabled=True):
+    def __init__(self, dev_id, name="Camera", plugin_props=None, enabled=True,
+                 device_type_id="protectCamera"):
         self.id = dev_id
         self.name = name
         self.pluginProps = dict(plugin_props or {})
         self.enabled = enabled
         self.states = {}
-        self.deviceTypeId = "protectCamera"
+        self.deviceTypeId = device_type_id
         self.model = "Protect Camera"
         # Full history, so a test can assert on the *sequence* of writes and
         # not merely the final resting state.
@@ -171,6 +172,12 @@ class _UniversalAction:
     EnergyUpdate = "EnergyUpdate"
 
 
+class _DeviceAction:
+    TurnOn = "TurnOn"
+    TurnOff = "TurnOff"
+    Toggle = "Toggle"
+
+
 def _install_fake_indigo():
     fake = types.ModuleType("indigo")
     fake.PluginBase = _FakePluginBase
@@ -180,6 +187,7 @@ def _install_fake_indigo():
     fake.List = list
     fake.kStateImageSel = _StateImageSel
     fake.kUniversalAction = _UniversalAction
+    fake.kDeviceAction = _DeviceAction
     sys.modules["indigo"] = fake
     return fake
 

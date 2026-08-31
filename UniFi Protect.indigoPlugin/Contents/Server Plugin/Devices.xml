@@ -177,4 +177,332 @@
             </State>
         </States>
     </Device>
+
+    <!-- Issue #8: Protect sensor (door/window/garage/leak/none-mounted
+    multisensor). Spec-derived (OpenAPI v6.2.83) - UNVERIFIED against real
+    hardware, since GET /sensors returns [] on the reference rig. See
+    docs/CONTRACT.md for the full state/reconciliation contract. -->
+    <!-- No subType: this one device tracks up to five different physical
+    sensor kinds (open/motion/leak/alarm/tamper) depending on mount type
+    and what's active, so no single kSensorDeviceSubType value fits. -->
+    <Device type="sensor" id="protectSensor">
+        <Name>Protect Sensor</Name>
+        <ConfigUI>
+            <Field id="sensorIdLabel" type="label">
+                <Label>Select the UniFi Protect sensor this device tracks. The list is populated live from your Protect controller. UNVERIFIED: built from the published OpenAPI spec, never exercised against real hardware -- please report a debug capture if something looks wrong.</Label>
+            </Field>
+            <Field id="sensorId" type="menu">
+                <Label>Sensor:</Label>
+                <List class="self" method="getSensorList" dynamicReload="true"/>
+            </Field>
+            <Field id="primaryStateLabel" type="label">
+                <Label>Which state drives the device's on/off status ("auto" picks by mount type: door/window/garage -> open, leak -> leak, none -> motion):</Label>
+            </Field>
+            <Field id="primaryState" type="menu" defaultValue="auto">
+                <Label>Primary state:</Label>
+                <List>
+                    <Option value="auto">Auto (by mount type)</Option>
+                    <Option value="open">Open/Closed</Option>
+                    <Option value="motion">Motion</Option>
+                    <Option value="leak">Leak</Option>
+                    <Option value="alarm">Alarm</Option>
+                </List>
+            </Field>
+            <Field id="SupportsOnState" type="checkbox" defaultValue="true" hidden="true">
+                <Label/>
+            </Field>
+            <Field id="SupportsSensorValue" type="checkbox" defaultValue="false" hidden="true">
+                <Label/>
+            </Field>
+            <Field id="SupportsStatusRequest" type="checkbox" defaultValue="true" hidden="true">
+                <Label/>
+            </Field>
+            <Field id="SupportsBatteryLevel" type="checkbox" defaultValue="true" hidden="true">
+                <Label/>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="isOpen">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Open</TriggerLabel>
+                <ControlPageLabel>Open</ControlPageLabel>
+            </State>
+            <State id="motionDetected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Motion Detected</TriggerLabel>
+                <ControlPageLabel>Motion Detected</ControlPageLabel>
+            </State>
+            <State id="leakDetected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Leak Detected</TriggerLabel>
+                <ControlPageLabel>Leak Detected</ControlPageLabel>
+            </State>
+            <State id="alarmTriggered">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Alarm Triggered</TriggerLabel>
+                <ControlPageLabel>Alarm Triggered</ControlPageLabel>
+            </State>
+            <State id="alarmType">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Alarm Type</TriggerLabel>
+                <ControlPageLabel>Alarm Type</ControlPageLabel>
+            </State>
+            <State id="tampered">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Tampered</TriggerLabel>
+                <ControlPageLabel>Tampered</ControlPageLabel>
+            </State>
+            <State id="batteryLow">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Battery Low</TriggerLabel>
+                <ControlPageLabel>Battery Low</ControlPageLabel>
+            </State>
+            <State id="temperature">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Temperature</TriggerLabel>
+                <ControlPageLabel>Temperature</ControlPageLabel>
+            </State>
+            <State id="humidity">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Humidity</TriggerLabel>
+                <ControlPageLabel>Humidity</ControlPageLabel>
+            </State>
+            <State id="lightLevel">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Light Level</TriggerLabel>
+                <ControlPageLabel>Light Level</ControlPageLabel>
+            </State>
+            <State id="mountType">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Mount Type</TriggerLabel>
+                <ControlPageLabel>Mount Type</ControlPageLabel>
+            </State>
+            <State id="sensorState">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Sensor State</TriggerLabel>
+                <ControlPageLabel>Sensor State</ControlPageLabel>
+            </State>
+            <State id="connected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Event Socket Connected</TriggerLabel>
+                <ControlPageLabel>Event Socket Connected</ControlPageLabel>
+            </State>
+            <State id="lastMotion">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Motion</TriggerLabel>
+                <ControlPageLabel>Last Motion</ControlPageLabel>
+            </State>
+            <State id="lastOpenChange">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Open/Close Change</TriggerLabel>
+                <ControlPageLabel>Last Open/Close Change</ControlPageLabel>
+            </State>
+            <State id="lastLeak">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Leak</TriggerLabel>
+                <ControlPageLabel>Last Leak</ControlPageLabel>
+            </State>
+            <State id="lastAlarm">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Alarm</TriggerLabel>
+                <ControlPageLabel>Last Alarm</ControlPageLabel>
+            </State>
+            <State id="lastTamper">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Tamper</TriggerLabel>
+                <ControlPageLabel>Last Tamper</ControlPageLabel>
+            </State>
+            <State id="lastPoll">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Poll</TriggerLabel>
+                <ControlPageLabel>Last Poll</ControlPageLabel>
+            </State>
+        </States>
+        <!-- batteryLevel is NOT declared here on purpose: it is Indigo's
+        NATIVE battery property (enabled by SupportsBatteryLevel above).
+        Writing it via dev.updateStateOnServer("batteryLevel", ...) routes
+        to that native property; declaring it as a <State> here would be
+        silently ignored (see indigo-configui-values-must-be-indigo-dict /
+        workspace MEMORY.md on native-key gotchas). -->
+    </Device>
+
+    <!-- Issue #8: Protect floodlight. Spec-derived (OpenAPI v6.2.83) -
+    UNVERIFIED against real hardware, since GET /lights returns [] on the
+    reference rig. See docs/CONTRACT.md. -->
+    <Device type="relay" id="protectLight">
+        <Name>Protect Light</Name>
+        <ConfigUI>
+            <Field id="lightIdLabel" type="label">
+                <Label>Select the UniFi Protect floodlight this device controls. UNVERIFIED: built from the published OpenAPI spec, never exercised against real hardware -- please report a debug capture if something looks wrong.</Label>
+            </Field>
+            <Field id="lightId" type="menu">
+                <Label>Light:</Label>
+                <List class="self" method="getLightList" dynamicReload="true"/>
+            </Field>
+            <Field id="turnOffHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+                <Label>"Off" clears the light's force-enable flag. If the floodlight's own motion mode is set to turn it on automatically, it may still light up on its own.</Label>
+            </Field>
+            <Field id="SupportsStatusRequest" type="checkbox" defaultValue="true" hidden="true">
+                <Label/>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="isDark">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Is Dark</TriggerLabel>
+                <ControlPageLabel>Is Dark</ControlPageLabel>
+            </State>
+            <State id="pirMotionDetected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>PIR Motion Detected</TriggerLabel>
+                <ControlPageLabel>PIR Motion Detected</ControlPageLabel>
+            </State>
+            <State id="forceEnabled">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Force Enabled</TriggerLabel>
+                <ControlPageLabel>Force Enabled</ControlPageLabel>
+            </State>
+            <State id="ledLevel">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>LED Level</TriggerLabel>
+                <ControlPageLabel>LED Level</ControlPageLabel>
+            </State>
+            <State id="lightMode">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Light Mode</TriggerLabel>
+                <ControlPageLabel>Light Mode</ControlPageLabel>
+            </State>
+            <State id="lightState">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Light State</TriggerLabel>
+                <ControlPageLabel>Light State</ControlPageLabel>
+            </State>
+            <State id="connected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Event Socket Connected</TriggerLabel>
+                <ControlPageLabel>Event Socket Connected</ControlPageLabel>
+            </State>
+            <State id="lastMotion">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Motion</TriggerLabel>
+                <ControlPageLabel>Last Motion</ControlPageLabel>
+            </State>
+            <State id="lastPoll">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Poll</TriggerLabel>
+                <ControlPageLabel>Last Poll</ControlPageLabel>
+            </State>
+        </States>
+    </Device>
+
+    <!-- Issue #8: Protect doorbell chime. Spec-derived (OpenAPI v6.2.83) -
+    UNVERIFIED against real hardware, since GET /chimes returns [] on the
+    reference rig. See docs/CONTRACT.md. -->
+    <Device type="custom" id="protectChime">
+        <Name>Protect Chime</Name>
+        <ConfigUI>
+            <Field id="chimeIdLabel" type="label">
+                <Label>Select the UniFi Protect chime this device tracks. UNVERIFIED: built from the published OpenAPI spec, never exercised against real hardware -- please report a debug capture if something looks wrong.</Label>
+            </Field>
+            <Field id="chimeId" type="menu">
+                <Label>Chime:</Label>
+                <List class="self" method="getChimeList" dynamicReload="true"/>
+            </Field>
+            <Field id="SupportsStatusRequest" type="checkbox" defaultValue="true" hidden="true">
+                <Label/>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="chimeState">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Chime State</TriggerLabel>
+                <ControlPageLabel>Chime State</ControlPageLabel>
+            </State>
+            <State id="pairedCameraCount">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Paired Camera Count</TriggerLabel>
+                <ControlPageLabel>Paired Camera Count</ControlPageLabel>
+            </State>
+            <State id="ringVolume">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Ring Volume</TriggerLabel>
+                <ControlPageLabel>Ring Volume</ControlPageLabel>
+            </State>
+            <State id="connected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Event Socket Connected</TriggerLabel>
+                <ControlPageLabel>Event Socket Connected</ControlPageLabel>
+            </State>
+            <State id="lastPoll">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Poll</TriggerLabel>
+                <ControlPageLabel>Last Poll</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>chimeState</UiDisplayStateId>
+    </Device>
+
+    <!-- Issue #8: Protect NVR/console arm state. Live-verified 2026-08-31
+    on 7.2.105 (unlike sensors/lights/chimes) - GET /nvrs returns a real
+    single object with `armMode`, `type`, `guid`, `mac`, none of which are
+    in the OpenAPI spec. No device selection: there is exactly one NVR. -->
+    <Device type="custom" id="protectNvr">
+        <Name>Protect NVR</Name>
+        <ConfigUI>
+            <Field id="nvrHelp" type="label">
+                <Label>Tracks the arm/disarm state of your UniFi OS console. There is only one NVR per console, so no selection is needed.</Label>
+            </Field>
+            <Field id="SupportsStatusRequest" type="checkbox" defaultValue="true" hidden="true">
+                <Label/>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="nvrName">
+                <ValueType>String</ValueType>
+                <TriggerLabel>NVR Name</TriggerLabel>
+                <ControlPageLabel>NVR Name</ControlPageLabel>
+            </State>
+            <State id="nvrModel">
+                <ValueType>String</ValueType>
+                <TriggerLabel>NVR Model</TriggerLabel>
+                <ControlPageLabel>NVR Model</ControlPageLabel>
+            </State>
+            <State id="protectVersion">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Protect Version</TriggerLabel>
+                <ControlPageLabel>Protect Version</ControlPageLabel>
+            </State>
+            <State id="armStatus">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Arm Status</TriggerLabel>
+                <ControlPageLabel>Arm Status</ControlPageLabel>
+            </State>
+            <State id="armedAt">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Armed At</TriggerLabel>
+                <ControlPageLabel>Armed At</ControlPageLabel>
+            </State>
+            <State id="breachDetectedAt">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Breach Detected At</TriggerLabel>
+                <ControlPageLabel>Breach Detected At</ControlPageLabel>
+            </State>
+            <State id="breachEventCount">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Breach Event Count</TriggerLabel>
+                <ControlPageLabel>Breach Event Count</ControlPageLabel>
+            </State>
+            <State id="connected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Event Socket Connected</TriggerLabel>
+                <ControlPageLabel>Event Socket Connected</ControlPageLabel>
+            </State>
+            <State id="lastPoll">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Poll</TriggerLabel>
+                <ControlPageLabel>Last Poll</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>armStatus</UiDisplayStateId>
+    </Device>
 </Devices>

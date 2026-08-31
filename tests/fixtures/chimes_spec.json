@@ -1,0 +1,22 @@
+[
+  {
+    "id": "6a1f2e3d0057a8034e003301",
+    "modelKey": "chime",
+    "state": "CONNECTED",
+    "name": "Front Door Chime",
+    "mac": "F09FC2010501",
+    "cameraIds": ["6a1f2e3d0057a8034e000101"],
+    "ringSettings": [
+      {"cameraId": "6a1f2e3d0057a8034e000101", "repeatTimes": 1, "ringtoneId": "default", "volume": 60}
+    ]
+  },
+  {
+    "id": "6a1f2e3d0057a8034e003302",
+    "modelKey": "chime",
+    "state": "DISCONNECTED",
+    "name": "Side Door Chime",
+    "mac": "F09FC2010502",
+    "cameraIds": [],
+    "ringSettings": []
+  }
+]
