@@ -5,6 +5,103 @@
         <CallbackMethod>takeSnapshot</CallbackMethod>
     </Action>
 
+    <Action id="setStatusLed" deviceFilter="self.protectCamera" uiPath="DeviceActions">
+        <Name>Set Status LED</Name>
+        <CallbackMethod>setStatusLed</CallbackMethod>
+        <ConfigUI>
+            <Field id="mode" type="menu" defaultValue="on">
+                <Label>Status LED:</Label>
+                <List>
+                    <Option value="on">On</Option>
+                    <Option value="off">Off</Option>
+                    <Option value="toggle">Toggle</Option>
+                </List>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="setOsdOverlay" deviceFilter="self.protectCamera" uiPath="DeviceActions">
+        <Name>Set OSD Overlay</Name>
+        <CallbackMethod>setOsdOverlay</CallbackMethod>
+        <ConfigUI>
+            <Field id="showName" type="menu" defaultValue="unchanged">
+                <Label>Show camera name:</Label>
+                <List>
+                    <Option value="unchanged">Unchanged</Option>
+                    <Option value="on">On</Option>
+                    <Option value="off">Off</Option>
+                </List>
+            </Field>
+            <Field id="showDate" type="menu" defaultValue="unchanged">
+                <Label>Show date:</Label>
+                <List>
+                    <Option value="unchanged">Unchanged</Option>
+                    <Option value="on">On</Option>
+                    <Option value="off">Off</Option>
+                </List>
+            </Field>
+            <Field id="showLogo" type="menu" defaultValue="unchanged">
+                <Label>Show logo:</Label>
+                <List>
+                    <Option value="unchanged">Unchanged</Option>
+                    <Option value="on">On</Option>
+                    <Option value="off">Off</Option>
+                </List>
+            </Field>
+            <Field id="overlayLocation" type="menu" defaultValue="unchanged">
+                <Label>Overlay location:</Label>
+                <List>
+                    <Option value="unchanged">Unchanged</Option>
+                    <Option value="topLeft">Top left</Option>
+                    <Option value="topMiddle">Top middle</Option>
+                    <Option value="topRight">Top right</Option>
+                    <Option value="bottomLeft">Bottom left</Option>
+                    <Option value="bottomMiddle">Bottom middle</Option>
+                    <Option value="bottomRight">Bottom right</Option>
+                </List>
+            </Field>
+            <Field id="overlayHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+                <Label>Only the fields you change from "Unchanged" are sent. Leaving everything unchanged is rejected - there would be nothing to do.</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="setVideoMode" deviceFilter="self.protectCamera" uiPath="DeviceActions">
+        <Name>Set Video Mode</Name>
+        <CallbackMethod>setVideoMode</CallbackMethod>
+        <ConfigUI>
+            <Field id="videoMode" type="menu">
+                <Label>Video mode:</Label>
+                <List class="self" method="getVideoModeList" dynamicReload="true"/>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="setHdrMode" deviceFilter="self.protectCamera" uiPath="DeviceActions">
+        <Name>Set HDR Mode</Name>
+        <CallbackMethod>setHdrMode</CallbackMethod>
+        <ConfigUI>
+            <Field id="hdrType" type="menu" defaultValue="auto">
+                <Label>HDR mode:</Label>
+                <List>
+                    <Option value="auto">Auto</Option>
+                    <Option value="on">On</Option>
+                    <Option value="off">Off</Option>
+                </List>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="setMicVolume" deviceFilter="self.protectCamera" uiPath="DeviceActions">
+        <Name>Set Microphone Volume</Name>
+        <CallbackMethod>setMicVolume</CallbackMethod>
+        <ConfigUI>
+            <Field id="micVolume" type="textfield" defaultValue="50">
+                <Label>Microphone volume (0-100):</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
     <Action id="refreshCameras">
         <Name>Refresh Cameras</Name>
         <CallbackMethod>refreshCameras</CallbackMethod>
