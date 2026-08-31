@@ -220,7 +220,24 @@ class ProtectAPI:
           naming the camera.
         """
 
-    def get_rtsps_streams(self, camera_id: str) -> dict: ...
+    def get_rtsps_streams(self, camera_id: str) -> dict:
+        """GET /cameras/{id}/rtsps-stream ->
+        {"high": url|None, "medium": url|None, "low": url|None, "package": url|None}.
+        Verified live 2026-08-31: the token was identical across two calls
+        10s apart; rotation over a longer window is untested. `package` is
+        null unless the camera reports `hasPackageCamera`."""
+
+    def create_rtsps_streams(self, camera_id: str, qualities: list[str]) -> dict:
+        """POST /cameras/{id}/rtsps-stream with body {"qualities": [...]}
+        (each entry one of "high"/"medium"/"low"/"package"). CREATES streams
+        for the requested qualities and returns the same four-key object GET
+        returns. Unverified against the reference rig -- GET already
+        returned non-null URLs there.
+
+        Every ProtectAPIError this raises carries body="" unconditionally --
+        unlike every other method in this module, a URL/token could
+        plausibly appear in this endpoint's error body, and it must never
+        be readable off the exception."""
 
     def get_meta_info(self) -> dict:
         """GET /meta/info -> {'applicationVersion': '7.2.105'}.
@@ -232,6 +249,12 @@ both `check_hostname = False` and `verify_mode = ssl.CERT_NONE` (a UNVR serves a
 self-signed cert; this is the normal case, not an error).
 
 **Never log the API key**, including inside exception text or a repr.
+
+**Never log an RTSPS stream URL either** (issue #7) -- it embeds an access
+token, exactly like the API key is a credential. This applies in both
+`protect_api.py` (`create_rtsps_streams`'s `body=""` above) and `plugin.py`
+(`_refresh_stream_urls` logs which qualities came back present, never the
+URL itself).
 
 ---
 
@@ -502,6 +525,10 @@ The declared states are exactly:
 | `osdDateEnabled` | Boolean | camera object's `osdSettings.isDateEnabled` |
 | `connected` | Boolean | **event socket** health, not the camera's |
 | `snapshotPath` | String | path written by the snapshot action |
+| `streamUrlHigh` | String | RTSPS URL, high quality; `""` if opted out, unavailable, or null |
+| `streamUrlMedium` | String | RTSPS URL, medium quality; same rules |
+| `streamUrlLow` | String | RTSPS URL, low quality; same rules |
+| `streamUrlPackage` | String | RTSPS URL, package-camera stream; `""` unless `hasPackageCamera` |
 
 The eight camera-info states above (issue #4) are read straight from the
 cached `GET /cameras` object (`self.camera_info`), not from the WS tracker,
@@ -551,6 +578,40 @@ every single frame forever with nothing visible to say so. The plugin logs
 the first failure per device id at WARNING and every one after that at
 DEBUG, tracked in `self._model_update_warned`, the same one-per-key pattern
 `_reported_ignored_types` already uses for unrecognized event types.
+
+The four stream-URL states above (issue #7) are opt-in per device via the
+`exposeStreamUrls` checkbox (default off) -- the URL embeds an access
+token, so it is treated as a credential, not plain data. `plugin.py`'s
+`_refresh_stream_urls(dev)`:
+
+- When the checkbox is off, unconditionally writes all four states to `""`
+  and does nothing else. This is the one place where "off" must actively
+  *clear* a stored value, not just stop refreshing it -- leaving a stale
+  token in the database after the user opted back out would defeat the
+  point of the checkbox.
+- When on, calls `get_rtsps_streams`. If every quality comes back `None`
+  (streams not yet created on the controller), calls
+  `create_rtsps_streams` with `["high", "medium", "low"]`, plus
+  `"package"` only when the cached camera object's `hasPackageCamera` is
+  true. The POST path is unverified on the reference rig -- GET already
+  returned three non-null URLs there.
+- On `ProtectAPIError`, logs the error and leaves the existing four states
+  untouched -- a transient failure (e.g. a 429) must not blank a stream a
+  viewer is actively using. The log line says the stored URLs may now be
+  stale, so a user with a broken viewer knows to use the **Refresh Stream
+  URLs** action or Send Status Request rather than assume the plugin is
+  wrong forever.
+- On success, logs at INFO only which qualities came back present (e.g.
+  `"Side Path: stream URLs refreshed (high, medium, low)"`) -- never the
+  URL itself, guarded by `_assert_no_url_in_message`, which mirrors
+  `protect_api._assert_no_secret`.
+
+Called from `deviceStartComm` (guarded on `self.api is None`, since it is
+REST and can run before the event socket exists), from `_open_socket` for
+every mapped device after `_refresh_camera_info()` (one extra throttled
+REST call per opted-in camera on every reconnect), from
+`actionControlUniversal`'s `RequestStatus` handler, and from the
+`refreshStreamUrls` action.
 
 `onOffState` (the built-in on/off state) is `motionDetected` OR (the
 per-device `audioCountsAsActivity` checkbox, default True, AND active AUDIO
