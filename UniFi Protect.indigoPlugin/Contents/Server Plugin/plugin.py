@@ -1239,7 +1239,8 @@ class Plugin(indigo.PluginBase):
         note = "the stored URLs may now be stale" if any(current.values()) \
             else "no URLs are stored yet"
         self.logger.error(_assert_no_url_in_message(
-            f"{dev.name}: could not refresh stream URLs ({exc}) - {note}.", current))
+            f"{dev.name}: could not refresh stream URLs "
+            f"({self._describe_api_error(exc)}) - {note}.", current))
 
     def _fill_missing_stream_qualities(self, dev, camera_id, cleaned, missing, current):
         """POST to create the qualities still missing after GET, but only

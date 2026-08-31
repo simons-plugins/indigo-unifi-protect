@@ -227,23 +227,25 @@ class ProtectAPI:
         10s apart; rotation over a longer window is untested. `package` is
         null unless the camera reports `hasPackageCamera`.
 
-        Its own shape-validation error (body not a JSON object) carries
-        body="" unconditionally, same as create_rtsps_streams below -- a
-        malformed body from this endpoint could plausibly echo a URL/token
-        back, and that must never be readable off the exception."""
+        EVERY ProtectAPIError raised here -- from `_get_json` (an HTTP
+        error/transport failure, whose `.body` `_request` would otherwise
+        fill with the real response text) or this method's own shape check
+        -- is re-raised through the module-level `_redact_body(exc)` helper,
+        which copies the exception with `body=""` and everything else
+        (including `kind`) preserved. This endpoint's response can contain
+        a live-stream URL (an access token), and a malformed/error body
+        could plausibly echo one back."""
 
     def create_rtsps_streams(self, camera_id: str, qualities: list[str]) -> dict:
         """POST /cameras/{id}/rtsps-stream with body {"qualities": [...]}
-        (each entry one of "high"/"medium"/"low"/"package"). CREATES streams
-        for the requested qualities and returns the same four-key object GET
-        returns. Unverified against the reference rig -- GET already
-        returned non-null URLs there.
+        (each entry one of "high"/"medium"/"low"/"package"), via `_request`.
+        CREATES streams for the requested qualities and returns the same
+        four-key object GET returns. Unverified against the reference rig
+        -- GET already returned non-null URLs there.
 
-        Every ProtectAPIError this raises carries body="" unconditionally --
-        unlike every other method in this module (except get_rtsps_streams's
-        own shape-validation branch above), a URL/token could plausibly
-        appear in this endpoint's error body, and it must never be readable
-        off the exception."""
+        Same `_redact_body` treatment as get_rtsps_streams above, on every
+        ProtectAPIError this raises (the `_request` call, the JSON parse,
+        and this method's own shape check)."""
 
     def get_meta_info(self) -> dict:
         """GET /meta/info -> {'applicationVersion': '7.2.105'}.
@@ -259,9 +261,9 @@ self-signed cert; this is the normal case, not an error).
 **Never log an RTSPS stream URL either** (issue #7) -- it embeds an access
 token, exactly like the API key is a credential. This applies in both
 `protect_api.py` (`get_rtsps_streams` and `create_rtsps_streams` both
-redact their shape-validation error's `body` to `""`, above) and
-`plugin.py` (every log line `_refresh_stream_urls` emits -- success,
-warning, or error -- passes through `_assert_no_url_in_message`, checked
+redact EVERY ProtectAPIError they raise to `body=""` via `_redact_body`,
+above) and `plugin.py` (every log line `_refresh_stream_urls` emits --
+success, warning, or error -- passes through `_assert_no_url_in_message`, checked
 against both the fresh values from the controller AND the device's
 current stored states, since the error path has no fresh response to
 check).
@@ -653,10 +655,13 @@ REST half accordingly:
     name the quality in a WARNING, `"...kept previous URL for: high"`);
     only when neither exists does the state become `""`.
   - On `ProtectAPIError` from either the GET or the POST, leaves every
-    existing state untouched and logs ERROR — wording depends on whether
-    anything is currently stored: `"the stored URLs may now be stale"` if
-    at least one of the four current states is non-empty, else `"no URLs
-    are stored yet"` (a URL that was never fetched cannot be stale).
+    existing state untouched and logs ERROR, described via
+    `self._describe_api_error(exc)` (issue #6) rather than a raw `str(exc)`
+    dump, same as every other camera-control error line — the outcome note
+    depends on whether anything is currently stored: `"the stored URLs may
+    now be stale"` if at least one of the four current states is
+    non-empty, else `"no URLs are stored yet"` (a URL that was never
+    fetched cannot be stale).
   - On success, logs INFO naming only which qualities ended up present
     (e.g. `"Side Path: stream URLs refreshed (high, medium, low)"`) —
     never a URL. **Every** log line this method emits — the shape error,
@@ -906,6 +911,7 @@ Issue #7 (stream URLs) added, in `test_plugin.py` and `test_protect_api.py`:
   driven through the real Indigo callbacks: opted-out logs INFO and still
   clears the four states; unconfigured (`self.api is None`) logs the
   standard "not configured" ERROR
-- `protect_api.get_rtsps_streams`/`create_rtsps_streams`: a shape error's
-  `.body` is always `""`, tested the same way for both methods, including
-  a body deliberately constructed to contain a token
+- `protect_api.get_rtsps_streams`/`create_rtsps_streams`: every
+  ProtectAPIError's `.body` is always `""` (HTTP error, transport failure,
+  or shape mismatch), tested the same way for both methods, including a
+  body deliberately constructed to contain a token
