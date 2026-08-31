@@ -471,8 +471,11 @@ def test_every_written_state_is_declared_and_legal(fake_indigo):
         # batteryLevel is protectSensor's one NATIVE-property write
         # (SupportsBatteryLevel) -- it is never a declared <State> (asserted
         # above) so it must be excluded here too, or it would show up as
-        # "undeclared".
-        written_states = written - {"batteryLevel"}
+        # "undeclared". Scoped to protectSensor ONLY: if any other device
+        # type ever wrote a batteryLevel key, that would be a real bug (no
+        # other type declares SupportsBatteryLevel) and this exemption must
+        # not hide it.
+        written_states = written - ({"batteryLevel"} if type_id == "protectSensor" else set())
 
         undeclared = written_states - declared
         assert not undeclared, (
@@ -2422,7 +2425,18 @@ def test_poll_devices_with_one_sensor_only_fetches_sensors(fake_indigo):
     plug._poll_devices()   # must not raise touching lights/chimes/nvr
 
 
-def test_sensor_poll_failure_keeps_last_values_and_logs_once_per_outage(fake_indigo, caplog):
+def test_sensor_poll_failure_writes_unavailable_and_keeps_everything_else(fake_indigo, caplog):
+    """Per docs/CONTRACT.md/README: a poll failure PROACTIVELY writes
+    sensorState="unavailable" (so a reader doesn't keep trusting a stale
+    "CONNECTED" the plugin can no longer vouch for) and nothing else -- every
+    other poll-derived key (isOpen, batteryLow, mountType, lastOpenChange,
+    lastPoll, ...) is left completely untouched at its last-written value,
+    not re-derived from the stale cache and not blanked either.
+
+    An earlier version of this test asserted NO new write happened at all on
+    failure, which blessed a real bug: sensorState kept showing a stale
+    "CONNECTED" through an outage with no signal anything was wrong.
+    """
     plug = make_plugin({})
     dev = add_sensor_device(fake_indigo, plug)
 
@@ -2435,7 +2449,10 @@ def test_sensor_poll_failure_keeps_last_values_and_logs_once_per_outage(fake_ind
     plug._last_rest_call = 0.0
     plug._poll_sensors()
     assert dev.states["sensorState"] == "CONNECTED"
-    writes_after_success = len(dev.state_writes)
+    assert dev.states["isOpen"] is False
+    assert dev.states["mountType"] == "door"
+    last_poll_after_success = dev.states["lastPoll"]
+    assert last_poll_after_success
 
     class FailingAPI:
         def get_sensors(self):
@@ -2450,9 +2467,17 @@ def test_sensor_poll_failure_keeps_last_values_and_logs_once_per_outage(fake_ind
 
     error_records = [r for r in caplog.records if r.levelname == "ERROR"]
     assert len(error_records) == 1, "ERROR must log once per class per outage, not per poll"
-    assert dev.states["sensorState"] == "CONNECTED", "last-known value must survive a poll failure"
-    assert len(dev.state_writes) == writes_after_success, (
-        "a failed poll must not write any new state batch -- lastPoll included"
+    assert dev.states["sensorState"] == "unavailable", (
+        "a poll failure must proactively mark the class state unavailable, not leave a "
+        "stale CONNECTED showing with no signal anything is wrong"
+    )
+    assert dev.states["isOpen"] is False, "other poll-derived fields must be left at last-known"
+    assert dev.states["mountType"] == "door", "other poll-derived fields must be left at last-known"
+    assert dev.states["lastPoll"] == last_poll_after_success, "lastPoll must not advance on failure"
+
+    last_batch = dev.state_writes[-1]
+    assert {entry["key"] for entry in last_batch} == {"sensorState", "connected"}, (
+        "a failed poll must write ONLY sensorState and connected, nothing else"
     )
 
 
@@ -2754,3 +2779,853 @@ def test_nvr_rekeys_from_placeholder_to_real_id_on_first_poll(fake_indigo):
     assert plug.nvrs["real-nvr-id"] == {dev.id}
     assert dev.states["armStatus"] == "disabled"
     assert dev.states["protectVersion"] == "7.2.105"
+
+
+# ---------------------------------------------------------------------
+# Review round 2 (silent-failure hunter + test analyst): poll must never
+# be able to kill the motion socket; honest values, never fabricated;
+# reconciliation correctness; action merge semantics; diagnostics.
+# ---------------------------------------------------------------------
+
+def test_pump_routes_sensor_motion_to_sensor_not_camera(fake_indigo):
+    plug = make_plugin({})
+    camera_dev = add_camera_device(fake_indigo, plug, camera_id="cam-1", dev_id=5001)
+    sensor_dev = add_sensor_device(fake_indigo, plug, sensor_id="sensor-1", dev_id=5002)
+    camera_dev.state_writes.clear()
+    sensor_dev.state_writes.clear()
+
+    class OneShotSocket:
+        last_frame_at = time.monotonic()
+
+        def __init__(self):
+            self._sent = False
+
+        def read_message(self, timeout=1.0):
+            if self._sent:
+                raise plug.StopThread()
+            self._sent = True
+            return {"item": {"id": "sm1", "device": "sensor-1", "type": "sensorMotion", "start": 1}}
+
+        def send_ping(self):
+            pass
+
+    plug.socket = OneShotSocket()
+    plug._last_poll = time.monotonic()   # a poll firing mid-test would confuse this assertion
+
+    with pytest.raises(plug.StopThread):
+        plug._pump()
+
+    assert sensor_dev.states["motionDetected"] is True
+    assert len(camera_dev.state_writes) == 0, "a sensor event must never write a camera device"
+
+
+def test_pump_does_not_poll_before_the_interval_elapses(fake_indigo):
+    plug = make_plugin({})
+    add_sensor_device(fake_indigo, plug)
+    poll_calls = []
+    plug._poll_devices = lambda: poll_calls.append(1)
+
+    class QuietSocket:
+        def __init__(self):
+            self.last_frame_at = time.monotonic()
+            self.reads = 0
+
+        def read_message(self, timeout=1.0):
+            self.reads += 1
+            if self.reads > 3:
+                raise plug.StopThread()
+            return None
+
+        def send_ping(self):
+            pass
+
+    plug.socket = QuietSocket()
+    plug._last_poll = time.monotonic()   # just polled
+
+    with pytest.raises(plug.StopThread):
+        plug._pump()
+
+    assert poll_calls == [], "must not poll again before DEVICE_POLL_INTERVAL has elapsed"
+
+
+def test_pump_polls_once_the_interval_has_elapsed(fake_indigo):
+    plug = make_plugin({})
+    add_sensor_device(fake_indigo, plug)
+    poll_calls = []
+    plug._poll_devices = lambda: poll_calls.append(1)
+
+    class QuietSocket:
+        def __init__(self):
+            self.last_frame_at = time.monotonic()
+            self.reads = 0
+
+        def read_message(self, timeout=1.0):
+            self.reads += 1
+            if self.reads > 2:
+                raise plug.StopThread()
+            return None
+
+        def send_ping(self):
+            pass
+
+    plug.socket = QuietSocket()
+    plug._last_poll = time.monotonic() - plugin_module.DEVICE_POLL_INTERVAL - 1
+
+    with pytest.raises(plug.StopThread):
+        plug._pump()
+
+    assert len(poll_calls) >= 1, "must poll once DEVICE_POLL_INTERVAL has elapsed"
+
+
+def test_poll_sensors_calls_get_sensors_exactly_once(fake_indigo):
+    plug = make_plugin({})
+    add_sensor_device(fake_indigo, plug)
+
+    class CountingAPI:
+        def __init__(self):
+            self.calls = 0
+
+        def get_sensors(self):
+            self.calls += 1
+            return [{"id": "sensor-1", "state": "CONNECTED"}]
+
+    api = CountingAPI()
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    plug._poll_sensors()
+
+    assert api.calls == 1
+
+
+def test_two_outages_with_recovery_between_logs_two_errors_one_info(fake_indigo, caplog):
+    plug = make_plugin({})
+    add_sensor_device(fake_indigo, plug)
+
+    class FailingAPI:
+        def get_sensors(self):
+            raise ProtectAPIError("HTTP 500 for /sensors", status=500)
+
+    class WorkingAPI:
+        def get_sensors(self):
+            return [{"id": "sensor-1", "state": "CONNECTED"}]
+
+    with caplog.at_level("DEBUG"):
+        plug.api = FailingAPI()
+        plug._last_rest_call = 0.0
+        plug._poll_sensors()
+
+        plug.api = WorkingAPI()
+        plug._last_rest_call = 0.0
+        plug._poll_sensors()
+
+        plug.api = FailingAPI()
+        plug._last_rest_call = 0.0
+        plug._poll_sensors()
+
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    info_records = [r for r in caplog.records
+                     if r.levelname == "INFO" and "recovered" in r.getMessage()]
+    assert len(error_records) == 2, "each fresh outage must log its own ERROR"
+    assert len(info_records) == 1, "a recovery must log INFO exactly once"
+
+
+def test_request_status_sensor_uses_single_get_not_list(fake_indigo):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)
+
+    class FatalListAPI:
+        def get_sensors(self):
+            raise AssertionError("get_sensors must not be called by RequestStatus")
+
+        def get_sensor(self, sensor_id):
+            self.get_calls = getattr(self, "get_calls", [])
+            self.get_calls.append(sensor_id)
+            return {"id": sensor_id, "state": "CONNECTED"}
+
+    api = FatalListAPI()
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"deviceAction": indigo.kUniversalAction.RequestStatus})()
+    plug.actionControlUniversal(action, dev)
+
+    assert api.get_calls == ["sensor-1"]
+
+
+def test_request_status_light_uses_single_get_not_list(fake_indigo):
+    plug = make_plugin({})
+    dev = add_light_device(fake_indigo, plug)
+
+    class FatalListAPI:
+        def get_lights(self):
+            raise AssertionError("get_lights must not be called by RequestStatus")
+
+        def get_light(self, light_id):
+            self.get_calls = getattr(self, "get_calls", [])
+            self.get_calls.append(light_id)
+            return {"id": light_id, "state": "CONNECTED"}
+
+    api = FatalListAPI()
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"deviceAction": indigo.kUniversalAction.RequestStatus})()
+    plug.actionControlUniversal(action, dev)
+
+    assert api.get_calls == ["light-1"]
+
+
+def test_request_status_chime_uses_single_get_not_list(fake_indigo):
+    plug = make_plugin({})
+    dev = add_chime_device(fake_indigo, plug)
+
+    class FatalListAPI:
+        def get_chimes(self):
+            raise AssertionError("get_chimes must not be called by RequestStatus")
+
+        def get_chime(self, chime_id):
+            self.get_calls = getattr(self, "get_calls", [])
+            self.get_calls.append(chime_id)
+            return {"id": chime_id, "state": "CONNECTED"}
+
+    api = FatalListAPI()
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"deviceAction": indigo.kUniversalAction.RequestStatus})()
+    plug.actionControlUniversal(action, dev)
+
+    assert api.get_calls == ["chime-1"]
+
+
+def test_request_status_nvr_uses_single_get(fake_indigo):
+    plug = make_plugin({})
+    dev = add_nvr_device(fake_indigo, plug)
+
+    class RecordingAPI:
+        def get_nvr(self):
+            self.get_calls = getattr(self, "get_calls", [])
+            self.get_calls.append("nvr")
+            return {"id": "nvr1", "modelKey": "nvr", "name": "UNVR",
+                     "armMode": {"status": "disabled"}}
+
+    api = RecordingAPI()
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"deviceAction": indigo.kUniversalAction.RequestStatus})()
+    plug.actionControlUniversal(action, dev)
+
+    assert api.get_calls == ["nvr"]
+
+
+def test_battery_low_pulse_override_cleared_by_next_poll(fake_indigo):
+    """Deterministic epoch-ms timestamps throughout -- exercising this via
+    two real _poll_sensors() calls (real wall-clock now_ms) would make the
+    "next poll is later than the pulse" precondition a race against however
+    fast the test happens to run."""
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.sensor_info = {"sensor-1": {"state": "CONNECTED",
+                                      "batteryStatus": {"isLow": False, "percentage": 80}}}
+    plug._device_last_poll_ms["sensor-1"] = 1000
+    plug._apply_sensor_state("sensor-1", force=True, poll_timestamp_ms=1000)
+    assert dev.states["batteryLow"] is False
+
+    plug.tracker.handle({"item": {"id": "bl1", "device": "sensor-1", "type": "sensorBatteryLow",
+                                   "start": 1500,
+                                   "metadata": {"sensorBatteryPercentage": {"number": 5}}}})
+    plug._apply_sensor_state("sensor-1", force=True)
+    assert dev.states["batteryLow"] is True, "a pulse newer than the last poll must override"
+
+    # The NEXT poll lands after the pulse -- simulated directly, the way
+    # _poll_sensors would advance _device_last_poll_ms and re-derive state.
+    plug._device_last_poll_ms["sensor-1"] = 2000
+    plug._apply_sensor_state("sensor-1", force=True, poll_timestamp_ms=2000)
+    assert dev.states["batteryLow"] is False, "the next poll must clear a stale pulse override"
+
+
+def test_extreme_values_pulse_updates_temperature(fake_indigo):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.sensor_info = {"sensor-1": {"state": "CONNECTED",
+                                      "stats": {"temperature": {"value": 20.0}}}}
+    plug._device_last_poll_ms["sensor-1"] = 100
+    plug.tracker.handle({"item": {"id": "ex1", "device": "sensor-1", "type": "sensorExtremeValues",
+                                   "start": 200,
+                                   "metadata": {"sensorType": {"text": "temperature"},
+                                                "sensorValue": {"text": 99.5},
+                                                "status": {"text": "high"}}}})
+
+    plug._apply_sensor_state("sensor-1", force=True)
+
+    assert dev.states["temperature"] == 99.5
+
+
+def test_extreme_values_pulse_light_maps_to_light_level_state(fake_indigo):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.sensor_info = {"sensor-1": {"state": "CONNECTED", "stats": {"light": {"value": 10.0}}}}
+    plug._device_last_poll_ms["sensor-1"] = 100
+    plug.tracker.handle({"item": {"id": "ex2", "device": "sensor-1", "type": "sensorExtremeValues",
+                                   "start": 200,
+                                   "metadata": {"sensorType": {"text": "light"},
+                                                "sensorValue": {"text": 5000.0},
+                                                "status": {"text": "high"}}}})
+
+    plug._apply_sensor_state("sensor-1", force=True)
+
+    assert dev.states["lightLevel"] == 5000.0
+
+
+def test_is_open_opened_then_closed_newest_wins(fake_indigo):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.sensor_info = {"sensor-1": {"isOpened": True, "openStatusChangedAt": 100}}
+    plug.tracker.handle({"item": {"id": "op1", "device": "sensor-1", "type": "sensorOpened",
+                                   "start": 200, "metadata": {"sensorMountType": {"text": "door"}}}})
+    plug.tracker.handle({"item": {"id": "cl1", "device": "sensor-1", "type": "sensorClosed",
+                                   "start": 300, "metadata": {"sensorMountType": {"text": "door"}}}})
+
+    plug._apply_sensor_state("sensor-1", force=True)
+
+    assert dev.states["isOpen"] is False, "closed@300 is the newest of opened@200/poll@100/closed@300"
+    assert dev.states["lastOpenChange"] == plugin_module.Plugin._iso_or_empty(300)
+
+
+def test_is_open_closed_then_opened_reverse_order_newest_still_wins(fake_indigo):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.sensor_info = {"sensor-1": {"isOpened": False, "openStatusChangedAt": 100}}
+    plug.tracker.handle({"item": {"id": "cl2", "device": "sensor-1", "type": "sensorClosed",
+                                   "start": 300, "metadata": {"sensorMountType": {"text": "door"}}}})
+    plug.tracker.handle({"item": {"id": "op2", "device": "sensor-1", "type": "sensorOpened",
+                                   "start": 200, "metadata": {"sensorMountType": {"text": "door"}}}})
+
+    plug._apply_sensor_state("sensor-1", force=True)
+
+    assert dev.states["isOpen"] is False, "closed@300 is still newer even handled before opened@200"
+    assert dev.states["lastOpenChange"] == plugin_module.Plugin._iso_or_empty(300)
+
+
+def _load_device_fixture(name):
+    import json
+    from pathlib import Path
+    with open(Path(__file__).parent / "fixtures" / name) as f:
+        return json.load(f)
+
+
+def test_sensors_spec_fixture_drives_write_sensor_states(fake_indigo):
+    sensors = _load_device_fixture("sensors_spec.json")
+    assert sensors, "fixture must actually contain entries"
+    plug = make_plugin({})
+    for i, sensor in enumerate(sensors):
+        dev = add_sensor_device(fake_indigo, plug, sensor_id=sensor["id"], dev_id=6000 + i,
+                                 name=sensor["name"])
+        plug.sensor_info = {sensor["id"]: sensor}
+        plug.socket = object()
+        plug._apply_sensor_state(sensor["id"], force=True)   # must not raise
+        assert dev.states["sensorState"] == sensor["state"]
+
+
+def test_lights_spec_fixture_drives_write_light_states(fake_indigo):
+    lights = _load_device_fixture("lights_spec.json")
+    assert lights
+    plug = make_plugin({})
+    for i, light in enumerate(lights):
+        dev = add_light_device(fake_indigo, plug, light_id=light["id"], dev_id=6100 + i)
+        plug.light_info = {light["id"]: light}
+        plug.socket = object()
+        plug._apply_light_state(light["id"], force=True)   # must not raise
+        assert dev.states["lightState"] == light["state"]
+
+
+def test_chimes_spec_fixture_drives_write_chime_states(fake_indigo):
+    chimes = _load_device_fixture("chimes_spec.json")
+    assert chimes
+    plug = make_plugin({})
+    for i, chime in enumerate(chimes):
+        dev = add_chime_device(fake_indigo, plug, chime_id=chime["id"], dev_id=6200 + i)
+        plug.chime_info = {chime["id"]: chime}
+        plug.socket = object()
+        plug._apply_chime_state(chime["id"], force=True)   # must not raise
+        assert dev.states["chimeState"] == chime["state"]
+
+
+def test_nvrs_spec_fixture_drives_write_nvr_states(fake_indigo):
+    nvr = _load_device_fixture("nvrs_spec.json")
+    assert nvr
+    plug = make_plugin({})
+    dev = add_nvr_device(fake_indigo, plug)
+    plug.nvr_info = nvr
+    plug.socket = object()
+    plug._apply_nvr_state(force=True)   # must not raise
+    assert dev.states["armStatus"] == nvr["armMode"]["status"]
+
+
+def test_disconnect_forces_alarm_and_tamper_false_and_clears_alarm_type(fake_indigo):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.tracker.handle({"item": {"id": "al1", "device": "sensor-1", "type": "sensorAlarm",
+                                   "start": 1, "metadata": {"alarmType": {"text": "smoke"}}}})
+    plug.tracker.handle({"item": {"id": "tm1", "device": "sensor-1", "type": "sensorTamper", "start": 2}})
+    plug._apply_sensor_state("sensor-1", force=True)
+    assert dev.states["alarmTriggered"] is True
+    assert dev.states["alarmType"] == "smoke"
+    assert dev.states["tampered"] is True
+
+    plug._mark_all_disconnected()
+
+    assert dev.states["alarmTriggered"] is False
+    assert dev.states["alarmType"] == ""
+    assert dev.states["tampered"] is False
+
+
+def test_primary_state_leak_drives_on_off_state_end_to_end(fake_indigo):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug, extra_props={"primaryState": "leak"})
+    plug.socket = object()
+    plug.tracker.handle({"item": {"id": "lk1", "device": "sensor-1", "type": "sensorWaterLeak",
+                                   "start": 1, "metadata": {"sensorMountType": {"text": "leak"}}}})
+
+    plug._apply_sensor_state("sensor-1", force=True)
+
+    assert dev.states["leakDetected"] is True
+    assert dev.states["onOffState"] is True
+
+
+def test_primary_state_motion_drives_on_off_state_end_to_end(fake_indigo):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug, extra_props={"primaryState": "motion"})
+    plug.socket = object()
+    plug.tracker.handle({"item": {"id": "sm1", "device": "sensor-1", "type": "sensorMotion", "start": 1}})
+
+    plug._apply_sensor_state("sensor-1", force=True)
+
+    assert dev.states["motionDetected"] is True
+    assert dev.states["onOffState"] is True
+
+
+# -- Item 6: never a fabricated value before the first poll --------------
+
+def test_sensor_before_first_poll_writes_only_lifecycle_and_state_unavailable(fake_indigo):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)   # deviceStartComm -> no info cached yet
+
+    assert dev.states["sensorState"] == "unavailable"
+    for key in ("isOpen", "batteryLow", "mountType", "lastOpenChange", "temperature",
+                "humidity", "lightLevel", "batteryLevel"):
+        assert key not in dev.states, f"{key} must not be fabricated before the first poll"
+
+
+def test_light_before_first_poll_never_writes_on_off_state_false(fake_indigo):
+    """The regression this exists to catch: every restart used to fire
+    'Floodlight turned off' because onOffState was written False before any
+    poll had ever told us isLightOn."""
+    plug = make_plugin({})
+    dev = add_light_device(fake_indigo, plug)
+
+    assert "onOffState" not in dev.states
+    for key in ("isDark", "forceEnabled", "lightMode", "ledLevel"):
+        assert key not in dev.states
+
+
+def test_sensor_primary_open_before_first_poll_omits_on_off_state(fake_indigo):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug, extra_props={"primaryState": "open"})
+
+    assert "onOffState" not in dev.states, (
+        "primaryState=open depends on a poll-derived value (isOpen) and must not "
+        "fabricate onOffState=False before the first poll"
+    )
+
+
+# -- Item 7: connected re-applied after reconnect regardless of poll ------
+
+def test_open_socket_reapplies_connected_true_for_sensors_before_polling(fake_indigo, monkeypatch):
+    """_poll_devices AND _refresh_camera_info are stubbed to no-ops so ONLY
+    the explicit reapply in _open_socket can be responsible for the write --
+    isolates this from whatever _poll_devices/_mark_class_unavailable
+    happens to also do, and from the camera-info REST call this test has no
+    interest in (and no real controller to answer it)."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    plug.startup()
+    dev = add_sensor_device(fake_indigo, plug)
+    dev.states["connected"] = False
+
+    plug._poll_devices = lambda: None
+    plug._refresh_camera_info = lambda: None
+
+    class FakeSocket:
+        last_frame_at = time.monotonic()
+
+        def connect(self):
+            pass
+
+    monkeypatch.setattr(plugin_module, "ProtectEventSocket", lambda *a, **k: FakeSocket())
+
+    plug._open_socket()
+
+    assert dev.states["connected"] is True
+
+
+# -- Item 2: null-safe reads, never write None into a String state -------
+
+def test_battery_status_null_does_not_crash_and_battery_level_is_skipped(fake_indigo):
+    """The exact crash this whole review round chases: JSON `batteryStatus:
+    null` used to raise AttributeError out of _write_sensor_states."""
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.sensor_info = {"sensor-1": {"state": "CONNECTED", "batteryStatus": None}}
+
+    plug._apply_sensor_state("sensor-1", force=True)   # must not raise
+
+    assert dev.states["batteryLow"] is False
+    assert "batteryLevel" not in dev.states
+
+
+def test_sensor_state_null_writes_unavailable_not_none(fake_indigo):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.sensor_info = {"sensor-1": {"state": None}}
+
+    plug._apply_sensor_state("sensor-1", force=True)
+
+    assert dev.states["sensorState"] == "unavailable"
+
+
+def test_nvr_arm_status_null_writes_unavailable_not_none(fake_indigo):
+    plug = make_plugin({})
+    dev = add_nvr_device(fake_indigo, plug)
+    plug.nvr_info = {"id": "nvr1", "modelKey": "nvr", "name": "UNVR", "armMode": {"status": None}}
+
+    plug._apply_nvr_state(force=True)
+
+    assert dev.states["armStatus"] == "unavailable"
+
+
+def test_nvr_arm_mode_not_a_dict_does_not_crash(fake_indigo):
+    plug = make_plugin({})
+    dev = add_nvr_device(fake_indigo, plug)
+    plug.nvr_info = {"id": "nvr1", "modelKey": "nvr", "name": "UNVR", "armMode": "not-a-dict"}
+
+    plug._apply_nvr_state(force=True)   # must not raise
+
+    assert dev.states["armStatus"] == "unavailable"
+
+
+# -- Item 9: DEBUG diagnostics for pulse/poll disagreement ----------------
+
+def test_sensor_open_pulse_discarded_as_stale_logs_debug_with_both_timestamps(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.tracker.handle({"item": {"id": "op1", "device": "sensor-1", "type": "sensorOpened",
+                                   "start": 100, "metadata": {"sensorMountType": {"text": "door"}}}})
+    plug.sensor_info = {"sensor-1": {"isOpened": False, "openStatusChangedAt": 500}}
+
+    with caplog.at_level("DEBUG"):
+        plug._apply_sensor_state("sensor-1", force=True)
+
+    records = [r for r in caplog.records if r.levelname == "DEBUG"
+               and "discarding sensorOpened pulse" in r.getMessage()]
+    assert len(records) == 1
+    assert "start=100" in records[0].getMessage()
+    assert "500" in records[0].getMessage()
+
+
+def test_poll_disagrees_with_idle_tracker_logs_debug(fake_indigo, caplog):
+    plug = make_plugin({})
+    add_sensor_device(fake_indigo, plug)
+
+    class API:
+        def get_sensors(self):
+            return [{"id": "sensor-1", "state": "CONNECTED", "isMotionDetected": True}]
+
+    plug.api = API()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("DEBUG"):
+        plug._poll_sensors()
+
+    records = [r for r in caplog.records if r.levelname == "DEBUG" and "tracker is idle" in r.getMessage()]
+    assert len(records) == 1
+
+
+# -- Item 5: registered id absent from a successful list poll ------------
+
+def test_sensor_absent_from_successful_list_warns_keeps_values_no_last_poll(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = add_sensor_device(fake_indigo, plug)
+
+    class WorkingAPI:
+        def get_sensors(self):
+            return [{"id": "sensor-1", "state": "CONNECTED", "mountType": "door",
+                      "isOpened": True, "openStatusChangedAt": 1}]
+
+    plug.api = WorkingAPI()
+    plug._last_rest_call = 0.0
+    plug._poll_sensors()
+    assert dev.states["sensorState"] == "CONNECTED"
+    last_poll_after_success = dev.states["lastPoll"]
+
+    class EmptyListAPI:
+        def get_sensors(self):
+            return []   # the reference rig's actual behaviour
+
+    plug.api = EmptyListAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("WARNING"):
+        plug._poll_sensors()
+
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warning_records) == 1
+    assert "sensor-1" in warning_records[0].getMessage()
+    assert dev.states["sensorState"] == "unavailable"
+    assert dev.states["mountType"] == "door", "poll-derived fields must be kept at last-known"
+    assert dev.states["lastPoll"] == last_poll_after_success, "lastPoll must not advance"
+
+
+def test_sensor_reappearing_in_list_clears_the_absent_warning(fake_indigo, caplog):
+    plug = make_plugin({})
+    add_sensor_device(fake_indigo, plug)
+
+    class EmptyListAPI:
+        def get_sensors(self):
+            return []
+
+    plug.api = EmptyListAPI()
+    plug._last_rest_call = 0.0
+    with caplog.at_level("WARNING"):
+        plug._poll_sensors()
+        plug._poll_sensors()   # would spam without the guard
+
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+
+    class WorkingAPI:
+        def get_sensors(self):
+            return [{"id": "sensor-1", "state": "CONNECTED"}]
+
+    plug.api = WorkingAPI()
+    plug._last_rest_call = 0.0
+    plug._poll_sensors()
+
+    plug.api = EmptyListAPI()
+    plug._last_rest_call = 0.0
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        plug._poll_sensors()
+
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1, (
+        "the id reappearing must clear the guard so a later absence warns again"
+    )
+
+
+# -- Item 11/12: action merge semantics -----------------------------------
+
+def test_light_turn_on_get_fails_after_successful_patch_merges_and_logs_correctly(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = add_light_device(fake_indigo, plug)
+
+    class PatchOkGetFailsAPI:
+        def patch_light(self, light_id, body):
+            return {"isLightForceEnabled": True}
+
+        def get_light(self, light_id):
+            raise ProtectAPIError("HTTP 500 for /lights/light-1", status=500)
+
+    plug.api = PatchOkGetFailsAPI()
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"deviceAction": indigo.kDeviceAction.TurnOn})()
+    with caplog.at_level("ERROR"):
+        plug.actionControlDevice(action, dev)
+
+    error_messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert any("could not re-read the light" in m for m in error_messages)
+    assert not any("could not set light" in m for m in error_messages), (
+        "a successful PATCH followed by a failed GET is not 'could not set light'"
+    )
+    assert dev.states["forceEnabled"] is True, (
+        "the PATCH response must be merged into the cache even though the re-GET failed"
+    )
+
+
+def test_light_toggle_before_any_poll_gets_first_never_guesses(fake_indigo):
+    plug = make_plugin({})
+    dev = add_light_device(fake_indigo, plug)
+    assert "light-1" not in plug.light_info
+
+    class RecordingAPI:
+        def __init__(self):
+            self.calls = []
+
+        def get_light(self, light_id):
+            self.calls.append(("get", light_id))
+            return {"id": light_id, "isLightForceEnabled": True, "isLightOn": True,
+                     "state": "CONNECTED"}
+
+        def patch_light(self, light_id, body):
+            self.calls.append(("patch", light_id, dict(body)))
+            return {"isLightForceEnabled": body["isLightForceEnabled"]}
+
+    api = RecordingAPI()
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"deviceAction": indigo.kDeviceAction.Toggle})()
+    plug.actionControlDevice(action, dev)
+
+    assert api.calls[0] == ("get", "light-1"), "Toggle before any poll must read before guessing"
+    assert api.calls[1] == ("patch", "light-1", {"isLightForceEnabled": False}), (
+        "cached isLightForceEnabled was True (from the GET) so Toggle must PATCH False"
+    )
+
+
+def test_set_light_level_merges_partial_patch_response_not_replaces(fake_indigo):
+    plug = make_plugin({})
+    dev = add_light_device(fake_indigo, plug)
+    plug.light_info = {"light-1": {"id": "light-1", "isLightOn": True, "state": "CONNECTED",
+                                    "isDark": True}}
+
+    class PartialPatchAPI:
+        def patch_light(self, light_id, body):
+            # A realistic partial PATCH response -- only the changed field.
+            return {"lightDeviceSettings": {"ledLevel": 5}}
+
+    plug.api = PartialPatchAPI()
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"props": {"ledLevel": "5"}})()
+    plug.setLightLevel(action, dev)
+
+    assert plug.light_info["light-1"]["isLightOn"] is True, (
+        "a partial PATCH response must be merged, not replace the whole cache"
+    )
+    assert dev.states["isDark"] is True
+    assert dev.states["ledLevel"] == 5
+
+
+def test_set_light_level_empty_patch_response_is_still_success_and_re_gets(fake_indigo):
+    plug = make_plugin({})
+    dev = add_light_device(fake_indigo, plug)
+
+    class EmptyPatchAPI:
+        def patch_light(self, light_id, body):
+            return None
+
+        def get_light(self, light_id):
+            return {"id": light_id, "isLightOn": True, "state": "CONNECTED",
+                     "lightDeviceSettings": {"ledLevel": 4}}
+
+    plug.api = EmptyPatchAPI()
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"props": {"ledLevel": "4"}})()
+    plug.setLightLevel(action, dev)   # must not error
+
+    assert dev.states["ledLevel"] == 4
+    assert dev.states["onOffState"] is True
+
+
+def test_set_chime_volume_merges_partial_patch_response(fake_indigo):
+    plug = make_plugin({})
+    dev = add_chime_device(fake_indigo, plug)
+    plug.chime_info = {"chime-1": {"id": "chime-1", "state": "CONNECTED",
+                                    "cameraIds": ["cam-a"],
+                                    "ringSettings": [{"cameraId": "cam-a", "repeatTimes": 1,
+                                                       "ringtoneId": "r1", "volume": 10}]}}
+
+    class PartialPatchAPI:
+        def patch_chime(self, chime_id, body):
+            return {"ringSettings": body["ringSettings"]}
+
+    plug.api = PartialPatchAPI()
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"props": {"volume": "80"}})()
+    plug.setChimeVolume(action, dev)
+
+    assert plug.chime_info["chime-1"]["cameraIds"] == ["cam-a"], (
+        "a partial PATCH response must be merged, not replace the whole cache"
+    )
+    assert dev.states["pairedCameraCount"] == 1
+    assert dev.states["ringVolume"] == 80
+
+
+# -- Item 1/3: a poll bug must never be able to kill the motion socket ----
+
+def test_pump_poll_tick_survives_a_write_that_raises_and_still_polls_the_light(fake_indigo):
+    """Fatal-collaborator test, driven through _pump's own poll tick (not
+    calling _poll_devices directly) -- a sensor device whose
+    updateStatesOnServer raises must not escape into _pump/runConcurrentThread
+    (which would be mistaken for an event-socket fault and tear the camera
+    connection down), and the light device (polled right after, in the same
+    _poll_devices cycle) must still get its write."""
+    plug = make_plugin({})
+    sensor_dev = add_sensor_device(fake_indigo, plug)
+
+    def boom(states):
+        raise RuntimeError("Indigo server busy")
+    sensor_dev.updateStatesOnServer = boom
+
+    light_dev = add_light_device(fake_indigo, plug)
+
+    class API:
+        def get_sensors(self):
+            return [{"id": "sensor-1", "state": "CONNECTED"}]
+        def get_lights(self):
+            return [{"id": "light-1", "state": "CONNECTED", "isLightOn": True}]
+
+    plug.api = API()
+    plug._last_rest_call = 0.0
+    plug._last_poll = time.monotonic() - plugin_module.DEVICE_POLL_INTERVAL - 1
+
+    class OneShotSocket:
+        def __init__(self):
+            self.last_frame_at = time.monotonic()
+            self.reads = 0
+        def read_message(self, timeout=1.0):
+            self.reads += 1
+            if self.reads > 1:
+                raise plug.StopThread()
+            return None
+        def send_ping(self):
+            pass
+
+    plug.socket = OneShotSocket()
+
+    with pytest.raises(plug.StopThread):
+        plug._pump()   # must not raise anything OTHER than StopThread
+
+    assert plug.socket is not None, "the event socket must still be open"
+    assert light_dev.states["onOffState"] is True, (
+        "the light poll (same _poll_devices cycle) must still have landed"
+    )
+
+
+def test_non_protect_api_error_from_get_sensors_fetch_does_not_escape(fake_indigo):
+    """A bug in a fake (or in our own code) raising something other than
+    ProtectAPIError from the LIST fetch itself -- not a per-device write --
+    must also never propagate into _poll_devices/_pump."""
+    plug = make_plugin({})
+    add_sensor_device(fake_indigo, plug)
+
+    class BuggyAPI:
+        def get_sensors(self):
+            raise RuntimeError("not a ProtectAPIError at all")
+
+    plug.api = BuggyAPI()
+    plug._last_rest_call = 0.0
+
+    plug._poll_devices()   # must not raise

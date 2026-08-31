@@ -221,6 +221,29 @@ def _camera_info_states(info):
     return states
 
 
+def _as_dict(value):
+    """Type-safe access for a JSON sub-object that might be null, missing,
+    or (a malformed/future API response) simply the wrong type. Never
+    raises. Used everywhere a nested object from a poll response is read,
+    e.g. `_as_dict(info.get("batteryStatus")).get("percentage")` -- unlike
+    `info.get("batteryStatus", {})`, this also survives the key being
+    PRESENT with a JSON `null` value, which the `.get(key, default)` form
+    does not guard (the default only applies when the key is absent)."""
+    return value if isinstance(value, dict) else {}
+
+
+def _state_or_unavailable(info, key="state"):
+    """String state derived from a poll object's own field (cameraState/
+    sensorState/lightState/chimeState/armStatus): STATE_UNAVAILABLE when
+    `info` itself is falsy, OR when the field is present but null/empty --
+    `info.get(key, STATE_UNAVAILABLE)` only substitutes the default when
+    the key is ABSENT, so a field that is present but `None` would
+    otherwise write `None` into what Indigo declares as a String state."""
+    if not info:
+        return STATE_UNAVAILABLE
+    return info.get(key) or STATE_UNAVAILABLE
+
+
 def _assert_no_url_in_message(message, *value_sources):
     """Defensive guard for issue #7, mirroring protect_api.py's
     ``_assert_no_secret``: an RTSPS stream URL embeds an access token and
@@ -280,13 +303,23 @@ class Plugin(indigo.PluginBase):
         # Protect id -> epoch-ms wall-clock time of the last successful poll
         # write for that sensor/light device. Used to decide whether a live
         # pulse (sensorBatteryLow, sensorExtremeValues, lightMotion) is newer
-        # than the last poll and should override the poll baseline.
+        # than the last poll and should override the poll baseline. Captured
+        # BEFORE the poll's REST request goes out (not after it returns) so a
+        # pulse that arrives mid-request is never mistaken for stale, and
+        # only advanced after that device's write is attempted.
         self._device_last_poll_ms = {}
         self._last_poll = 0.0
-        # Which poll classes ("sensor"/"light"/"chime"/"nvr") are currently
-        # in a reported-failure state, so the ERROR log fires once per class
-        # per outage rather than once per poll cycle.
+        # (class_name, exc.kind) -> currently in a reported-failure state,
+        # so the ERROR log fires once per class PER FAILURE KIND per outage
+        # (an auth failure and a transport failure are different problems)
+        # rather than once per poll cycle. A class_name with no failing kind
+        # in this set is healthy.
         self._poll_failed_classes = set()
+        # (class_name, protect_id) currently reported as absent from a
+        # successful list poll (still registered in Indigo, but Protect's
+        # list no longer mentions it) -- so the WARNING fires once per
+        # absence-episode, not once per poll cycle.
+        self._absent_from_list_reported = set()
 
         self._last_rest_call = 0.0
         self._reconnect_requested = False
@@ -683,10 +716,26 @@ class Plugin(indigo.PluginBase):
                 dev = indigo.devices.get(dev_id, None)
                 if dev is not None and dev.enabled:
                     self._prime_stream_urls(dev)
-        # Issue #8: only poll if at least one non-camera device is
-        # registered -- an API that raises if touched (proved by a
-        # fatal-collaborator test) must never be touched when only cameras
-        # exist.
+        # Issue #8: re-apply connected=True immediately for every
+        # registered sensor/light/chime/NVR device, regardless of whether
+        # the poll below succeeds. Without this, a failing first poll after
+        # reconnect leaves these devices reporting connected=False forever
+        # (or until a poll eventually succeeds), even though the event
+        # socket -- what `connected` actually means for every device class
+        # in this plugin -- is genuinely back up. _write_*_states already
+        # writes only the lifecycle booleans/connected/*State=unavailable
+        # when nothing is cached yet, so this is safe to call unconditionally.
+        for sensor_id in list(self.sensors):
+            self._apply_sensor_state(sensor_id, connected=True, force=True)
+        for light_id in list(self.lights):
+            self._apply_light_state(light_id, connected=True, force=True)
+        for chime_id in list(self.chimes):
+            self._apply_chime_state(chime_id, connected=True, force=True)
+        if self.nvrs:
+            self._apply_nvr_state(connected=True, force=True)
+        # Only poll if at least one non-camera device is registered -- an
+        # API that raises if touched (proved by a fatal-collaborator test)
+        # must never be touched when only cameras exist.
         if self.sensors or self.lights or self.chimes or self.nvrs:
             self._poll_devices()
 
@@ -1003,77 +1052,219 @@ class Plugin(indigo.PluginBase):
             self._poll_nvr()
 
     def _report_poll_failure(self, class_name, exc):
-        """ERROR once per class per outage; DEBUG for every failure after
-        the first, so a controller stuck down doesn't spam the Event Log
-        once a minute forever."""
-        if class_name not in self._poll_failed_classes:
-            self._poll_failed_classes.add(class_name)
-            self.logger.error(f"Could not poll {class_name}s: {exc}")
+        """ERROR once per (class, failure kind) per outage; DEBUG for every
+        failure after the first, so a controller stuck down doesn't spam
+        the Event Log once a minute forever. Keyed on `exc.kind` (falling
+        back to the exception's type name for a non-ProtectAPIError) as
+        well as the class, so e.g. an auth failure and a transport failure
+        are each reported once rather than the second masking the first."""
+        kind = getattr(exc, "kind", None) or type(exc).__name__
+        key = (class_name, kind)
+        # _describe_api_error (camera-control error messaging) reads
+        # exc.kind/exc.status/exc.retry_after/exc.issues -- all
+        # ProtectAPIError-only attributes. A non-ProtectAPIError reaching
+        # here (a bug, or a fake in a test) must not raise AttributeError
+        # out of a poll-failure handler, so it gets the plain fallback
+        # instead of that richer formatting.
+        description = (self._describe_api_error(exc) if isinstance(exc, ProtectAPIError)
+                        else f"{type(exc).__name__}: {exc}")
+        if key not in self._poll_failed_classes:
+            self._poll_failed_classes.add(key)
+            self.logger.error(
+                f"Could not poll {class_name}s ({description}) - last-known values are "
+                "held, and the camera event socket is unaffected."
+            )
         else:
-            self.logger.debug(f"Could not poll {class_name}s (still failing): {exc}")
+            self.logger.debug(f"Could not poll {class_name}s (still failing): {description}")
 
     def _clear_poll_failure(self, class_name):
-        self._poll_failed_classes.discard(class_name)
+        """Clears every failure-kind guard for this class and logs INFO
+        once if it was actually failing -- a poll (or a successful
+        single-device RequestStatus) recovering is worth knowing about the
+        same way the failure itself was."""
+        remaining = {key for key in self._poll_failed_classes if key[0] != class_name}
+        had_failure = remaining != self._poll_failed_classes
+        self._poll_failed_classes = remaining
+        if had_failure:
+            self.logger.info(f"{class_name} polling recovered")
+
+    def _mark_class_unavailable(self, registry, state_key):
+        """On a REST poll failure for one class (the fetch itself failed --
+        not a per-id absence from an otherwise-successful list): proactively
+        push `{state_key: unavailable}` + `connected` to every registered
+        device of that class, WITHOUT touching any other state. Poll-derived
+        fields keep their last-written value in Indigo (this method never
+        reads self.sensor_info/etc., so it cannot re-derive them from a
+        stale cache and present that as fresh), and the in-memory cache is
+        left alone by the caller so a live pulse mid-outage can still
+        reconcile against it."""
+        connected = self._is_connected()
+        for protect_id in list(registry):
+            for dev_id in sorted(registry.get(protect_id, ())):
+                dev = indigo.devices.get(dev_id, None)
+                if dev is None or not dev.enabled:
+                    continue
+                try:
+                    dev.updateStatesOnServer([
+                        {"key": state_key, "value": STATE_UNAVAILABLE},
+                        {"key": "connected", "value": connected},
+                    ])
+                except Exception as exc:
+                    self.logger.error(
+                        f"{dev.name}: could not apply polled state "
+                        f"({type(exc).__name__}: {exc}) - the event socket is unaffected"
+                    )
+                    self.logger.debug("polled-state write traceback", exc_info=True)
+
+    def _warn_absent_from_list(self, class_name, protect_id, registry):
+        """A registered id that a successful list poll no longer mentions:
+        the device may have been removed from Protect, or the API simply
+        returned an empty list. WARNING once per (class, id) absence-episode
+        -- cleared by _clear_absent_from_list the moment it reappears."""
+        key = (class_name, protect_id)
+        if key in self._absent_from_list_reported:
+            return
+        self._absent_from_list_reported.add(key)
+        for dev_id in sorted(registry.get(protect_id, ())):
+            dev = indigo.devices.get(dev_id, None)
+            name = dev.name if dev is not None else f"device {dev_id}"
+            self.logger.warning(
+                f"{name}: {class_name} {protect_id} is not in the controller's list - "
+                "removed from Protect, or the API returned an empty list; keeping "
+                "last-known values"
+            )
+
+    def _clear_absent_from_list(self, class_name, protect_id):
+        self._absent_from_list_reported.discard((class_name, protect_id))
 
     def _poll_sensors(self):
+        # Captured BEFORE the request goes out (see docs/CONTRACT.md) -- a
+        # live pulse that arrives while this REST call is in flight must
+        # never be mistaken for older than a poll that, from the pulse's
+        # point of view, hasn't finished yet.
+        now_ms = int(time.time() * 1000)
         try:
             sensors = self._rest(self.api.get_sensors)
         except ProtectAPIError as exc:
             self._report_poll_failure("sensor", exc)
+            self._mark_class_unavailable(self.sensors, "sensorState")
+            return
+        except Exception as exc:
+            # A non-ProtectAPIError here (a bug, or a fake in a test) must
+            # be treated exactly like a ProtectAPIError -- it is still a
+            # poll failure, not grounds to let the exception reach
+            # _poll_devices/_pump and be mistaken for an event-socket fault.
+            self._report_poll_failure("sensor", exc)
+            self.logger.debug("sensor poll traceback", exc_info=True)
+            self._mark_class_unavailable(self.sensors, "sensorState")
             return
         self._clear_poll_failure("sensor")
         self.sensor_info = {s["id"]: s for s in sensors if s.get("id")}
-        now_ms = int(time.time() * 1000)
         for sensor_id in list(self.sensors):
             info = self.sensor_info.get(sensor_id)
-            if info is not None and info.get("isMotionDetected") is False:
+            if info is None:
+                self._warn_absent_from_list("sensor", sensor_id, self.sensors)
+                # No poll_timestamp_ms -- lastPoll must not advance for a
+                # device the list poll didn't actually confirm, and
+                # _device_last_poll_ms is deliberately not touched either.
+                self._apply_sensor_state(sensor_id, force=True)
+                continue
+            self._clear_absent_from_list("sensor", sensor_id)
+            was_active = self.tracker.family_active(FAMILY_SENSOR_MOTION, sensor_id)
+            poll_says_active = info.get("isMotionDetected")
+            if poll_says_active is False and was_active:
                 self.tracker.clear_family(FAMILY_SENSOR_MOTION, sensor_id)
-            self._device_last_poll_ms[sensor_id] = now_ms
+                self.logger.debug(
+                    f"sensor {sensor_id}: poll says motion has stopped - correcting the "
+                    "tracker (a lost 'end' frame would look like this)"
+                )
+            elif poll_says_active is True and not was_active:
+                self.logger.debug(
+                    f"sensor {sensor_id}: poll says motion is active but the tracker is "
+                    "idle - trusting the tracker (a lost 'add' frame would look like this)"
+                )
             self._apply_sensor_state(sensor_id, force=True, poll_timestamp_ms=now_ms)
+            # Advanced only after the write attempt, per docs/CONTRACT.md.
+            self._device_last_poll_ms[sensor_id] = now_ms
 
     def _poll_lights(self):
+        now_ms = int(time.time() * 1000)
         try:
             lights = self._rest(self.api.get_lights)
         except ProtectAPIError as exc:
             self._report_poll_failure("light", exc)
+            self._mark_class_unavailable(self.lights, "lightState")
+            return
+        except Exception as exc:
+            self._report_poll_failure("light", exc)
+            self.logger.debug("light poll traceback", exc_info=True)
+            self._mark_class_unavailable(self.lights, "lightState")
             return
         self._clear_poll_failure("light")
         self.light_info = {l["id"]: l for l in lights if l.get("id")}
-        now_ms = int(time.time() * 1000)
         for light_id in list(self.lights):
-            self._device_last_poll_ms[light_id] = now_ms
+            info = self.light_info.get(light_id)
+            if info is None:
+                self._warn_absent_from_list("light", light_id, self.lights)
+                self._apply_light_state(light_id, force=True)
+                continue
+            self._clear_absent_from_list("light", light_id)
             self._apply_light_state(light_id, force=True, poll_timestamp_ms=now_ms)
+            self._device_last_poll_ms[light_id] = now_ms
 
     def _poll_chimes(self):
+        now_ms = int(time.time() * 1000)
         try:
             chimes = self._rest(self.api.get_chimes)
         except ProtectAPIError as exc:
             self._report_poll_failure("chime", exc)
+            self._mark_class_unavailable(self.chimes, "chimeState")
+            return
+        except Exception as exc:
+            self._report_poll_failure("chime", exc)
+            self.logger.debug("chime poll traceback", exc_info=True)
+            self._mark_class_unavailable(self.chimes, "chimeState")
             return
         self._clear_poll_failure("chime")
         self.chime_info = {c["id"]: c for c in chimes if c.get("id")}
-        now_ms = int(time.time() * 1000)
         for chime_id in list(self.chimes):
-            self._device_last_poll_ms[chime_id] = now_ms
+            info = self.chime_info.get(chime_id)
+            if info is None:
+                self._warn_absent_from_list("chime", chime_id, self.chimes)
+                self._apply_chime_state(chime_id, force=True)
+                continue
+            self._clear_absent_from_list("chime", chime_id)
             self._apply_chime_state(chime_id, force=True, poll_timestamp_ms=now_ms)
+            self._device_last_poll_ms[chime_id] = now_ms
 
     def _poll_nvr(self):
+        now_ms = int(time.time() * 1000)
         try:
             nvr = self._rest(self.api.get_nvr)
         except ProtectAPIError as exc:
             self._report_poll_failure("nvr", exc)
+            self._mark_class_unavailable(self.nvrs, "armStatus")
+            return
+        except Exception as exc:
+            self._report_poll_failure("nvr", exc)
+            self.logger.debug("nvr poll traceback", exc_info=True)
+            self._mark_class_unavailable(self.nvrs, "armStatus")
             return
         self._clear_poll_failure("nvr")
         self.nvr_info = nvr
         self._rekey_nvr(nvr.get("id"))
         try:
             meta = self._rest(self.api.get_meta_info)
-            self._protect_version = meta.get("applicationVersion", "") or ""
-        except ProtectAPIError as exc:
-            # Cosmetic only (protectVersion) -- must never block the arm-
-            # state write above, which is the whole point of this device.
+        except Exception as exc:
+            # Cosmetic only (protectVersion) -- must never block the
+            # arm-state write below, which is the whole point of this
+            # device. Caught broadly, not just ProtectAPIError, for the
+            # same reason every other poll fetch above is.
             self.logger.debug(f"Could not refresh Protect version: {exc}")
-        now_ms = int(time.time() * 1000)
+        else:
+            version = meta.get("applicationVersion") if isinstance(meta, dict) else None
+            if version:
+                self._protect_version = version
         self._apply_nvr_state(force=True, poll_timestamp_ms=now_ms)
 
     def _rekey_nvr(self, real_id):
@@ -1094,6 +1285,22 @@ class Plugin(indigo.PluginBase):
             return datetime.fromtimestamp(epoch_ms / 1000.0).isoformat(timespec="seconds")
         return ""
 
+    def _apply_polled_write(self, dev, write_fn, *args):
+        """Every per-device write for the new (issue #8) device classes goes
+        through here. A write failure (a bad Indigo state value, a server
+        hiccup inside updateStatesOnServer, ...) must NEVER be allowed to
+        propagate up into _poll_devices/_pump/_open_socket -- that would be
+        mistaken for an event-socket fault and tear down the camera
+        connection for a completely unrelated bug in polled-device code."""
+        try:
+            write_fn(dev, *args)
+        except Exception as exc:
+            self.logger.error(
+                f"{dev.name}: could not apply polled state ({type(exc).__name__}: {exc}) - "
+                "the event socket is unaffected"
+            )
+            self.logger.debug("polled-state write traceback", exc_info=True)
+
     # -- Sensor state -----------------------------------------------------
 
     def _apply_sensor_state(self, sensor_id, connected=None, force=False, poll_timestamp_ms=None):
@@ -1103,7 +1310,8 @@ class Plugin(indigo.PluginBase):
             dev = indigo.devices.get(dev_id, None)
             if dev is None or not dev.enabled:
                 continue
-            self._write_sensor_states(dev, sensor_id, connected, force, poll_timestamp_ms)
+            self._apply_polled_write(
+                dev, self._write_sensor_states, sensor_id, connected, force, poll_timestamp_ms)
 
     def _resolve_sensor_primary_state(self, dev, mount_type):
         choice = dev.pluginProps.get("primaryState", "auto")
@@ -1114,32 +1322,53 @@ class Plugin(indigo.PluginBase):
     def _sensor_open_state(self, sensor_id, info):
         """isOpen = poll's isOpened, overridden by whichever of sensorOpened/
         sensorClosed has the newer `start` versus the poll's own
-        openStatusChangedAt (and versus each other, if both exist). Returns
+        openStatusChangedAt -- or, when that field is null (both entries in
+        tests/fixtures/sensors_spec.json have it null; it may simply be
+        common), versus this device's last-poll baseline
+        (_device_last_poll_ms) instead. Without that fallback a single
+        stale pulse wins forever whenever openStatusChangedAt is null,
+        since `None` compares as "always older" against a real timestamp --
+        the fallback makes the override self-expire at the next poll like
+        every other pulse override in this module. Returns
         (is_open, winning_timestamp_ms) -- the timestamp doubles as
         lastOpenChange."""
         is_open = bool(info.get("isOpened")) if info else False
         changed_at = info.get("openStatusChangedAt") if info else None
-        winning_ms = changed_at if isinstance(changed_at, (int, float)) else None
+        if isinstance(changed_at, (int, float)):
+            winning_ms = changed_at
+        else:
+            winning_ms = self._device_last_poll_ms.get(sensor_id)
 
         for pulse_type, value in (("sensorOpened", True), ("sensorClosed", False)):
             pulse = self.tracker.last_pulse(sensor_id, pulse_type)
             start = pulse.get("start") if pulse else None
-            if isinstance(start, (int, float)) and (winning_ms is None or start > winning_ms):
+            if not isinstance(start, (int, float)):
+                continue
+            if winning_ms is None or start > winning_ms:
                 winning_ms = start
                 is_open = value
+            else:
+                self.logger.debug(
+                    f"sensor {sensor_id}: discarding {pulse_type} pulse (start={start}) - "
+                    f"older than the poll baseline ({winning_ms})"
+                )
         return is_open, winning_ms
 
     def _sensor_battery_low(self, sensor_id, info):
         """batteryLow = poll batteryStatus.isLow OR a sensorBatteryLow pulse
         newer than this device's last poll write."""
-        battery_low = False
-        if info:
-            battery_low = bool((info.get("batteryStatus") or {}).get("isLow"))
+        battery_low = bool(_as_dict(info.get("batteryStatus")).get("isLow")) if info else False
         pulse = self.tracker.last_pulse(sensor_id, "sensorBatteryLow")
         start = pulse.get("start") if pulse else None
         last_poll_ms = self._device_last_poll_ms.get(sensor_id)
-        if isinstance(start, (int, float)) and (last_poll_ms is None or start > last_poll_ms):
-            battery_low = True
+        if isinstance(start, (int, float)):
+            if last_poll_ms is None or start > last_poll_ms:
+                battery_low = True
+            else:
+                self.logger.debug(
+                    f"sensor {sensor_id}: discarding sensorBatteryLow pulse (start={start}) - "
+                    f"older than the poll baseline ({last_poll_ms})"
+                )
         return battery_low
 
     def _sensor_metric(self, sensor_id, info, metric_key):
@@ -1151,7 +1380,7 @@ class Plugin(indigo.PluginBase):
         keys and the pulse's metadata.sensorType.text values)."""
         value = None
         if info:
-            raw = ((info.get("stats") or {}).get(metric_key) or {}).get("value")
+            raw = _as_dict(_as_dict(info.get("stats")).get(metric_key)).get("value")
             if isinstance(raw, (int, float)):
                 value = float(raw)
 
@@ -1159,13 +1388,19 @@ class Plugin(indigo.PluginBase):
         if pulse:
             start = pulse.get("start")
             last_poll_ms = self._device_last_poll_ms.get(sensor_id)
-            if isinstance(start, (int, float)) and (last_poll_ms is None or start > last_poll_ms):
-                metadata = pulse.get("metadata") or {}
-                sensor_type = (metadata.get("sensorType") or {}).get("text")
-                if sensor_type == metric_key:
-                    raw = (metadata.get("sensorValue") or {}).get("text")
-                    if isinstance(raw, (int, float)):
-                        value = float(raw)
+            if isinstance(start, (int, float)):
+                if last_poll_ms is None or start > last_poll_ms:
+                    metadata = _as_dict(pulse.get("metadata"))
+                    sensor_type = _as_dict(metadata.get("sensorType")).get("text")
+                    if sensor_type == metric_key:
+                        raw = _as_dict(metadata.get("sensorValue")).get("text")
+                        if isinstance(raw, (int, float)):
+                            value = float(raw)
+                else:
+                    self.logger.debug(
+                        f"sensor {sensor_id}: discarding sensorExtremeValues pulse "
+                        f"(start={start}) - older than the poll baseline ({last_poll_ms})"
+                    )
         return value
 
     def _write_sensor_states(self, dev, sensor_id, connected, force, poll_timestamp_ms):
@@ -1173,53 +1408,80 @@ class Plugin(indigo.PluginBase):
 
         # Lifecycle booleans: live-event-driven, so honesty rule applies --
         # False whenever the socket is down, exactly like camera motion.
+        # Knowable and safe to write even with no poll cache at all -- the
+        # tracker's answer ("no event has happened") is genuine information,
+        # not a fabrication, unlike a poll-derived field we've simply never
+        # read.
         motion_active = self.tracker.family_active(FAMILY_SENSOR_MOTION, sensor_id) if connected else False
         leak_active = self.tracker.family_active(FAMILY_SENSOR_LEAK, sensor_id) if connected else False
         alarm_active = self.tracker.family_active(FAMILY_SENSOR_ALARM, sensor_id) if connected else False
         alarm_types = self.tracker.family_types(FAMILY_SENSOR_ALARM, sensor_id) if connected else set()
         tamper_active = self.tracker.family_active(FAMILY_SENSOR_TAMPER, sensor_id) if connected else False
-
-        # Poll-derived (with live pulse override): kept as last-known when
-        # disconnected, exactly like camera hardware/config states.
-        is_open, open_change_ms = self._sensor_open_state(sensor_id, info)
-        battery_low = self._sensor_battery_low(sensor_id, info)
-        temperature = self._sensor_metric(sensor_id, info, "temperature")
-        humidity = self._sensor_metric(sensor_id, info, "humidity")
-        light_level = self._sensor_metric(sensor_id, info, "light")
-        mount_type = (info or {}).get("mountType") or ""
-
-        primary = self._resolve_sensor_primary_state(dev, mount_type)
-        on_state = {
-            "open": is_open, "motion": motion_active, "leak": leak_active, "alarm": alarm_active,
-        }[primary]
+        last_motion_ms = self.tracker.last_family_ms(FAMILY_SENSOR_MOTION, sensor_id)
 
         states = [
-            {"key": "onOffState", "value": on_state},
-            {"key": "isOpen", "value": is_open},
             {"key": "motionDetected", "value": motion_active},
             {"key": "leakDetected", "value": leak_active},
             {"key": "alarmTriggered", "value": alarm_active},
             {"key": "alarmType", "value": ",".join(sorted(alarm_types))},
             {"key": "tampered", "value": tamper_active},
-            {"key": "batteryLow", "value": battery_low},
-            {"key": "mountType", "value": mount_type},
-            {"key": "sensorState", "value": info.get("state", "") if info else STATE_UNAVAILABLE},
+            {"key": "sensorState", "value": _state_or_unavailable(info)},
             {"key": "connected", "value": connected},
+            {"key": "lastMotion", "value": self._iso_or_empty(last_motion_ms)},
         ]
-        if temperature is not None:
-            states.append({"key": "temperature", "value": temperature})
-        if humidity is not None:
-            states.append({"key": "humidity", "value": humidity})
-        if light_level is not None:
-            states.append({"key": "lightLevel", "value": light_level})
 
-        last_motion_ms = self.tracker.last_family_ms(FAMILY_SENSOR_MOTION, sensor_id)
-        states.append({"key": "lastMotion", "value": self._iso_or_empty(last_motion_ms)})
-        states.append({"key": "lastOpenChange", "value": self._iso_or_empty(open_change_ms)})
+        # Poll-derived (with live pulse override): omitted entirely -- not
+        # written as a fabricated False/"" -- when there is no poll cache
+        # yet (brand-new device before the first poll, a REST failure that
+        # never populated the cache, or an id absent from a successful
+        # list). Kept at last-known when info IS present but the socket is
+        # down, exactly like camera hardware/config states.
+        mount_type = None
+        if info:
+            is_open, open_change_ms = self._sensor_open_state(sensor_id, info)
+            battery_low = self._sensor_battery_low(sensor_id, info)
+            temperature = self._sensor_metric(sensor_id, info, "temperature")
+            humidity = self._sensor_metric(sensor_id, info, "humidity")
+            light_level = self._sensor_metric(sensor_id, info, "light")
+            mount_type = info.get("mountType") or ""
+
+            states.append({"key": "isOpen", "value": is_open})
+            states.append({"key": "batteryLow", "value": battery_low})
+            states.append({"key": "mountType", "value": mount_type})
+            states.append({"key": "lastOpenChange", "value": self._iso_or_empty(open_change_ms)})
+            if temperature is not None:
+                states.append({"key": "temperature", "value": temperature})
+            if humidity is not None:
+                states.append({"key": "humidity", "value": humidity})
+            if light_level is not None:
+                states.append({"key": "lightLevel", "value": light_level})
+
+            battery_pct = _as_dict(info.get("batteryStatus")).get("percentage")
+            if isinstance(battery_pct, (int, float)):
+                # batteryLevel is Indigo's NATIVE property (SupportsBatteryLevel
+                # in Devices.xml) -- deliberately NOT in the `states` batch
+                # above; writing it needs its own updateStateOnServer call.
+                dev.updateStateOnServer("batteryLevel", value=int(battery_pct))
+        else:
+            is_open = None   # unknown -- only a lifecycle-derived primary can drive onOffState
+
+        # onOffState: "open" is the one primary choice backed by a
+        # poll-derived value, so it is only written once we actually have
+        # one -- never a fabricated False before the first poll. "motion"/
+        # "leak"/"alarm" are lifecycle booleans and are always knowable.
+        primary = self._resolve_sensor_primary_state(dev, mount_type or "")
+        lifecycle_by_primary = {"motion": motion_active, "leak": leak_active, "alarm": alarm_active}
+        if primary == "open":
+            on_state = is_open
+        else:
+            on_state = lifecycle_by_primary[primary]
+        if on_state is not None:
+            states.append({"key": "onOffState", "value": on_state})
+
         if poll_timestamp_ms is not None:
             states.append({"key": "lastPoll", "value": self._iso_or_empty(poll_timestamp_ms)})
 
-        if force or on_state != bool(dev.states.get("onOffState", False)):
+        if on_state is not None and (force or on_state != bool(dev.states.get("onOffState", False))):
             if primary == "motion":
                 image = (indigo.kStateImageSel.MotionSensorTripped if on_state
                          else indigo.kStateImageSel.MotionSensor)
@@ -1227,13 +1489,6 @@ class Plugin(indigo.PluginBase):
                 image = indigo.kStateImageSel.SensorOn if on_state else indigo.kStateImageSel.SensorOff
             dev.updateStateImageOnServer(image)
         dev.updateStatesOnServer(states)
-
-        # batteryLevel is Indigo's NATIVE property (SupportsBatteryLevel in
-        # Devices.xml) -- it is deliberately NOT in the `states` batch above;
-        # writing it needs its own updateStateOnServer call.
-        battery_pct = (info or {}).get("batteryStatus", {}).get("percentage") if info else None
-        if isinstance(battery_pct, (int, float)):
-            dev.updateStateOnServer("batteryLevel", value=int(battery_pct))
 
     # -- Light state --------------------------------------------------------
 
@@ -1244,10 +1499,11 @@ class Plugin(indigo.PluginBase):
             dev = indigo.devices.get(dev_id, None)
             if dev is None or not dev.enabled:
                 continue
-            self._write_light_states(dev, light_id, connected, force, poll_timestamp_ms)
+            self._apply_polled_write(
+                dev, self._write_light_states, light_id, connected, force, poll_timestamp_ms)
 
     def _light_last_motion_ms(self, light_id, info):
-        poll_last_motion = (info or {}).get("lastMotion") if info else None
+        poll_last_motion = info.get("lastMotion") if info else None
         pulse = self.tracker.last_pulse(light_id, "lightMotion")
         pulse_start = pulse.get("start") if pulse else None
         if isinstance(pulse_start, (int, float)) and (
@@ -1258,18 +1514,17 @@ class Plugin(indigo.PluginBase):
     def _write_light_states(self, dev, light_id, connected, force, poll_timestamp_ms):
         info = self.light_info.get(light_id)
 
-        # Poll-derived, kept as last-known when disconnected.
-        is_light_on = bool(info.get("isLightOn")) if info else False
-        is_dark = bool(info.get("isDark")) if info else False
-        force_enabled = bool(info.get("isLightForceEnabled")) if info else False
-        light_mode = ((info or {}).get("lightModeSettings") or {}).get("mode") or ""
-        light_state = info.get("state", "") if info else STATE_UNAVAILABLE
+        states = [
+            {"key": "lightState", "value": _state_or_unavailable(info)},
+            {"key": "connected", "value": connected},
+        ]
 
         # pirMotionDetected is the one live-event-influenced field on a
         # light (via the lightMotion pulse) -- treated like a sensor's
         # lifecycle booleans: forced False when the socket is down, per
         # docs/CONTRACT.md pairing it with isMotionDetected under the same
-        # disconnect rule.
+        # disconnect rule. Always knowable (False is genuine information
+        # when the socket is up and nothing has fired), so always written.
         pir_motion = False
         if connected:
             pulse = self.tracker.last_pulse(light_id, "lightMotion")
@@ -1277,28 +1532,38 @@ class Plugin(indigo.PluginBase):
             last_poll_ms = self._device_last_poll_ms.get(light_id)
             if isinstance(start, (int, float)) and (last_poll_ms is None or start > last_poll_ms):
                 pir_motion = True
+            elif isinstance(start, (int, float)):
+                self.logger.debug(
+                    f"light {light_id}: discarding lightMotion pulse (start={start}) - "
+                    f"older than the poll baseline ({last_poll_ms})"
+                )
+                pir_motion = bool(info.get("isPirMotionDetected")) if info else False
             elif info:
                 pir_motion = bool(info.get("isPirMotionDetected"))
-
-        states = [
-            {"key": "onOffState", "value": is_light_on},
-            {"key": "isDark", "value": is_dark},
-            {"key": "pirMotionDetected", "value": pir_motion},
-            {"key": "forceEnabled", "value": force_enabled},
-            {"key": "lightMode", "value": light_mode},
-            {"key": "lightState", "value": light_state},
-            {"key": "connected", "value": connected},
-        ]
-        try:
-            states.append({"key": "ledLevel",
-                            "value": int(((info or {}).get("lightDeviceSettings") or {})["ledLevel"])})
-        except (KeyError, TypeError, ValueError):
-            # Missing or unparseable -- skipped, not defaulted to 0, same
-            # rule as camera micVolume.
-            pass
-
+        states.append({"key": "pirMotionDetected", "value": pir_motion})
         states.append({"key": "lastMotion",
                         "value": self._iso_or_empty(self._light_last_motion_ms(light_id, info))})
+
+        # Poll-derived: omitted (not fabricated) when there is no cache yet.
+        # onOffState is the light's actual LED (isLightOn), with no
+        # lifecycle-boolean fallback at all -- writing False here before the
+        # first poll is exactly the "every restart fires 'Floodlight turned
+        # off'" bug this gate exists to prevent.
+        if info:
+            is_light_on = bool(info.get("isLightOn"))
+            states.append({"key": "onOffState", "value": is_light_on})
+            states.append({"key": "isDark", "value": bool(info.get("isDark"))})
+            states.append({"key": "forceEnabled", "value": bool(info.get("isLightForceEnabled"))})
+            states.append({"key": "lightMode",
+                            "value": _as_dict(info.get("lightModeSettings")).get("mode") or ""})
+            try:
+                states.append({"key": "ledLevel",
+                                "value": int(_as_dict(info.get("lightDeviceSettings"))["ledLevel"])})
+            except (KeyError, TypeError, ValueError):
+                # Missing or unparseable -- skipped, not defaulted to 0, same
+                # rule as camera micVolume.
+                pass
+
         if poll_timestamp_ms is not None:
             states.append({"key": "lastPoll", "value": self._iso_or_empty(poll_timestamp_ms)})
 
@@ -1324,22 +1589,52 @@ class Plugin(indigo.PluginBase):
         elif action.deviceAction == indigo.kDeviceAction.TurnOff:
             force_enabled = False
         elif action.deviceAction == indigo.kDeviceAction.Toggle:
-            cached = self.light_info.get(light_id) or {}
-            force_enabled = not bool(cached.get("isLightForceEnabled"))
+            # Never guess before a poll: if nothing is cached yet (e.g.
+            # right after startup), read the light first rather than
+            # assuming isLightForceEnabled is False.
+            cached = self.light_info.get(light_id)
+            if cached is None:
+                try:
+                    cached = self._rest(self.api.get_light, light_id)
+                except ProtectAPIError as exc:
+                    self.logger.error(f"{dev.name}: could not read the light to toggle it ({exc})")
+                    return
+                self.light_info[light_id] = cached
+            force_enabled = not bool((cached or {}).get("isLightForceEnabled"))
         else:
             return
 
         try:
-            self._rest(self.api.patch_light, light_id, {"isLightForceEnabled": force_enabled})
-            info = self._rest(self.api.get_light, light_id)
+            patch_response = self._rest(self.api.patch_light, light_id,
+                                         {"isLightForceEnabled": force_enabled})
         except ProtectAPIError as exc:
             self.logger.error(f"{dev.name}: could not set light ({exc})")
             return
 
-        self.light_info[light_id] = info
+        # The PATCH itself succeeded -- merge its response (which may be
+        # partial) into the cache immediately, so even if the re-GET below
+        # fails we don't lose the fact that the force flag actually changed.
+        cached = self.light_info.get(light_id) or {}
+        if isinstance(patch_response, dict) and patch_response:
+            self.light_info[light_id] = {**cached, **patch_response}
+        else:
+            self.light_info[light_id] = {**cached, "isLightForceEnabled": force_enabled}
+
+        try:
+            info = self._rest(self.api.get_light, light_id)
+        except ProtectAPIError as exc:
+            self.logger.error(
+                f"{dev.name}: force flag set, but could not re-read the light ({exc}) - "
+                "states may be stale until the next poll"
+            )
+            info = None
+
+        if info:
+            self.light_info[light_id] = info
+
         now_ms = int(time.time() * 1000)
-        self._device_last_poll_ms[light_id] = now_ms
         self._apply_light_state(light_id, force=True, poll_timestamp_ms=now_ms)
+        self._device_last_poll_ms[light_id] = now_ms
         if force_enabled:
             self.logger.info(f"{dev.name}: force-enabled")
         else:
@@ -1367,16 +1662,36 @@ class Plugin(indigo.PluginBase):
             return
 
         try:
-            info = self._rest(self.api.patch_light, light_id,
-                               {"lightDeviceSettings": {"ledLevel": level}})
+            response = self._rest(self.api.patch_light, light_id,
+                                   {"lightDeviceSettings": {"ledLevel": level}})
         except ProtectAPIError as exc:
             self.logger.error(f"{dev.name}: could not set LED level ({exc})")
             return
 
-        self.light_info[light_id] = info
+        cached = self.light_info.get(light_id) or {}
+        if isinstance(response, dict) and response:
+            # Merge, never replace -- a PATCH response can be a partial
+            # object, and replacing the cache with it would silently drop
+            # every other previously-known field.
+            self.light_info[light_id] = {**cached, **response}
+        else:
+            # A None/empty PATCH response is still a success (some PATCH
+            # endpoints return nothing useful) -- re-GET for an
+            # authoritative view rather than guessing the new shape.
+            try:
+                info = self._rest(self.api.get_light, light_id)
+            except ProtectAPIError as exc:
+                self.logger.error(
+                    f"{dev.name}: LED level set, but could not re-read the light ({exc}) - "
+                    "states may be stale until the next poll"
+                )
+                info = None
+            if info:
+                self.light_info[light_id] = info
+
         now_ms = int(time.time() * 1000)
-        self._device_last_poll_ms[light_id] = now_ms
         self._apply_light_state(light_id, force=True, poll_timestamp_ms=now_ms)
+        self._device_last_poll_ms[light_id] = now_ms
         self.logger.info(f"{dev.name}: LED level set to {level}")
 
     # -- Chime state --------------------------------------------------------
@@ -1388,18 +1703,19 @@ class Plugin(indigo.PluginBase):
             dev = indigo.devices.get(dev_id, None)
             if dev is None or not dev.enabled:
                 continue
-            self._write_chime_states(dev, chime_id, connected, force, poll_timestamp_ms)
+            self._apply_polled_write(
+                dev, self._write_chime_states, chime_id, connected, force, poll_timestamp_ms)
 
     def _write_chime_states(self, dev, chime_id, connected, force, poll_timestamp_ms):
         info = self.chime_info.get(chime_id)
         states = [
-            {"key": "chimeState", "value": info.get("state", "") if info else STATE_UNAVAILABLE},
+            {"key": "chimeState", "value": _state_or_unavailable(info)},
             {"key": "connected", "value": connected},
         ]
         if info:
             states.append({"key": "pairedCameraCount", "value": len(info.get("cameraIds") or [])})
             ring_settings = info.get("ringSettings") or []
-            if ring_settings:
+            if ring_settings and isinstance(ring_settings[0], dict):
                 try:
                     states.append({"key": "ringVolume", "value": int(ring_settings[0]["volume"])})
                 except (KeyError, TypeError, ValueError):
@@ -1437,15 +1753,28 @@ class Plugin(indigo.PluginBase):
         new_settings = [dict(entry, volume=volume) for entry in ring_settings]
 
         try:
-            info = self._rest(self.api.patch_chime, chime_id, {"ringSettings": new_settings})
+            response = self._rest(self.api.patch_chime, chime_id, {"ringSettings": new_settings})
         except ProtectAPIError as exc:
             self.logger.error(f"{dev.name}: could not set chime volume ({exc})")
             return
 
-        self.chime_info[chime_id] = info
+        if isinstance(response, dict) and response:
+            self.chime_info[chime_id] = {**cached, **response}
+        else:
+            try:
+                info = self._rest(self.api.get_chime, chime_id)
+            except ProtectAPIError as exc:
+                self.logger.error(
+                    f"{dev.name}: chime volume set, but could not re-read the chime ({exc}) - "
+                    "states may be stale until the next poll"
+                )
+                info = None
+            if info:
+                self.chime_info[chime_id] = info
+
         now_ms = int(time.time() * 1000)
-        self._device_last_poll_ms[chime_id] = now_ms
         self._apply_chime_state(chime_id, force=True, poll_timestamp_ms=now_ms)
+        self._device_last_poll_ms[chime_id] = now_ms
         self.logger.info(f"{dev.name}: ring volume set to {volume}")
 
     # -- NVR state ------------------------------------------------------
@@ -1458,19 +1787,29 @@ class Plugin(indigo.PluginBase):
             dev = indigo.devices.get(dev_id, None)
             if dev is None or not dev.enabled:
                 continue
-            self._write_nvr_states(dev, connected, force, poll_timestamp_ms)
+            self._apply_polled_write(dev, self._write_nvr_states, connected, force, poll_timestamp_ms)
 
     def _write_nvr_states(self, dev, connected, force, poll_timestamp_ms):
         info = self.nvr_info
-        states = [{"key": "connected", "value": connected}]
+        arm_mode = _as_dict(info.get("armMode")) if info else {}
+        arm_status = (arm_mode.get("status") or STATE_UNAVAILABLE) if info else STATE_UNAVAILABLE
+
+        states = [
+            {"key": "armStatus", "value": arm_status},
+            {"key": "connected", "value": connected},
+        ]
         if info:
-            arm_mode = info.get("armMode") or {}
             states.append({"key": "nvrName", "value": info.get("name") or ""})
             model = info.get("type")
             if model:
                 states.append({"key": "nvrModel", "value": str(model)})
-            states.append({"key": "protectVersion", "value": self._protect_version})
-            states.append({"key": "armStatus", "value": arm_mode.get("status", STATE_UNAVAILABLE)})
+            # protectVersion is written only once /meta/info has EVER
+            # succeeded (self._protect_version starts "" and is only ever
+            # updated on a successful get_meta_info -- see _poll_nvr) --
+            # never a fabricated value from a poll that only refreshed the
+            # arm state.
+            if self._protect_version:
+                states.append({"key": "protectVersion", "value": self._protect_version})
             states.append({"key": "armedAt", "value": self._iso_or_empty(arm_mode.get("armedAt"))})
             states.append({"key": "breachDetectedAt",
                             "value": self._iso_or_empty(arm_mode.get("breachDetectedAt"))})
@@ -1478,8 +1817,6 @@ class Plugin(indigo.PluginBase):
                 states.append({"key": "breachEventCount", "value": int(arm_mode.get("breachEventCount", 0))})
             except (TypeError, ValueError):
                 pass
-        else:
-            states.append({"key": "armStatus", "value": STATE_UNAVAILABLE})
         if poll_timestamp_ms is not None:
             states.append({"key": "lastPoll", "value": self._iso_or_empty(poll_timestamp_ms)})
         dev.updateStatesOnServer(states)
@@ -1487,7 +1824,6 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
     # Actions and menu items
     # ------------------------------------------------------------------
-
     def actionControlUniversal(self, action, dev):
         """Devices.xml sets SupportsStatusRequest, so Indigo shows "Send Status
         Request" on every device type. Declaring the capability and then doing
@@ -1533,12 +1869,18 @@ class Plugin(indigo.PluginBase):
         except ProtectAPIError as exc:
             self.logger.error(f"{dev.name}: could not refresh ({exc})")
             return
+        # A successful single-device read is as good evidence of recovery
+        # as a successful list poll -- clear the same guard so a user who
+        # fixes the controller and immediately hits "Send Status Request"
+        # isn't left staring at a stale ERROR from the last list-poll outage.
+        self._clear_poll_failure("sensor")
         self.sensor_info[sensor_id] = info
-        if info.get("isMotionDetected") is False:
+        was_active = self.tracker.family_active(FAMILY_SENSOR_MOTION, sensor_id)
+        if info.get("isMotionDetected") is False and was_active:
             self.tracker.clear_family(FAMILY_SENSOR_MOTION, sensor_id)
         now_ms = int(time.time() * 1000)
-        self._device_last_poll_ms[sensor_id] = now_ms
         self._apply_sensor_state(sensor_id, force=True, poll_timestamp_ms=now_ms)
+        self._device_last_poll_ms[sensor_id] = now_ms
         self.logger.info(f"{dev.name}: refreshed")
 
     def _request_status_light(self, dev):
@@ -1554,10 +1896,11 @@ class Plugin(indigo.PluginBase):
         except ProtectAPIError as exc:
             self.logger.error(f"{dev.name}: could not refresh ({exc})")
             return
+        self._clear_poll_failure("light")
         self.light_info[light_id] = info
         now_ms = int(time.time() * 1000)
-        self._device_last_poll_ms[light_id] = now_ms
         self._apply_light_state(light_id, force=True, poll_timestamp_ms=now_ms)
+        self._device_last_poll_ms[light_id] = now_ms
         self.logger.info(f"{dev.name}: refreshed")
 
     def _request_status_chime(self, dev):
@@ -1573,10 +1916,11 @@ class Plugin(indigo.PluginBase):
         except ProtectAPIError as exc:
             self.logger.error(f"{dev.name}: could not refresh ({exc})")
             return
+        self._clear_poll_failure("chime")
         self.chime_info[chime_id] = info
         now_ms = int(time.time() * 1000)
-        self._device_last_poll_ms[chime_id] = now_ms
         self._apply_chime_state(chime_id, force=True, poll_timestamp_ms=now_ms)
+        self._device_last_poll_ms[chime_id] = now_ms
         self.logger.info(f"{dev.name}: refreshed")
 
     def _request_status_nvr(self, dev):
@@ -1588,6 +1932,7 @@ class Plugin(indigo.PluginBase):
         except ProtectAPIError as exc:
             self.logger.error(f"{dev.name}: could not refresh ({exc})")
             return
+        self._clear_poll_failure("nvr")
         self.nvr_info = info
         self._rekey_nvr(info.get("id"))
         now_ms = int(time.time() * 1000)
