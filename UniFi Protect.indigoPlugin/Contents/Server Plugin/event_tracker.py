@@ -16,13 +16,15 @@ See docs/CONTRACT.md, section `event_tracker.py`, for the binding spec.
 
 from collections import deque
 
-# item.type values, per Protect's OpenAPI spec. Only smartDetectZone and
+# item.type values. Source: UniFi Protect Integration API OpenAPI spec
+# v6.2.83 (developer.ui.com), vendored as docs/protect-openapi-v6.2.83.json
+# by PR #10; verified against Protect 7.2.105. Only smartDetectZone and
 # smartAudioDetect have been observed live on the reference rig (see
-# docs/CONTRACT.md); motion, smartDetectLine and smartDetectLoiterZone are
-# taken from the published spec, not proven on the wire, but share the same
-# add/update/end lifecycle so they are routed identically. `motion` is the
-# plain (non-smart) camera motion event and carries no smartDetectTypes at
-# all -- that is expected, not malformed.
+# docs/CONTRACT.md); motion, smartDetectLine and smartDetectLoiterZone come
+# from the spec, not proven on the wire, but share the same add/update/end
+# lifecycle so they are routed identically. `motion` is the plain (non-smart)
+# camera motion event and carries no smartDetectTypes at all -- that is
+# expected, not malformed.
 MOTION_EVENT_TYPES = frozenset({
     "motion", "smartDetectZone", "smartDetectLine", "smartDetectLoiterZone",
 })
@@ -51,6 +53,13 @@ _TYPE_TO_FAMILY.update({t: _FAMILY_AUDIO for t in AUDIO_EVENT_TYPES})
 # not a string -- distinct from any real (if unrecognized) type string.
 MISSING_TYPE_KEY = "<missing>"
 
+# Cap on distinct keys tracked by ignored_type_counts/ignored_type_samples.
+# A stream sending an unbounded variety of item.type strings (or a
+# misbehaving one) would otherwise grow these dicts without bound; past the
+# cap, every NEW key is folded into OTHER_TYPE_KEY instead.
+MAX_IGNORED_TYPE_KEYS = 64
+OTHER_TYPE_KEY = "<other>"
+
 
 class EventTracker:
     """Tracks Protect MOTION and AUDIO events and derives per-camera state.
@@ -78,8 +87,11 @@ class EventTracker:
     masquerading as motion, which is exactly what happened to audio events
     before `item.type` was inspected at all. An ignored frame is NOT
     malformed -- it parsed fine, it just isn't a family we act on -- so it
-    does not move `malformed_count` or `dropped_terminal_count`, and an
-    `end` frame of an unknown type still creates or finishes nothing.
+    does not move `malformed_count` or `dropped_terminal_count`. The one
+    exception: an `end` frame for an id this tracker is actively holding
+    still finishes that event regardless of what (or whether) `item.type`
+    says -- see `_finish` below. An `end` frame of an unrecognized type for
+    an id never seen creates/finishes nothing, same as before.
 
     `handle()` reports a camera as changed when ANY of four independent
     things moved as a result of the message: the motion active/idle flag,
@@ -107,10 +119,19 @@ class EventTracker:
        `end`) rather than silently swallowed.
     4. An unrecognized `item.type` must never be folded into either family's
        state -- it is counted (`ignored_type_counts`) and otherwise ignored,
-       not treated as a malformed frame and not treated as motion.
+       not treated as a malformed frame and not treated as motion. But (a
+       real bug, fixed) this must NOT extend to an `end` frame for an id the
+       tracker is already holding: a missing/wrong-family `item.type` on
+       that specific frame must not be allowed to lose the lifecycle signal
+       and leave the camera stuck active forever with no diagnostic.
 
-    Event ids are globally unique across both families (motion ids are
-    UUIDs, audio ids are 24-char hex), so the finished-id cache is shared.
+    Event id formats observed differ (motion ids are UUIDs, audio ids are
+    24-char hex -- one sample each), so the finished-id cache and the
+    active-event index (`_active_index`, event_id -> (family, device)) are
+    shared across both families rather than kept separately. If they ever
+    collided, an audio `end` would suppress a later motion `add` carrying
+    that same id via the trap-2 path -- worth knowing, not currently
+    observed.
     """
 
     def __init__(self, finished_cap: int = 512) -> None:
@@ -123,6 +144,13 @@ class EventTracker:
         # that family.
         self._active_events: dict = {_FAMILY_MOTION: {}, _FAMILY_AUDIO: {}}
 
+        # event_id -> (family, device) for every event currently present in
+        # _active_events. Shared across both families (ids are unique) so
+        # `_finish` can resolve an event's REAL family/device without
+        # trusting the terminating frame's own (possibly missing or wrong)
+        # item.type -- see class docstring, trap 4.
+        self._active_index: dict = {}
+
         # family -> camera_id -> most recent epoch-ms `start` seen for that
         # camera in that family, active or not.
         self._last_seen: dict = {_FAMILY_MOTION: {}, _FAMILY_AUDIO: {}}
@@ -132,6 +160,9 @@ class EventTracker:
         self._malformed_count = 0
         self._dropped_terminal_count = 0
         self._ignored_type_counts: dict = {}
+        # key -> first device id seen sending that ignored type. Lets a log
+        # line point at which camera actually sent it.
+        self._ignored_type_samples: dict = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -140,11 +171,11 @@ class EventTracker:
     def handle(self, message: dict) -> set:
         """Apply one WS message. Return the set of camera ids that changed.
 
-        Never raises: any malformed input is silently ignored and yields an
-        empty set, which is also the correct (no-op) result for a duplicate
-        or stale frame, or a frame of an unrecognized `item.type`. These
-        cases are NOT the same thing and an empty set alone can't tell them
-        apart -- `malformed_count`, `dropped_terminal_count`, and
+        Never raises: any malformed input is ignored (and counted) and
+        yields an empty set, which is also the correct (no-op) result for a
+        duplicate or stale frame, or a frame of an unrecognized `item.type`.
+        These cases are NOT the same thing and an empty set alone can't tell
+        them apart -- `malformed_count`, `dropped_terminal_count`, and
         `ignored_type_counts` are the voice for "a frame was destroyed and
         may have lost an event" and "a frame arrived for an event family we
         don't act on", as opposed to "nothing changed".
@@ -177,8 +208,19 @@ class EventTracker:
         family, keyed by the type string (`"<missing>"` when absent or not a
         string). These frames parsed fine -- they are NOT malformed -- they
         just aren't a family this tracker folds into motion or audio state.
-        A copy, so callers can't mutate tracker-internal state through it."""
+        Capped at `MAX_IGNORED_TYPE_KEYS` distinct keys; anything past that
+        is folded into `OTHER_TYPE_KEY`. A copy, so callers can't mutate
+        tracker-internal state through it."""
         return dict(self._ignored_type_counts)
+
+    @property
+    def ignored_type_samples(self) -> dict:
+        """First-seen device id for each key in `ignored_type_counts` --
+        `"unknown"` when the frame's own `device` field was itself
+        missing/invalid. Lets a log line point at which camera actually
+        sent an ignored type. A copy, for the same reason
+        `ignored_type_counts` returns one."""
+        return dict(self._ignored_type_samples)
 
     def is_active(self, camera_id: str) -> bool:
         """True while >=1 unfinished MOTION event references this camera."""
@@ -198,8 +240,9 @@ class EventTracker:
         """True while >=1 unfinished AUDIO event references this camera.
 
         An audio event counts as active from its `add` onward even before
-        it is classified -- the `add` frame's `smartDetectTypes` is always
-        empty, with the real types arriving on a later `update`."""
+        it is classified -- the `add` frame's `smartDetectTypes` was empty
+        in the one live capture (frame 3); the code does not rely on it,
+        with the real types arriving on a later `update`."""
         return self._is_active(_FAMILY_AUDIO, camera_id)
 
     def audio_types(self, camera_id: str) -> set:
@@ -232,6 +275,7 @@ class EventTracker:
         self._finished_order.clear()
         self._active_events[_FAMILY_MOTION].clear()
         self._active_events[_FAMILY_AUDIO].clear()
+        self._active_index.clear()
         self._last_seen[_FAMILY_MOTION].clear()
         self._last_seen[_FAMILY_AUDIO].clear()
 
@@ -255,16 +299,30 @@ class EventTracker:
             self._malformed_count += 1
             return set()
 
+        # A held id's `end` must finish that event no matter what item.type
+        # says. A real bug let an audio-typed (or type-missing) end frame
+        # for a MOTION id fall straight into the ignore-and-count branch
+        # below and get lost with zero diagnostics, leaving the camera
+        # stuck active forever. `_active_index` is authoritative for "which
+        # family is this id actually tracked under" -- the frame's own type
+        # is not. Runs BEFORE type classification/ignoring on purpose; only
+        # fires for an id we are actually holding, so an end for a type we
+        # don't recognize AND have never seen still falls through to the
+        # ignore-and-count branch below, unchanged.
+        event_id = item.get("id")
+        if (item.get("end") is not None and isinstance(event_id, str)
+                and event_id in self._active_index):
+            return self._finish(event_id)
+
         raw_type = item.get("type")
         family = _TYPE_TO_FAMILY.get(raw_type) if isinstance(raw_type, str) else None
         if family is None:
             # Not malformed: the frame parsed fine, it just isn't a family
             # this tracker acts on. Return immediately -- an unrecognized
-            # type must never reach _parse_item/_activate/_finish, so it can
-            # never be folded into either family's state, and an `end` of an
-            # unknown type creates/finishes nothing.
+            # type must never reach _parse_item/_activate, so it can never
+            # be folded into either family's state.
             key = raw_type if isinstance(raw_type, str) else MISSING_TYPE_KEY
-            self._ignored_type_counts[key] = self._ignored_type_counts.get(key, 0) + 1
+            self._count_ignored(key, item)
             return set()
 
         parsed = self._parse_item(item)
@@ -276,7 +334,7 @@ class EventTracker:
         device, event_id, types, start, end = parsed
 
         if end is not None:
-            result = self._finish(family, device, event_id)
+            result = self._finish(event_id)
         else:
             result = self._activate(family, device, event_id, types)
 
@@ -290,6 +348,17 @@ class EventTracker:
                 last_seen[device] = start
 
         return result
+
+    def _count_ignored(self, key: str, item: dict) -> None:
+        """Bump `ignored_type_counts[key]` and, the first time this key is
+        seen, record which device sent it. See MAX_IGNORED_TYPE_KEYS for the
+        distinct-key cap."""
+        if key not in self._ignored_type_counts and len(self._ignored_type_counts) >= MAX_IGNORED_TYPE_KEYS:
+            key = OTHER_TYPE_KEY
+        self._ignored_type_counts[key] = self._ignored_type_counts.get(key, 0) + 1
+        if key not in self._ignored_type_samples:
+            device = item.get("device")
+            self._ignored_type_samples[key] = device if isinstance(device, str) and device else "unknown"
 
     @staticmethod
     def _parse_item(item):
@@ -323,18 +392,21 @@ class EventTracker:
     def _safe_type_set(raw) -> set:
         """Best-effort extraction of smartDetectTypes.
 
-        A missing/non-list value, or a list containing an unhashable
-        element (e.g. `{"type": "person"}` instead of `"person"`), degrades
-        to an empty set rather than raising -- never let a types problem
-        discard the frame carrying it. A plain `motion` event has no
-        smartDetectTypes key at all and degrades the same way.
+        Only string elements are kept; anything else (an unhashable dict
+        like `{"type": "person"}`, a stray int, `None`, ...) is dropped
+        rather than raising or being kept as-is. A non-string element that
+        survived into this set would otherwise reach plugin.py's
+        `_write_states` -- `sorted()` and `",".join()` there raise
+        `TypeError` on a mixed list, which would escape `_pump`, tear the
+        event socket down, and wipe every camera's live state on
+        reconnect. That is the opposite of what trap 3 exists to prevent,
+        so it is enforced here instead of trusted to the caller. A
+        missing/non-list value degrades to an empty set the same way -- a
+        plain `motion` event has no smartDetectTypes key at all.
         """
         if not isinstance(raw, list):
             return set()
-        try:
-            return set(raw)
-        except TypeError:
-            return set()
+        return {element for element in raw if isinstance(element, str)}
 
     @staticmethod
     def _union_types(cam_events: dict) -> set:
@@ -365,6 +437,7 @@ class EventTracker:
         before_types = self._union_types(cam_events)
 
         cam_events[event_id] = frozenset(types)
+        self._active_index[event_id] = (family, device)
 
         after_types = self._union_types(cam_events)
 
@@ -376,23 +449,36 @@ class EventTracker:
             return {device}
         return set()
 
-    def _finish(self, family: str, device: str, event_id: str) -> set:
-        cam_events = self._active_events[family].get(device)
-        was_tracked_active = cam_events is not None and event_id in cam_events
-
+    def _finish(self, event_id: str) -> set:
+        """Mark event_id finished, in whichever family/camera the shared
+        `_active_index` says it belongs to -- NOT whichever family the
+        terminating frame itself claims. A frame's own `item.type` can be
+        missing, wrong, or (the bug this exists to fix) name the OTHER
+        family; the index is built from that event's own `add`/`update`
+        and is authoritative. An id not present in the index (never seen,
+        or already finished) still gets marked finished below -- out-of-
+        order arrival, or a repeat, must never create or re-finish an
+        active event.
+        """
         changed: set = set()
-        if was_tracked_active:
-            before_types = self._union_types(cam_events)
-            del cam_events[event_id]
-            is_active_now = bool(cam_events)
-            after_types = self._union_types(cam_events) if is_active_now else set()
+        indexed = self._active_index.get(event_id)
 
-            # Changed if the active flag flipped (camera went idle in this
-            # family) OR the remaining detect-type union moved (e.g. a
-            # person event ended while a vehicle event on the same camera
-            # is still open).
-            if (not is_active_now) or (before_types != after_types):
-                changed.add(device)
+        if indexed is not None:
+            family, device = indexed
+            cam_events = self._active_events[family].get(device)
+            if cam_events is not None and event_id in cam_events:
+                before_types = self._union_types(cam_events)
+                del cam_events[event_id]
+                del self._active_index[event_id]
+                is_active_now = bool(cam_events)
+                after_types = self._union_types(cam_events) if is_active_now else set()
+
+                # Changed if the active flag flipped (camera went idle in
+                # this family) OR the remaining detect-type union moved
+                # (e.g. a person event ended while a vehicle event on the
+                # same camera is still open).
+                if (not is_active_now) or (before_types != after_types):
+                    changed.add(device)
 
         # Trap 1: terminal frames repeat. Only the first `end` for a given
         # id does anything; later ones must not re-run eviction bookkeeping

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from event_tracker import EventTracker
+from event_tracker import EventTracker, MOTION_EVENT_TYPES
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "ws_capture.json"
 AUDIO_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "ws_capture_audio.json"
@@ -665,6 +665,11 @@ def test_real_audio_capture_exact_transition_sequence():
         assert tracker.audio_active(CAMERA_A) is False, f"frame {frame_num}: camera A audio"
         assert tracker.audio_active(CAMERA_B) is False, f"frame {frame_num}: camera B audio"
 
+    # The audio event's own `start` (frame 3) must have been recorded as
+    # Side Path's last_audio_ms, independent of the interleaved motion
+    # frames' own timestamps.
+    assert tracker.last_audio_ms(SIDE_PATH_CAMERA) == 1787775388929
+
 
 # ---------------------------------------------------------------------
 # Unrecognized item.type: ignored and counted, never malformed, never
@@ -674,6 +679,8 @@ def test_real_audio_capture_exact_transition_sequence():
 @pytest.mark.parametrize("raw_type,expected_key", [
     ("ring", "ring"),
     (None, "<missing>"),
+    (42, "<missing>"),
+    (["smartDetectZone"], "<missing>"),
 ])
 def test_unknown_item_type_add_never_activates_either_family(raw_type, expected_key):
     tracker = EventTracker()
@@ -798,6 +805,9 @@ def test_zone_and_audio_events_on_same_camera_are_independent():
     changed = tracker.handle(audio_end)
     assert changed == {cam}
     assert tracker.is_active(cam) is True, "ending audio must not affect motion"
+    assert tracker.detect_types(cam) == {"person"}, (
+        "motion's own detect-type union must survive the audio event ending"
+    )
     assert tracker.audio_active(cam) is False
 
     # Bring up a second (fresh-id) audio event, then end the still-active
@@ -814,6 +824,9 @@ def test_zone_and_audio_events_on_same_camera_are_independent():
     assert changed == {cam}
     assert tracker.is_active(cam) is False, "zone event finished"
     assert tracker.audio_active(cam) is True, "ending motion must not affect audio"
+    assert tracker.audio_types(cam) == {"alrmBabyCry"}, (
+        "the still-open second audio event's types must survive the zone event ending"
+    )
 
 
 # ---------------------------------------------------------------------
@@ -907,3 +920,159 @@ def test_handle_reports_changed_when_only_audio_type_union_moves():
     assert changed == {cam}, "audio_types moving must report the camera as changed"
     assert tracker.audio_active(cam) is True   # active flag itself unchanged
     assert tracker.audio_types(cam) == {"alrmSpeak"}
+
+
+# ---------------------------------------------------------------------
+# Bug: an `end` frame for a HELD id must finish that event regardless of
+# what item.type says — missing, unrecognized, or even the OTHER family.
+# Before this fix such a frame fell into the ignore-and-count branch and
+# lost the lifecycle signal, leaving the camera stuck active forever with
+# no diagnostic.
+# ---------------------------------------------------------------------
+
+def test_held_id_end_with_missing_type_still_finishes_the_event():
+    tracker = EventTracker()
+    cam = "camHeldMissingType"
+    add = {"item": {"id": "e1", "device": cam, "type": "smartDetectZone",
+                     "start": 1, "smartDetectTypes": ["person"]}}
+    end_no_type = {"item": {"id": "e1", "device": cam, "end": 2}}
+
+    assert tracker.handle(add) == {cam}
+    assert tracker.is_active(cam) is True
+
+    changed = tracker.handle(end_no_type)
+
+    assert changed == {cam}, "a held id's end must finish it even with no item.type"
+    assert tracker.is_active(cam) is False
+    assert tracker.ignored_type_counts == {}, "acted on via the index, not ignored"
+
+
+def test_held_id_end_with_other_family_type_still_finishes_the_event():
+    """A `smartAudioDetect`-typed end for a MOTION id (the frame's own type
+    naming the WRONG family) must still resolve to the event's real family
+    via the shared active-event index, not the frame's own claim."""
+    tracker = EventTracker()
+    cam = "camHeldWrongFamily"
+    add = {"item": {"id": "e1", "device": cam, "type": "smartDetectZone",
+                     "start": 1, "smartDetectTypes": ["person"]}}
+    wrong_type_end = {"item": {"id": "e1", "device": cam, "type": "smartAudioDetect",
+                                "end": 2}}
+
+    assert tracker.handle(add) == {cam}
+    assert tracker.is_active(cam) is True
+
+    changed = tracker.handle(wrong_type_end)
+
+    assert changed == {cam}
+    assert tracker.is_active(cam) is False, "must finish the MOTION event"
+    assert tracker.audio_active(cam) is False, "must NOT create an audio event"
+    assert tracker.ignored_type_counts == {}
+
+
+def test_untracked_id_unknown_type_end_still_creates_or_finishes_nothing():
+    """The existing untracked-unknown-end behaviour must be unchanged: an
+    `end` of an unrecognized type for an id the tracker has never seen is
+    still ignored and counted, not routed through the index shortcut."""
+    tracker = EventTracker()
+    cam = "camNeverHeld"
+    end = {"item": {"id": "never-seen-2", "device": cam, "type": "bogus", "end": 2}}
+
+    changed = tracker.handle(end)
+
+    assert changed == set()
+    assert tracker.is_active(cam) is False
+    assert tracker.audio_active(cam) is False
+    assert tracker.ignored_type_counts == {"bogus": 1}
+
+
+# ---------------------------------------------------------------------
+# _safe_type_set keeps only string elements — a non-string element must
+# never survive into the returned set (it would otherwise reach plugin.py's
+# sorted()/join() and raise, tearing the socket down).
+# ---------------------------------------------------------------------
+
+def test_mixed_smart_detect_types_keeps_only_strings():
+    tracker = EventTracker()
+    add = {"item": {"id": "e1", "device": "camMixed", "type": "smartAudioDetect",
+                     "start": 1, "smartDetectTypes": ["alrmSpeak", 3, {"x": 1}, None]}}
+
+    tracker.handle(add)
+
+    assert tracker.audio_types("camMixed") == {"alrmSpeak"}
+
+
+# ---------------------------------------------------------------------
+# ignored_type_counts hygiene: first-seen device sample, capped distinct
+# keys with overflow bucketed under "<other>".
+# ---------------------------------------------------------------------
+
+def test_ignored_type_samples_records_first_seen_device():
+    tracker = EventTracker()
+    tracker.handle({"item": {"id": "e1", "device": "camFirst", "type": "ring"}})
+    tracker.handle({"item": {"id": "e2", "device": "camSecond", "type": "ring"}})
+
+    assert tracker.ignored_type_samples == {"ring": "camFirst"}
+    assert tracker.ignored_type_counts == {"ring": 2}
+
+
+def test_ignored_type_samples_unknown_when_device_missing():
+    tracker = EventTracker()
+    tracker.handle({"item": {"id": "e1", "type": "ring"}})   # no device
+
+    assert tracker.ignored_type_samples == {"ring": "unknown"}
+
+
+def test_ignored_type_counts_caps_distinct_keys_and_buckets_overflow():
+    tracker = EventTracker()
+    for i in range(64):
+        tracker.handle({"item": {"id": f"e{i}", "device": f"cam{i}", "type": f"weirdType{i}"}})
+
+    assert len(tracker.ignored_type_counts) == 64
+
+    # The 65th and 66th distinct types must be bucketed under "<other>",
+    # not get their own keys.
+    tracker.handle({"item": {"id": "e64", "device": "camOverflow1", "type": "weirdType64"}})
+    tracker.handle({"item": {"id": "e65", "device": "camOverflow2", "type": "weirdType65"}})
+
+    assert len(tracker.ignored_type_counts) == 65   # 64 real keys + "<other>"
+    assert "weirdType64" not in tracker.ignored_type_counts
+    assert "weirdType65" not in tracker.ignored_type_counts
+    assert tracker.ignored_type_counts["<other>"] == 2
+    assert tracker.ignored_type_samples["<other>"] == "camOverflow1"
+
+
+# ---------------------------------------------------------------------
+# last_motion_ms / last_audio_ms are tracked fully independently.
+# ---------------------------------------------------------------------
+
+def test_last_audio_and_last_motion_are_tracked_independently():
+    tracker = EventTracker()
+    cam = "camLastSeen"
+    zone_add = {"item": {"id": "z1", "device": cam, "type": "smartDetectZone",
+                          "start": 1000, "smartDetectTypes": ["person"]}}
+    audio_add = {"item": {"id": "a1", "device": cam, "type": "smartAudioDetect",
+                           "start": 2000, "smartDetectTypes": ["alrmSpeak"]}}
+
+    tracker.handle(zone_add)
+    tracker.handle(audio_add)
+
+    assert tracker.last_motion_ms(cam) == 1000
+    assert tracker.last_audio_ms(cam) == 2000
+    assert tracker.last_motion_ms(cam) != tracker.last_audio_ms(cam)
+
+
+# ---------------------------------------------------------------------
+# Every documented MOTION_EVENT_TYPES value must activate the motion family.
+# ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("motion_type", sorted(MOTION_EVENT_TYPES))
+def test_every_motion_event_type_activates_is_active(motion_type):
+    tracker = EventTracker()
+    cam = f"cam-{motion_type}"
+    add = {"item": {"id": "e1", "device": cam, "type": motion_type, "start": 1,
+                     "smartDetectTypes": ["person"]}}
+
+    changed = tracker.handle(add)
+
+    assert changed == {cam}
+    assert tracker.is_active(cam) is True
