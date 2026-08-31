@@ -73,16 +73,27 @@ identical in shape and lifecycle (add/update/end, epoch-ms timestamps, ids
 unique across both families).
 
 - **Motion**: `item.type` in `{"motion", "smartDetectZone", "smartDetectLine",
-  "smartDetectLoiterZone"}`, `smartDetectTypes` ⊂ `{person, vehicle, animal}`
-  (empty for the plain `motion` type, which carries none). Only
-  `smartDetectZone` has been observed on the reference rig; the other three
-  come from Protect's published OpenAPI spec, not proven on the wire.
-- **Audio**: `item.type` is `smartAudioDetect`, `smartDetectTypes` ⊂
-  `{alrmSmoke, alrmCmonx, alrmBabyCry, alrmSpeak}`. Only `alrmSpeak` has been
-  observed live; `alrmSmoke`/`alrmCmonx` remain unverified on the wire.
+  "smartDetectLoiterZone"}` (empty `smartDetectTypes` for the plain `motion`
+  type, which carries none). Only `smartDetectZone` has been observed on the
+  reference rig; the other three come from Protect's published OpenAPI spec,
+  not proven on the wire.
+- **Audio**: `item.type` is `smartAudioDetect`.
+- `smartDetectTypes` values: this plugin only TRACKS (surfaces as its own
+  state) `person`, `vehicle`, `animal` for motion and `alrmSpeak`,
+  `alrmBabyCry`, `alrmSmoke`, `alrmCmonx` for audio. Observed live: `person`
+  and `alrmSpeak` only — nothing else in either list is proven on the wire.
+  The spec's (v6.2.83) full enums are wider: motion objects are `person,
+  vehicle, package, licensePlate, face, animal`; audio alarms are `alrmSmoke,
+  alrmCmonx, alrmSiren, alrmBabyCry, alrmSpeak, alrmBark, alrmBurglar,
+  alrmCarHorn, alrmGlassBreak`. Any value outside the tracked list still
+  passes through into `lastDetectTypes`/`lastAudioTypes` untouched — it just
+  never sets one of the specific boolean states, and for audio it still sets
+  `audioDetected`.
 - Any other `item.type` (including missing/non-string, and documented-but-
   unhandled types like doorbell `ring` or Protect sensor events) must be
-  **ignored and counted**, never folded into either family.
+  **ignored and counted**, never folded into either family — UNLESS the
+  frame carries an `end` for an id this tracker is already holding, in which
+  case it must still finish that event (see "Required semantics" below).
 
 **Three wire facts, proven live on 2026-08-26 by speaking near a camera
 (the "Side Path" camera, UNVR 7.2.105):**
@@ -349,8 +360,18 @@ class EventTracker:
    "smartDetectZone", "smartDetectLine", "smartDetectLoiterZone"}` →
    MOTION, `{"smartAudioDetect"}` → AUDIO, anything else → ignored and
    counted in `ignored_type_counts`, with no further processing — an `end`
-   frame of an unrecognized type must not finish (or create) anything.
-7. `handle` returns changed-camera ids so the caller writes Indigo states only
+   frame of an unrecognized type for an id never seen must not finish (or
+   create) anything.
+7. **Exception to #6**: an `end` frame for an id the tracker is CURRENTLY
+   HOLDING (present in the shared `event_id -> (family, device)` active
+   index) must still finish that event, regardless of what — or whether —
+   `item.type` says. A real bug let a missing-type or wrong-family-typed
+   `end` for a held id fall into the ignore-and-count branch and lose the
+   lifecycle signal, leaving the camera stuck active forever with zero
+   diagnostic. `_finish` resolves the family from the index, never from the
+   terminating frame's own claim. This does NOT apply to an id never seen —
+   that case is still #6 (ignored and counted, nothing created or finished).
+8. `handle` returns changed-camera ids so the caller writes Indigo states only
    on real transitions — but "changed" is EITHER the active/idle flag OR the
    detect-type union moving, for EITHER family, not only active/idle
    transitions. (An earlier version only fired on active/idle transitions;
@@ -376,8 +397,10 @@ Standard Indigo lifecycle. Key points:
 - Reconnect with exponential backoff 1s → 60s. On disconnect, set every camera
   device's `connected` state False and call `tracker.clear_camera` for each, so
   a dead socket reads as "unknown", not as "no motion".
-- `deviceStartComm` / `deviceStopComm` maintain `self.cameras: dict[str, int]`
-  mapping Protect camera id → Indigo device id.
+- `deviceStartComm` / `deviceStopComm` maintain `self.cameras: dict[str, set[int]]`
+  mapping Protect camera id → the set of Indigo device ids pointed at it (a
+  set, not a scalar, because Indigo's Duplicate command trivially produces
+  two devices on one camera).
 
 ### State IDs — strict, undocumented Indigo rule
 
@@ -391,7 +414,7 @@ The declared states are exactly:
 
 | State id | Type | Meaning |
 |---|---|---|
-| `motionDetected` | Boolean | MOTION family active (person/vehicle/animal/plain motion) |
+| `motionDetected` | Boolean (OnOff) | MOTION family active (person/vehicle/animal/plain motion) |
 | `personDetected` | Boolean | `person` in active MOTION detect types |
 | `vehicleDetected` | Boolean | `vehicle` in active MOTION detect types |
 | `animalDetected` | Boolean | `animal` in active MOTION detect types |
@@ -413,13 +436,19 @@ per-device `audioCountsAsActivity` checkbox, default True, AND active AUDIO
 types intersect `{alrmSpeak, alrmBabyCry}`). Smoke/CO alarm sounds NEVER
 contribute to `onOffState`, checkbox or not — an alarm is not presence, and
 folding it in would make a "device turned on" trigger fire on a smoke alarm.
-Everything is False/empty when `connected` is False, exactly as today.
+When `connected` is False: the live booleans (`motionDetected`,
+`audioDetected`, `onOffState`, the per-type booleans) and the `*Types`
+strings (`lastDetectTypes`, `lastAudioTypes`) go False/empty.
+`lastMotion`/`lastAudio` are historical timestamps, not live state, and are
+KEPT — a disconnect does not erase when motion or audio was last actually
+seen.
 
-Set `onOffState` via `dev.updateStateOnServer("onOffState", value=<bool>)`
-and keep `motionDetected`/`audioDetected` in step. The state image
+`onOffState`, `motionDetected`, `audioDetected` and every other state above
+are written together in one batched call —
+`dev.updateStatesOnServer([...])` — not via individual
+`updateStateOnServer()` calls. The state image
 (`MotionSensorTripped`/`MotionSensor`) tracks `onOffState`, not
-`motionDetected` alone. Batch multi-state writes with
-`dev.updateStatesOnServer([...])`.
+`motionDetected` alone.
 
 ---
 
@@ -438,7 +467,11 @@ adversarially — **"when could this report idle and be wrong?"**:
 - two overlapping events on one camera: both must end before it goes idle
 - an `end` for an unknown id does not create an active event
 - malformed messages (`{}`, missing `item`, `item` not a dict, missing
-  `device`, missing `smartDetectTypes`) are ignored and never raise
+  `device`, missing `id`) are ignored and never raise
+- a missing (or non-list, or mixed-type) `smartDetectTypes` is tolerated and
+  DEGRADES to an empty/filtered set rather than discarding the frame — it is
+  not in the malformed list above, because a bad cosmetic field must never
+  be allowed to veto a lifecycle signal (`end`)
 - `finished_cap` eviction does not resurrect a recently-ended event
 
 Issue #5 (audio) added `tests/fixtures/ws_capture_audio.json` (13 frames: 10
@@ -459,6 +492,14 @@ cover:
 - `clear_camera`/`reset` clear both families
 - `handle` reports changed when only the audio detect-type union moves
   (empty → `{alrmSpeak}`), mirroring the motion-family overlap fix
+- `test_unknown_item_type_end_creates_or_finishes_nothing` — an unrecognized
+  `item.type` on an `end` for an id never seen creates/finishes nothing
+- `test_plain_motion_event_type_activates_motion_family_with_no_types` — the
+  plain `motion` type (no smartDetectTypes at all) still activates MOTION
+- `test_held_id_end_with_missing_type_still_finishes_the_event` and
+  `test_held_id_end_with_other_family_type_still_finishes_the_event` — the
+  exception to the ignore-and-count rule: an `end` for a HELD id must
+  finish it regardless of what `item.type` says (see "Required semantics")
 
 Per workspace convention, a degradation-path test must make the negative
 assertion **fatal**: to prove the tracker never consults the network, hand it a
