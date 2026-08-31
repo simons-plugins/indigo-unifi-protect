@@ -98,6 +98,66 @@ def _truthy(value, default=True):
     return bool(value)
 
 
+def _camera_info_states(info):
+    """Build the read-only hardware/config states from a cached camera
+    object (issue #4). Split out of _write_states because pylint already
+    flags that method for too-many-locals.
+
+    Callers must only pass a non-None `info` -- when the camera object is
+    unavailable there is nothing honest to report here, and the caller must
+    leave the last-known values in place rather than call this at all.
+
+    The single rule for every key below: a key that is absent or malformed
+    is SKIPPED, never defaulted. A partial camera object (e.g. a read that
+    only returned some fields) must not blank a state that was correct a
+    moment ago, and an absent boolean (e.g. no isMicEnabled key) must not
+    be reported as a confident False -- "mic disabled" is a real reading,
+    not the same thing as "unknown". A non-dict nested object (a malformed
+    `ledSettings`/`osdSettings`) must not raise -- it just means those keys
+    are skipped too.
+    """
+    states = []
+
+    camera_type = info.get("type")
+    if isinstance(camera_type, str) and camera_type:
+        states.append({"key": "cameraModel", "value": camera_type})
+
+    video_mode = info.get("videoMode")
+    if isinstance(video_mode, str) and video_mode:
+        states.append({"key": "videoMode", "value": video_mode})
+
+    hdr_type = info.get("hdrType")
+    if isinstance(hdr_type, str) and hdr_type:
+        states.append({"key": "hdrType", "value": hdr_type})
+
+    if "isMicEnabled" in info:
+        states.append({"key": "micEnabled", "value": bool(info["isMicEnabled"])})
+
+    try:
+        mic_volume = info["micVolume"]
+        if isinstance(mic_volume, bool):
+            # int(True) == 1 -- a real-looking but fabricated volume.
+            raise TypeError("micVolume must not be a bool")
+        states.append({"key": "micVolume", "value": int(mic_volume)})
+    except (KeyError, TypeError, ValueError):
+        # Missing, a bool, or otherwise unparseable -- skipped, not
+        # defaulted to 0. 0 is a real, meaningful mic volume.
+        pass
+
+    led = info.get("ledSettings")
+    if isinstance(led, dict) and "isEnabled" in led:
+        states.append({"key": "ledEnabled", "value": bool(led["isEnabled"])})
+
+    osd = info.get("osdSettings")
+    if isinstance(osd, dict):
+        if "isNameEnabled" in osd:
+            states.append({"key": "osdNameEnabled", "value": bool(osd["isNameEnabled"])})
+        if "isDateEnabled" in osd:
+            states.append({"key": "osdDateEnabled", "value": bool(osd["isDateEnabled"])})
+
+    return states
+
+
 class Plugin(indigo.PluginBase):
 
     def __init__(self, pluginId, pluginDisplayName, pluginVersion, pluginPrefs, **kwargs):
@@ -124,6 +184,12 @@ class Plugin(indigo.PluginBase):
         # run -- so a burst of the same unsupported/unknown type doesn't
         # spam the Event Log once per frame.
         self._reported_ignored_types = set()
+        # Device ids for which a dev.model update has already logged its
+        # one WARNING this plugin run -- indigo.devices.get() returns a
+        # fresh object every call, so a persistent replaceOnServer()
+        # failure would otherwise retry (and log at DEBUG) on every single
+        # frame forever, with no visible hint anything is wrong.
+        self._model_update_warned = set()
         # Resolved lazily on first use, NOT here. Indigo exec()s plugin.py as a
         # string, so __file__ does not exist and touching it in __init__ kills
         # the plugin at InitializeMain before any of it runs.
@@ -500,6 +566,15 @@ class Plugin(indigo.PluginBase):
         for audio_type, state_key in TRACKED_AUDIO_TYPES.items():
             states.append({"key": state_key, "value": audio_type in audio_types})
 
+        # Hardware/config states (issue #4) come straight from the cached
+        # camera object, not the WS tracker. When info is None the lookup
+        # itself failed -- cameraState already says STATE_UNAVAILABLE above,
+        # and leaving these eight states at their last-known values is more
+        # honest than overwriting real hardware state with a made-up
+        # False/"" that looks like a fresh, confirmed read.
+        if info:
+            states.extend(_camera_info_states(info))
+
         last_ms = self.tracker.last_motion_ms(camera_id)
         if isinstance(last_ms, (int, float)) and last_ms > 0:
             states.append({
@@ -522,6 +597,44 @@ class Plugin(indigo.PluginBase):
                 else indigo.kStateImageSel.MotionSensor
             )
         dev.updateStatesOnServer(states)
+
+        # Model update comes AFTER the state write on purpose: a
+        # replaceOnServer() failure below must never be able to block the
+        # states above from landing.
+        if info:
+            self._update_camera_model(dev, info)
+
+    def _update_camera_model(self, dev, info):
+        """Set the Indigo device's model from the camera's hardware type
+        (issue #4), so the device list shows e.g. "UVC G5 Turret Ultra"
+        instead of the generic "Protect Camera". Best-effort only -- caught
+        broadly because a failure here is cosmetic, not a reason to lose the
+        state write that already happened above.
+
+        In real Indigo, indigo.devices.get() returns a FRESH device object
+        on every call, so a persistent failure here (e.g. the user has this
+        device's edit dialog open) would otherwise retry -- and log --
+        forever with no visible trace, because DEBUG is off by default.
+        Log the first failure per device at WARNING, everything after that
+        at DEBUG, so a persistent fault is seen once instead of an Event
+        Log flooded with one line per frame.
+        """
+        model = info.get("type")
+        if not model or model == dev.model:
+            return
+        try:
+            dev.model = model
+            dev.replaceOnServer()
+        except Exception as exc:
+            if dev.id in self._model_update_warned:
+                self.logger.debug(f"{dev.name}: could not update device model: {exc}")
+                return
+            self._model_update_warned.add(dev.id)
+            self.logger.warning(
+                f"{dev.name}: could not update device model to '{model}' "
+                f"({type(exc).__name__}: {exc}). If this repeats, check whether "
+                "this device's edit dialog is open in the Indigo UI."
+            )
 
     # ------------------------------------------------------------------
     # Actions and menu items

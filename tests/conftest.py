@@ -52,10 +52,12 @@ class _FakeDevice:
         self.enabled = enabled
         self.states = {}
         self.deviceTypeId = "protectCamera"
+        self.model = "Protect Camera"
         # Full history, so a test can assert on the *sequence* of writes and
         # not merely the final resting state.
         self.state_writes = []
         self.image_writes = []
+        self.replace_on_server_calls = 0
         self.state_list_changed_calls = 0
         # Set to an exception instance to make stateListOrDisplayStateIdChanged
         # raise, for testing the deviceStartComm degradation path.
@@ -73,6 +75,8 @@ class _FakeDevice:
     def updateStateImageOnServer(self, image):
         self.image_writes.append(image)
 
+    def replaceOnServer(self):
+        self.replace_on_server_calls += 1
     def stateListOrDisplayStateIdChanged(self):
         # Fatal ordering check, first call only: if THE FIRST call for this
         # device happens after a state write, a plugin upgrade adding new

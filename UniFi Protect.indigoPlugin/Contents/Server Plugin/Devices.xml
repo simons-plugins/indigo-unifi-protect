@@ -98,6 +98,46 @@
                 <TriggerLabel>Camera State</TriggerLabel>
                 <ControlPageLabel>Camera State</ControlPageLabel>
             </State>
+            <State id="cameraModel">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Camera Model</TriggerLabel>
+                <ControlPageLabel>Camera Model</ControlPageLabel>
+            </State>
+            <State id="videoMode">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Video Mode</TriggerLabel>
+                <ControlPageLabel>Video Mode</ControlPageLabel>
+            </State>
+            <State id="hdrType">
+                <ValueType>String</ValueType>
+                <TriggerLabel>HDR Mode</TriggerLabel>
+                <ControlPageLabel>HDR Mode</ControlPageLabel>
+            </State>
+            <State id="micEnabled">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Microphone Enabled</TriggerLabel>
+                <ControlPageLabel>Microphone Enabled</ControlPageLabel>
+            </State>
+            <State id="micVolume">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Microphone Volume</TriggerLabel>
+                <ControlPageLabel>Microphone Volume</ControlPageLabel>
+            </State>
+            <State id="ledEnabled">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Status LED Enabled</TriggerLabel>
+                <ControlPageLabel>Status LED Enabled</ControlPageLabel>
+            </State>
+            <State id="osdNameEnabled">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>OSD Name Enabled</TriggerLabel>
+                <ControlPageLabel>OSD Name Enabled</ControlPageLabel>
+            </State>
+            <State id="osdDateEnabled">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>OSD Date Enabled</TriggerLabel>
+                <ControlPageLabel>OSD Date Enabled</ControlPageLabel>
+            </State>
             <State id="connected">
                 <ValueType>Boolean</ValueType>
                 <TriggerLabel>Event Socket Connected</TriggerLabel>

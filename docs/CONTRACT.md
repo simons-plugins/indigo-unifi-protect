@@ -435,8 +435,65 @@ The declared states are exactly:
 | `lastAudio` | String | ISO-8601 local time, `""` if never |
 | `lastAudioTypes` | String | comma-joined AUDIO types, e.g. `alrmSpeak` |
 | `cameraState` | String | Protect's `state`, e.g. `CONNECTED` |
+| `cameraModel` | String | camera object's `type`, e.g. `UVC G5 Turret Ultra` |
+| `videoMode` | String | camera object's `videoMode` |
+| `hdrType` | String | camera object's `hdrType` |
+| `micEnabled` | Boolean | camera object's `isMicEnabled` |
+| `micVolume` | Integer | camera object's `micVolume`; the key is skipped (not written) if it fails to parse as `int` |
+| `ledEnabled` | Boolean | camera object's `ledSettings.isEnabled` |
+| `osdNameEnabled` | Boolean | camera object's `osdSettings.isNameEnabled` |
+| `osdDateEnabled` | Boolean | camera object's `osdSettings.isDateEnabled` |
 | `connected` | Boolean | **event socket** health, not the camera's |
 | `snapshotPath` | String | path written by the snapshot action |
+
+The eight camera-info states above (issue #4) are read straight from the
+cached `GET /cameras` object (`self.camera_info`), not from the WS tracker,
+and their fate is entirely independent of `connected` / socket health — see
+below for why that's a deliberate split from the motion/audio states.
+
+They are **only written when the camera object itself is available** — when
+the lookup has failed entirely, `cameraState` already reports
+`STATE_UNAVAILABLE` and all eight are left at their last-known values rather
+than overwritten with a made-up False/`""` that would look like a fresh,
+confirmed read.
+
+Within a present object, the rule is per-key, not per-object: **a key that
+is absent or malformed is skipped, never defaulted.** This matters because
+the camera object can be *partially* present — a read can return some
+fields and not others — and a missing key is not the same claim as a
+present-and-false one:
+- The three string keys (`cameraModel`/`type`, `videoMode`, `hdrType`) are
+  written only when present and non-empty; a missing one keeps whatever
+  value that state already held, exactly like the whole-object-missing case
+  above (and consistent with `dev.model`, which is likewise only ever
+  updated, never cleared).
+- The four boolean keys (`micEnabled`/`isMicEnabled`,
+  `ledEnabled`/`ledSettings.isEnabled`,
+  `osdNameEnabled`/`osdSettings.isNameEnabled`,
+  `osdDateEnabled`/`osdSettings.isDateEnabled`) are written only when their
+  source key is present. An absent key is skipped, not written as False —
+  "mic disabled" is a real reading and must not be confused with "the field
+  wasn't in the payload".
+- `ledSettings`/`osdSettings` are guarded with `isinstance(x, dict)`: a
+  truthy non-dict value there (a malformed object, not merely an absent
+  one) must not raise `AttributeError` out of `_write_states` — that would
+  escape to `_pump`, tear the socket down, and reconnect into the same bad
+  object forever, one malformed camera killing motion for every camera.
+- `micVolume` is parsed with `int()` inside a `try`; a `bool` is explicitly
+  rejected before that (`int(True) == 1` is a real-looking but fabricated
+  volume), and any failure — missing, wrong type, unparseable — skips the
+  key rather than writing a fabricated `0`.
+
+`dev.model` is set from `type` when it differs from the device's current
+model, via `dev.replaceOnServer()`, guarded so a failure there is never
+able to block the state write above it, which always happens first. Because
+`indigo.devices.get()` returns a fresh device object on every call in real
+Indigo, a *persistent* `replaceOnServer()` failure (e.g. the device's edit
+dialog left open in the Indigo UI) would otherwise retry — and log — on
+every single frame forever with nothing visible to say so. The plugin logs
+the first failure per device id at WARNING and every one after that at
+DEBUG, tracked in `self._model_update_warned`, the same one-per-key pattern
+`_reported_ignored_types` already uses for unrecognized event types.
 
 `onOffState` (the built-in on/off state) is `motionDetected` OR (the
 per-device `audioCountsAsActivity` checkbox, default True, AND active AUDIO
@@ -448,7 +505,11 @@ When `connected` is False: the live booleans (`motionDetected`,
 strings (`lastDetectTypes`, `lastAudioTypes`) go False/empty.
 `lastMotion`/`lastAudio` are historical timestamps, not live state, and are
 KEPT — a disconnect does not erase when motion or audio was last actually
-seen.
+seen. The eight camera-info states (issue #4, above) are a second,
+independent exception, for a different reason: they follow `camera_info`,
+not `connected`, and keep their last-known values across a socket drop too
+— a dead event socket says nothing about whether the camera's hardware
+config has changed.
 
 `onOffState`, `motionDetected`, `audioDetected` and every other state above
 are written together in one batched call —

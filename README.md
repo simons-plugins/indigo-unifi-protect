@@ -138,6 +138,24 @@ exactly like `motionDetected` does (`lastAudio` is a historical
 timestamp and is kept, same as `lastMotion`). Silence is not safety —
 it can just as easily mean the plugin can't hear anything right now.
 
+### Camera hardware and config states
+
+Each device also reports the camera's current hardware/config as read-only
+states: `cameraModel`, `videoMode`, `hdrType`, `micEnabled`, `micVolume`,
+`ledEnabled`, `osdNameEnabled`, and `osdDateEnabled`. Unlike the motion/audio
+states above, these come from the cached `GET /cameras` object rather than
+the event socket, and they are only written when that object is available —
+a failed lookup leaves them at their last-known value rather than overwriting
+real hardware state with a fabricated `False`/`""`. `dev.model` is also kept
+in sync with the camera's hardware type, so the device list shows e.g. "UVC
+G5 Turret Ultra" instead of the generic "Protect Camera".
+
+Deliberately **not** available, because it needs the private (not the
+official integration) API: firmware version, camera IP, `isDark`, IR LED
+mode/level, zoom position, motion tuning, and wifi stats. See
+[`docs/API-REFERENCE.md`](./docs/API-REFERENCE.md) (added by PR #10) for
+the full verified field list.
+
 ## Latency
 
 Motion detection rides the Protect event WebSocket, not polling. Measured
