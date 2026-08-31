@@ -1648,13 +1648,15 @@ def test_validate_action_config_ui_video_mode_selected_accepted(fake_indigo):
 #
 # The URL embeds an access token -- it is a credential, not just data.
 # The questions here are not "does it fetch the URL?" but "can the
-# checkbox-off path ever touch the network?" and "can the token ever
-# reach a log line, on the success path OR the error path?"
+# checkbox-off path ever touch the network?", "can the token ever reach a
+# log line, on the success path OR the error path?", and (per the
+# threading review) "can REST ever block deviceStartComm/_open_socket, or
+# can a stream-URL failure ever tear down the event socket?"
 # ---------------------------------------------------------------------
 
 def _make_stream_device(fake_indigo, expose_value=None, dev_id=1001, camera_id="cam-1"):
     """Builds a device WITHOUT going through deviceStartComm, so these
-    tests control exactly when _refresh_stream_urls runs rather than
+    tests control exactly when the stream-URL machinery runs rather than
     picking up an extra call for free."""
     from conftest import _FakeDevice
     props = {"cameraId": camera_id}
@@ -1666,8 +1668,13 @@ def _make_stream_device(fake_indigo, expose_value=None, dev_id=1001, camera_id="
 
 
 class _RaisingStreamAPI:
-    """Fatal-collaborator: any touch proves the opt-out path is not
-    actually opting out of the network."""
+    """Fatal-collaborator: any touch of the stream endpoints proves the
+    opt-out path is not actually opting out of the network. get_cameras is
+    a normal, unrelated call (actionControlUniversal's RequestStatus path
+    always makes it) and is allowed through."""
+
+    def get_cameras(self):
+        return []
 
     def get_rtsps_streams(self, camera_id):
         raise AssertionError("get_rtsps_streams must not be called when opted out")
@@ -1698,6 +1705,14 @@ class _FakeStreamAPI:
         return dict(self._create_response)
 
 
+def _prep_pending(plug, dev, camera_id="cam-1"):
+    """Wire a device straight into plug.cameras/pending, bypassing
+    deviceStartComm, so pump-drain tests control exactly one device's
+    lifecycle state."""
+    plug.cameras.setdefault(camera_id, set()).add(dev.id)
+    plug._stream_refresh_pending.add(dev.id)
+
+
 @pytest.mark.parametrize("expose_value", [None, False, "false", "False"])
 def test_stream_urls_opted_out_writes_empty_states_and_never_touches_api(
         fake_indigo, expose_value):
@@ -1711,6 +1726,21 @@ def test_stream_urls_opted_out_writes_empty_states_and_never_touches_api(
     assert dev.states["streamUrlMedium"] == ""
     assert dev.states["streamUrlLow"] == ""
     assert dev.states["streamUrlPackage"] == ""
+
+
+def test_stream_urls_opting_out_clears_previously_populated_states(fake_indigo):
+    """Off must ACTIVELY clear a stored token, not just stop refreshing
+    it -- starts from non-empty states, unlike the test above."""
+    plug = make_plugin({})
+    dev = _make_stream_device(fake_indigo, expose_value=False)
+    for key in plugin_module.STREAM_URL_STATES.values():
+        dev.states[key] = "rtsps://x/stale"
+    plug.api = _RaisingStreamAPI()
+
+    plug._refresh_stream_urls(dev)
+
+    for key in plugin_module.STREAM_URL_STATES.values():
+        assert dev.states[key] == "", f"{key} must be cleared, not left stale"
 
 
 @pytest.mark.parametrize("expose_value", [True, "true", "True"])
@@ -1751,6 +1781,10 @@ def test_stream_url_token_never_appears_in_any_log_record_on_success(fake_indigo
         assert "SECRET-TOKEN" not in record.getMessage(), (
             "the stream URL/token must never appear in a log record"
         )
+    info_records = [r for r in caplog.records if r.levelname == "INFO"]
+    assert any("refreshed" in r.getMessage() for r in info_records), (
+        "the token-absence check above must not be passing on a silent no-op"
+    )
 
 
 def test_stream_url_token_never_appears_in_any_log_record_on_error(fake_indigo, caplog):
@@ -1777,6 +1811,10 @@ def test_stream_url_token_never_appears_in_any_log_record_on_error(fake_indigo, 
             "the stream URL/token must never appear in a log record, even via "
             "the error path"
         )
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("could not refresh stream URLs" in r.getMessage() for r in error_records), (
+        "the token-absence check above must not be passing on a silent no-op"
+    )
 
 
 def test_stream_urls_get_all_null_triggers_post_without_package_by_default(fake_indigo):
@@ -1820,6 +1858,103 @@ def test_stream_urls_get_all_null_with_package_camera_includes_package(fake_indi
     assert dev.states["streamUrlPackage"] == "rtsps://x/4"
 
 
+def test_partial_null_get_posts_missing_when_camera_cached(fake_indigo):
+    """Camera capabilities ARE cached: a null 'high' triggers a POST for
+    just that quality, and a real response replaces the prior value."""
+    plug = make_plugin({})
+    dev = _make_stream_device(fake_indigo, expose_value=True)
+    dev.states["streamUrlHigh"] = "rtsps://x/prior-high"
+    api = _FakeStreamAPI(
+        {"high": None, "medium": "rtsps://x/m", "low": "rtsps://x/l", "package": None},
+        create_response={"high": "rtsps://x/new-high"},
+    )
+    plug.api = api
+    plug._last_rest_call = 0.0
+    plug.camera_info = {"cam-1": {"hasPackageCamera": False}}
+
+    plug._refresh_stream_urls(dev)
+
+    assert api.create_calls == [("cam-1", ["high"])]
+    assert dev.states["streamUrlHigh"] == "rtsps://x/new-high"
+
+
+def test_partial_null_get_keeps_prior_when_camera_not_cached_and_warns(fake_indigo, caplog):
+    """Camera capabilities are NOT cached (e.g. before the first camera
+    refresh): a null 'high' must not trigger a guessed POST, the prior
+    value is kept, and both conditions are named in a WARNING."""
+    plug = make_plugin({})
+    dev = _make_stream_device(fake_indigo, expose_value=True)
+    dev.states["streamUrlHigh"] = "rtsps://x/prior-high"
+    api = _FakeStreamAPI(
+        {"high": None, "medium": "rtsps://x/m", "low": "rtsps://x/l", "package": None})
+    plug.api = api
+    plug._last_rest_call = 0.0
+    plug.camera_info = {}   # not cached
+
+    with caplog.at_level("WARNING"):
+        plug._refresh_stream_urls(dev)
+
+    assert api.create_calls == []
+    assert dev.states["streamUrlHigh"] == "rtsps://x/prior-high", "prior value must survive"
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("capabilities not loaded" in r.getMessage() for r in warning_records)
+    assert any("kept previous URL for" in r.getMessage() and "high" in r.getMessage()
+               for r in warning_records)
+
+
+@pytest.mark.parametrize("bad_body", [{}, {"error": "x"}])
+def test_shape_error_when_no_known_keys_present(fake_indigo, caplog, bad_body):
+    plug = make_plugin({})
+    dev = _make_stream_device(fake_indigo, expose_value=True)
+    dev.states["streamUrlHigh"] = "rtsps://x/prior-high"
+
+    class ShapeErrorAPI:
+        def get_rtsps_streams(self, camera_id):
+            return dict(bad_body)
+
+        def create_rtsps_streams(self, camera_id, qualities):
+            raise AssertionError("must not POST on a shape error")
+
+    plug.api = ShapeErrorAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("ERROR"):
+        plug._refresh_stream_urls(dev)
+
+    assert dev.states["streamUrlHigh"] == "rtsps://x/prior-high", "states must be untouched"
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("unexpected response shape" in r.getMessage() for r in error_records)
+
+
+def test_non_string_value_for_a_key_is_skipped_with_warning(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = _make_stream_device(fake_indigo, expose_value=True)
+
+    class WeirdShapeAPI:
+        def get_rtsps_streams(self, camera_id):
+            return {"high": 12345, "medium": "rtsps://x/m", "low": "rtsps://x/l",
+                     "package": None}
+
+        def create_rtsps_streams(self, camera_id, qualities):
+            raise AssertionError(
+                "camera_info is deliberately empty here -- capabilities are "
+                "unknown, so no guessed POST should ever be attempted"
+            )
+
+    plug.api = WeirdShapeAPI()
+    plug._last_rest_call = 0.0
+    # camera_info deliberately empty -- isolates this test to the
+    # skip-and-warn behaviour, not the POST/cache branch covered above.
+
+    with caplog.at_level("WARNING"):
+        plug._refresh_stream_urls(dev)
+
+    assert dev.states["streamUrlHigh"] == "", "a non-string value must not be written verbatim"
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("non-string value" in r.getMessage() and "high" in r.getMessage()
+               for r in warning_records)
+
+
 def test_stream_urls_error_leaves_prior_states_untouched_and_logs_stale(fake_indigo, caplog):
     plug = make_plugin({})
     dev = _make_stream_device(fake_indigo, expose_value=True)
@@ -1844,6 +1979,27 @@ def test_stream_urls_error_leaves_prior_states_untouched_and_logs_stale(fake_ind
     )
 
 
+def test_stream_urls_error_with_nothing_stored_says_not_stale(fake_indigo, caplog):
+    """The wording must not claim staleness for a URL that was never
+    fetched in the first place."""
+    plug = make_plugin({})
+    dev = _make_stream_device(fake_indigo, expose_value=True)
+
+    class FailingAPI:
+        def get_rtsps_streams(self, camera_id):
+            raise ProtectAPIError("HTTP 500 for /cameras/cam-1/rtsps-stream", status=500)
+
+    plug.api = FailingAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("ERROR"):
+        plug._refresh_stream_urls(dev)
+
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("no URLs are stored yet" in r.getMessage() for r in error_records)
+    assert not any("stale" in r.getMessage() for r in error_records)
+
+
 def test_device_start_comm_default_opted_out_writes_empty_stream_states(fake_indigo):
     """End-to-end through the real lifecycle call, not just the unit-level
     _refresh_stream_urls call the other tests above use directly."""
@@ -1856,16 +2012,19 @@ def test_device_start_comm_default_opted_out_writes_empty_stream_states(fake_ind
     assert dev.states["streamUrlPackage"] == ""
 
 
-def test_device_start_comm_with_api_none_and_opted_in_does_not_crash(fake_indigo):
-    """self.api is None (unconfigured plugin) but the device has opted in --
-    _refresh_stream_urls must guard and return WITHOUT writing any stream
-    state, rather than crashing on a None api."""
+def test_device_start_comm_opted_in_queues_pending_without_rest(fake_indigo):
+    """deviceStartComm must be cheap-only (threading review): an opted-in
+    device gets QUEUED, not fetched -- no stream state is written yet, and
+    a fatal-collaborator API proves the network was never touched, whether
+    or not self.api is even configured."""
     plug = make_plugin({})
+    plug.api = _RaisingStreamAPI()
     dev = add_camera_device_with_props(
-        fake_indigo, plug, {"exposeStreamUrls": True})   # must not raise
+        fake_indigo, plug, {"exposeStreamUrls": True})   # must not raise, must not fetch
 
     for key in plugin_module.STREAM_URL_STATES.values():
-        assert key not in dev.states, f"{key} must not be written when self.api is None"
+        assert key not in dev.states, f"{key} must not be written by deviceStartComm itself"
+    assert dev.id in plug._stream_refresh_pending
 
 
 def test_assert_no_url_in_message_trips_on_leak():
@@ -1876,3 +2035,188 @@ def test_assert_no_url_in_message_trips_on_leak():
     with pytest.raises(AssertionError):
         plugin_module._assert_no_url_in_message(
             f"oops the url is {token} right here", {"high": token})
+
+
+# ---------------------------------------------------------------------
+# Issue #7 follow-up (threading/socket-safety review): the synchronous
+# user-initiated paths must always report something, and the async
+# pump-drain path must never be able to take the event socket down.
+# ---------------------------------------------------------------------
+
+def test_refresh_stream_urls_action_opted_out_logs_info_and_clears(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = _make_stream_device(fake_indigo, expose_value=False)
+    dev.states["streamUrlHigh"] = "rtsps://x/prior"
+    plug.api = _RaisingStreamAPI()
+
+    with caplog.at_level("INFO"):
+        plug.refreshStreamUrls(object(), dev)
+
+    assert dev.states["streamUrlHigh"] == ""
+    assert dev.states["streamUrlMedium"] == ""
+    assert dev.states["streamUrlLow"] == ""
+    assert dev.states["streamUrlPackage"] == ""
+    info_records = [r for r in caplog.records if r.levelname == "INFO"]
+    assert any("tick 'Expose RTSPS stream URLs'" in r.getMessage() for r in info_records)
+
+
+def test_refresh_stream_urls_action_unconfigured_logs_error(fake_indigo, caplog):
+    plug = make_plugin({})   # self.api stays None
+    dev = _make_stream_device(fake_indigo, expose_value=True)
+
+    with caplog.at_level("ERROR"):
+        plug.refreshStreamUrls(object(), dev)
+
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("not configured" in r.getMessage() for r in error_records)
+
+
+class _RequestStatusAction:
+    deviceAction = indigo.kUniversalAction.RequestStatus
+
+
+def test_request_status_opted_out_logs_info_and_clears(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = _make_stream_device(fake_indigo, expose_value=False)
+    dev.states["streamUrlHigh"] = "rtsps://x/prior"
+    plug.api = _RaisingStreamAPI()
+
+    with caplog.at_level("INFO"):
+        plug.actionControlUniversal(_RequestStatusAction(), dev)
+
+    assert dev.states["streamUrlHigh"] == ""
+    info_records = [r for r in caplog.records if r.levelname == "INFO"]
+    assert any("tick 'Expose RTSPS stream URLs'" in r.getMessage() for r in info_records)
+
+
+def test_request_status_unconfigured_logs_error(fake_indigo, caplog):
+    plug = make_plugin({})   # self.api stays None
+    dev = _make_stream_device(fake_indigo, expose_value=True)
+
+    with caplog.at_level("ERROR"):
+        plug.actionControlUniversal(_RequestStatusAction(), dev)
+
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("not configured" in r.getMessage() for r in error_records)
+
+
+def test_pump_drains_one_pending_stream_refresh_per_tick(fake_indigo):
+    plug = make_plugin({})
+    dev_a = _make_stream_device(fake_indigo, expose_value=True, dev_id=1, camera_id="cam-a")
+    dev_b = _make_stream_device(fake_indigo, expose_value=True, dev_id=2, camera_id="cam-b")
+    _prep_pending(plug, dev_a, camera_id="cam-a")
+    _prep_pending(plug, dev_b, camera_id="cam-b")
+    plug.api = _FakeStreamAPI({"high": "rtsps://x/h", "medium": "rtsps://x/m",
+                                "low": "rtsps://x/l", "package": None})
+    plug._last_rest_call = 0.0
+
+    class TwoReadSocket:
+        last_frame_at = time.monotonic()
+
+        def __init__(self):
+            self.reads = 0
+
+        def read_message(self, timeout=1.0):
+            self.reads += 1
+            if self.reads > 2:
+                raise plug.StopThread()
+            return None
+
+        def send_ping(self):
+            pass
+
+    plug.socket = TwoReadSocket()
+
+    with pytest.raises(plug.StopThread):
+        plug._pump()   # must NOT raise ConnectionError -- socket stays "connected"
+
+    assert plug._stream_refresh_pending == set(), "both devices must drain, one per tick"
+    assert dev_a.states["streamUrlHigh"] == "rtsps://x/h"
+    assert dev_b.states["streamUrlHigh"] == "rtsps://x/h"
+
+
+def test_pump_drain_survives_a_device_write_failure_and_logs_untick(fake_indigo, caplog):
+    """Fatal-collaborator form, at the write step: updateStatesOnServer
+    raises. That must be caught by the drain, not by runConcurrentThread's
+    generic handler, which would tear the socket down over one bad camera.
+    """
+    plug = make_plugin({})
+    dev = _make_stream_device(fake_indigo, expose_value=True, dev_id=1, camera_id="cam-1")
+    _prep_pending(plug, dev)
+    plug.api = _FakeStreamAPI({"high": "rtsps://x/h", "medium": "rtsps://x/m",
+                                "low": "rtsps://x/l", "package": None})
+    plug._last_rest_call = 0.0
+
+    def boom(states):
+        raise RuntimeError("Indigo server busy")
+
+    dev.updateStatesOnServer = boom
+
+    class OneReadSocket:
+        last_frame_at = time.monotonic()
+
+        def __init__(self):
+            self.reads = 0
+
+        def read_message(self, timeout=1.0):
+            self.reads += 1
+            if self.reads > 1:
+                raise plug.StopThread()
+            return None
+
+        def send_ping(self):
+            pass
+
+    plug.socket = OneReadSocket()
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(plug.StopThread):
+            plug._pump()   # must NOT raise the RuntimeError
+
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("untick" in r.getMessage() for r in error_records)
+
+
+def test_leak_guard_failure_is_caught_by_the_pump_drain_not_raised(
+        fake_indigo, caplog, monkeypatch):
+    """Guard-wiring test: force _assert_no_url_in_message itself to raise,
+    and prove the drain still turns that into the 'untick' ERROR rather
+    than letting it escape."""
+    plug = make_plugin({})
+    dev = _make_stream_device(fake_indigo, expose_value=True, dev_id=1, camera_id="cam-1")
+    _prep_pending(plug, dev)
+    plug.api = _FakeStreamAPI({"high": "rtsps://x/h", "medium": "rtsps://x/m",
+                                "low": "rtsps://x/l", "package": None})
+    plug._last_rest_call = 0.0
+
+    def exploding_guard(message, *sources):
+        raise AssertionError("leak guard tripped")
+
+    monkeypatch.setattr(plugin_module, "_assert_no_url_in_message", exploding_guard)
+
+    with caplog.at_level("ERROR"):
+        plug._drain_one_pending_stream_refresh()   # must not raise
+
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("untick" in r.getMessage() for r in error_records)
+
+
+def test_open_socket_primes_but_never_fetches_stream_urls(fake_indigo, monkeypatch):
+    """_open_socket must only PRIME (queue) opted-in devices, never fetch --
+    a get_rtsps_streams/create_rtsps_streams that raises must not be able
+    to break the reconnect path, and must never even be called from here."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = _make_stream_device(fake_indigo, expose_value=True, dev_id=1, camera_id="cam-1")
+    plug.cameras = {"cam-1": {1}}
+    plug.api = _RaisingStreamAPI()
+    plug._last_rest_call = 0.0
+
+    class FakeSocket:
+        def connect(self):
+            pass
+
+    monkeypatch.setattr(plugin_module, "ProtectEventSocket", lambda *a, **k: FakeSocket())
+
+    plug._open_socket()   # must not raise
+
+    assert dev.id in plug._stream_refresh_pending, "opted-in device must be queued, not fetched"

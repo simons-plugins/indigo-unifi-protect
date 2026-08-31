@@ -478,6 +478,53 @@ def test_fake_api_key_never_appears_on_shape_validation_failure(monkeypatch):
 
 
 # ---------------------------------------------------------------------
+# get_rtsps_streams (issue #7) -- same body="" redaction on its own
+# shape-validation branch as create_rtsps_streams, per the threading/
+# leak review: an unexpected body (a proxy error page, a shape change)
+# could otherwise echo a URL back through .body.
+# ---------------------------------------------------------------------
+
+def test_get_rtsps_streams_parses_real_shape(monkeypatch):
+    body = json.dumps({
+        "high": "rtsps://192.0.2.1:7441/tok-high?enableSrtp",
+        "medium": "rtsps://192.0.2.1:7441/tok-medium?enableSrtp",
+        "low": "rtsps://192.0.2.1:7441/tok-low?enableSrtp",
+        "package": None,
+    }).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+
+    api = make_api()
+    result = api.get_rtsps_streams("cam1")
+
+    assert result["high"] == "rtsps://192.0.2.1:7441/tok-high?enableSrtp"
+    assert result["package"] is None
+
+
+def test_get_rtsps_streams_shape_error_body_is_never_propagated(monkeypatch):
+    """A non-dict body (e.g. a list) fails ProtectAPI's own shape check.
+    Unlike every other GET method in this module, this endpoint's shape-
+    error body must carry "" -- a malformed response here could plausibly
+    contain a URL/token, and that must never be readable off the
+    exception.
+    """
+    leaking_body = json.dumps(
+        ["rtsps://192.0.2.1:7441/SECRETTOKEN?enableSrtp"]
+    ).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(leaking_body)))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.get_rtsps_streams("cam1")
+
+    exc = excinfo.value
+    assert exc.body == ""
+    assert "SECRETTOKEN" not in str(exc)
+    assert "SECRETTOKEN" not in repr(exc)
+
+
+# ---------------------------------------------------------------------
 # create_rtsps_streams (issue #7) -- POST body, and the never-log-the-
 # token rule extended to the response BODY of a failed request, not just
 # the API key.

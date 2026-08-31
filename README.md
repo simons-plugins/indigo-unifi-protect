@@ -224,13 +224,21 @@ When enabled, four states are populated: `streamUrlHigh`, `streamUrlMedium`,
 unless the camera reports `hasPackageCamera` — most cameras don't have a
 package-detection lens and the controller returns `null` for it.
 
-They refresh automatically when the device starts, on every event-socket
-reconnect, and on **Send Status Request**. If a viewer stops working, fire
-the plugin's **Refresh Stream URLs** action (or Send Status Request) rather
-than assuming the URL is permanently dead: on the one console this was
-verified against, the token was identical across two calls ten seconds
-apart, but whether it rotates over a longer window (hours/days) is
-untested, and a stale token would look exactly like a broken stream.
+They refresh automatically after the device starts and on every event-socket
+reconnect — but not instantly: fetching a stream URL talks to the
+controller, and that happens in the background, throttled alongside every
+other request this plugin makes, so **the first URLs typically appear a
+few seconds after the plugin connects**, not the moment you tick the
+checkbox or the socket comes up. With several opted-in cameras, they fill
+in one at a time rather than all at once. If a viewer stops working, fire
+the plugin's **Refresh Stream URLs** action (or Send Status Request, which
+is synchronous and reports the outcome immediately) rather than assuming
+the URL is permanently dead: on the one console this was verified against,
+the token was identical across two calls ten seconds apart, but whether it
+rotates over a longer window (hours/days) is untested, and a stale token
+would look exactly like a broken stream. A momentary failure (e.g. a
+rate limit) never blanks a working URL — the plugin keeps whichever value
+it already had rather than clearing a stream a viewer might be using.
 
 A one-line example: copy the `streamUrlHigh` state's value and hand it
 straight to a player -- `ffplay "rtsps://192.168.0.10:7441/<token>?enableSrtp"`,
