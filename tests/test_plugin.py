@@ -1023,15 +1023,23 @@ class _RaisesIfTouched:
     def get_cameras(self):
         raise AssertionError("get_cameras must not be called")
 
+    def get_camera(self, camera_id):
+        raise AssertionError(f"get_camera must not be called (camera_id={camera_id!r})")
+
 
 class _RecordingAPI:
     """Records every patch_camera call and echoes the change back as the
     (full) response, matching the real API's contract of returning the
-    whole camera object."""
+    whole camera object. get_camera (used by setStatusLed's toggle re-read)
+    returns get_camera_response if given, else the same base_info -- pass a
+    different object to simulate a cache that's gone stale relative to the
+    controller's real current state."""
 
-    def __init__(self, base_info):
+    def __init__(self, base_info, get_camera_response=None):
         self.calls = []
+        self.get_camera_calls = []
         self._info = dict(base_info)
+        self._get_camera_response = get_camera_response
 
     def patch_camera(self, camera_id, body):
         self.calls.append((camera_id, body))
@@ -1042,6 +1050,11 @@ class _RecordingAPI:
             else:
                 merged[key] = value
         return merged
+
+    def get_camera(self, camera_id):
+        self.get_camera_calls.append(camera_id)
+        response = self._get_camera_response if self._get_camera_response is not None             else self._info
+        return dict(response)
 
 
 def test_set_status_led_gate_failure_does_not_touch_api(fake_indigo, caplog):
@@ -1070,14 +1083,40 @@ def test_set_status_led_success_updates_camera_info_and_state(fake_indigo):
 
 
 def test_set_status_led_toggle_inverts_cached_value(fake_indigo):
-    base = {"featureFlags": {"hasLedStatus": True}, "ledSettings": {"isEnabled": True}}
-    plug, dev = _configured_plugin(fake_indigo, base)
-    api = _RecordingAPI(base)
+    """Toggle re-reads the camera before inverting -- the cache can be days
+    stale (last changed from the UniFi app, not this plugin). Cache says
+    True; the fresh get_camera read says False; the PATCH must invert the
+    FRESH value, not the stale cached one."""
+    cached = {"featureFlags": {"hasLedStatus": True}, "ledSettings": {"isEnabled": True}}
+    fresh = {"featureFlags": {"hasLedStatus": True}, "ledSettings": {"isEnabled": False}}
+    plug, dev = _configured_plugin(fake_indigo, cached)
+    api = _RecordingAPI(cached, get_camera_response=fresh)
     plug.api = api
 
     plug.setStatusLed(SimpleNamespace(props={"mode": "toggle"}), dev)
 
-    assert api.calls == [("cam-1", {"ledSettings": {"isEnabled": False}})]
+    assert api.get_camera_calls == ["cam-1"]
+    assert api.calls == [("cam-1", {"ledSettings": {"isEnabled": True}})]
+
+
+def test_set_status_led_toggle_get_camera_error_sends_no_patch(fake_indigo, caplog):
+    """Fatal-collaborator form: patch_camera raises if ever reached, proving
+    a failed re-read aborts the action instead of falling back to the stale
+    cached value."""
+    base = {"featureFlags": {"hasLedStatus": True}, "ledSettings": {"isEnabled": True}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+
+    class RaisesOnGetCamera(_RaisesIfTouched):
+        def get_camera(self, camera_id):
+            raise ProtectAPIError("HTTP 500 for /cameras/cam-1", status=500)
+
+    plug.api = RaisesOnGetCamera()
+
+    with caplog.at_level("ERROR"):
+        plug.setStatusLed(SimpleNamespace(props={"mode": "toggle"}), dev)
+
+    assert plug.camera_info["cam-1"] == base
+    assert any(r.levelname == "ERROR" for r in caplog.records)
 
 
 def test_refused_patch_leaves_camera_info_and_device_state_untouched(fake_indigo, caplog):
@@ -1252,8 +1291,12 @@ def test_camera_not_cached_and_refresh_fails_no_patch_error_logged(fake_indigo, 
         plug.setStatusLed(SimpleNamespace(props={"mode": "on"}), dev)
 
     assert plug.camera_info == {}
-    assert any("unavailable" in r.getMessage().lower() for r in caplog.records
-               if r.levelname == "ERROR")
+    error_messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert any("unavailable" in m.lower() for m in error_messages)
+    assert any("500" in m for m in error_messages), (
+        "the HTTP 500 cause must reach an ERROR record via _describe_api_error, not "
+        "just a generic 'unavailable'"
+    )
 
 
 def test_get_video_mode_list_known_target_returns_camera_modes(fake_indigo):
@@ -1284,3 +1327,319 @@ def test_get_video_mode_list_target_device_exists_but_camera_not_cached_falls_ba
 
     assert result == [(mode, f"{mode} (unverified)")
                        for mode in plugin_module.VIDEO_MODE_SPEC_ENUM]
+
+
+# ---------------------------------------------------------------------
+# Issue #6 review fixes: shape errors, error-kind-specific wording,
+# strict enum validation, outcome logging, and a state-write safety net.
+# ---------------------------------------------------------------------
+
+def test_patch_camera_shape_error_does_not_replace_cache_and_triggers_refresh(fake_indigo, caplog):
+    """patch_camera raising kind='shape' (e.g. a 200 whose body doesn't
+    look like the real camera object) must NOT be cached, must not blank
+    hardware states, and must trigger a real GET refresh instead."""
+    base = {"id": "cam-1", "featureFlags": {"hasHdr": True}, "hdrType": "auto"}
+    plug, dev = _configured_plugin(fake_indigo, base)
+    plug._apply_camera_state("cam-1", force=True)
+    before_hdr_state = dev.states.get("hdrType")
+
+    class ShapeErrorAPI:
+        def __init__(self):
+            self.get_cameras_calls = 0
+
+        def patch_camera(self, camera_id, body):
+            raise ProtectAPIError(
+                "Unexpected response shape for /cameras/cam-1: expected the camera object",
+                status=None, kind="shape", body='{"id": "cam-1"}')
+
+        def get_cameras(self):
+            self.get_cameras_calls += 1
+            return [dict(base)]
+
+    api = ShapeErrorAPI()
+    plug.api = api
+
+    with caplog.at_level("ERROR"):
+        plug.setHdrMode(SimpleNamespace(props={"hdrType": "on"}), dev)
+
+    assert api.get_cameras_calls == 1
+    assert plug.camera_info["cam-1"] == base
+    assert dev.states["hdrType"] == before_hdr_state
+    assert any("unusable" in r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+
+
+def test_resolve_camera_refresh_succeeds_but_camera_still_absent(fake_indigo, caplog):
+    """Distinct from the refresh-FAILED case: the GET succeeds, but this
+    camera simply isn't in the result -- it's gone from the controller."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = add_camera_device(fake_indigo, plug)
+    plug.camera_info = {}
+    plug._last_rest_call = 0.0
+
+    class SucceedsButMissingAPI(_RaisesIfTouched):
+        def get_cameras(self):
+            return [{"id": "cam-other", "featureFlags": {}}]
+
+    plug.api = SucceedsButMissingAPI()
+
+    with caplog.at_level("ERROR"):
+        plug.setStatusLed(SimpleNamespace(props={"mode": "on"}), dev)
+
+    assert any("is not on the controller" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_patch_camera_401_gives_actionable_api_key_text(fake_indigo, caplog):
+    base = {"featureFlags": {"hasHdr": True}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+
+    class Auth401API:
+        def patch_camera(self, camera_id, body):
+            raise ProtectAPIError("HTTP 401 for /cameras/cam-1", status=401, kind="auth")
+
+    plug.api = Auth401API()
+
+    with caplog.at_level("ERROR"):
+        plug.setHdrMode(SimpleNamespace(props={"hdrType": "on"}), dev)
+
+    assert any("Regenerate it in UniFi OS" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_patch_camera_403_adds_permission_hint(fake_indigo, caplog):
+    base = {"featureFlags": {"hasHdr": True}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+
+    class Auth403API:
+        def patch_camera(self, camera_id, body):
+            raise ProtectAPIError("HTTP 403 for /cameras/cam-1", status=403, kind="auth")
+
+    plug.api = Auth403API()
+
+    with caplog.at_level("ERROR"):
+        plug.setHdrMode(SimpleNamespace(props={"hdrType": "on"}), dev)
+
+    assert any("lacks permission" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_patch_camera_transport_error_not_worded_refused_and_triggers_refresh(fake_indigo, caplog):
+    base = {"id": "cam-1", "featureFlags": {"hasHdr": True}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+
+    class TransportAPI:
+        def __init__(self):
+            self.get_cameras_calls = 0
+
+        def patch_camera(self, camera_id, body):
+            raise ProtectAPIError("Connection failure for /cameras/cam-1: timed out",
+                                   status=None, kind="transport")
+
+        def get_cameras(self):
+            self.get_cameras_calls += 1
+            return [dict(base)]
+
+    api = TransportAPI()
+    plug.api = api
+
+    with caplog.at_level("ERROR"):
+        plug.setHdrMode(SimpleNamespace(props={"hdrType": "on"}), dev)
+
+    error_messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert not any("refused" in m for m in error_messages)
+    assert any("outcome unknown" in m for m in error_messages)
+    assert api.get_cameras_calls == 1
+
+
+def test_patch_camera_429_includes_retry_after_seconds(fake_indigo, caplog):
+    base = {"featureFlags": {"hasHdr": True}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+
+    class RateLimitedAPI:
+        def patch_camera(self, camera_id, body):
+            raise ProtectAPIError("HTTP 429 for /cameras/cam-1", status=429,
+                                   kind="rate_limited", retry_after=7.0)
+
+    plug.api = RateLimitedAPI()
+
+    with caplog.at_level("ERROR"):
+        plug.setHdrMode(SimpleNamespace(props={"hdrType": "on"}), dev)
+
+    assert any("7s" in r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+
+
+_ACTION_MIN_PROPS = {
+    "setStatusLed": {"mode": "on"},
+    "setOsdOverlay": {"showName": "on", "showDate": "unchanged",
+                       "showLogo": "unchanged", "overlayLocation": "unchanged"},
+    "setVideoMode": {"videoMode": "sport"},
+    "setHdrMode": {"hdrType": "on"},
+    "setMicVolume": {"micVolume": "50"},
+}
+
+
+@pytest.mark.parametrize("method_name,props", list(_ACTION_MIN_PROPS.items()))
+def test_no_camera_selected_touches_nothing(fake_indigo, caplog, method_name, props):
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = add_camera_device(fake_indigo, plug, camera_id="")
+    plug.api = _RaisesIfTouched()
+
+    with caplog.at_level("ERROR"):
+        getattr(plug, method_name)(SimpleNamespace(props=props), dev)   # must not raise
+
+    assert plug.camera_info == {}
+    assert any("no camera selected" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+@pytest.mark.parametrize("method_name,props", list(_ACTION_MIN_PROPS.items()))
+def test_not_configured_touches_nothing(fake_indigo, caplog, method_name, props):
+    plug = make_plugin({})   # no host/apiKey -> self.api stays None
+    dev = add_camera_device(fake_indigo, plug)
+
+    with caplog.at_level("ERROR"):
+        getattr(plug, method_name)(SimpleNamespace(props=props), dev)   # must not raise
+
+    assert plug.camera_info == {}
+    assert any("not configured" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_set_status_led_invalid_mode_uppercase_rejected(fake_indigo, caplog):
+    """mode='ON' must be rejected, not silently read as falsy/off and
+    logged as success (the exact bug the review flagged)."""
+    base = {"featureFlags": {"hasLedStatus": True}, "ledSettings": {"isEnabled": True}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+    plug.api = _RaisesIfTouched()
+
+    with caplog.at_level("ERROR"):
+        plug.setStatusLed(SimpleNamespace(props={"mode": "ON"}), dev)
+
+    assert any("invalid mode" in r.getMessage().lower() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_set_status_led_missing_mode_rejected(fake_indigo, caplog):
+    base = {"featureFlags": {"hasLedStatus": True}, "ledSettings": {"isEnabled": True}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+    plug.api = _RaisesIfTouched()
+
+    with caplog.at_level("ERROR"):
+        plug.setStatusLed(SimpleNamespace(props={}), dev)
+
+    assert any("invalid mode" in r.getMessage().lower() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_set_osd_overlay_invalid_show_name_value_rejected(fake_indigo, caplog):
+    plug, dev = _configured_plugin(fake_indigo, {})
+    plug.api = _RaisesIfTouched()
+
+    with caplog.at_level("ERROR"):
+        plug.setOsdOverlay(SimpleNamespace(props={
+            "showName": "yes", "showDate": "unchanged",
+            "showLogo": "unchanged", "overlayLocation": "unchanged"}), dev)
+
+    assert any("invalid showName" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_set_status_led_success_log_states_outcome(fake_indigo, caplog):
+    base = {"featureFlags": {"hasLedStatus": True}, "ledSettings": {"isEnabled": True}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+    plug.api = _RecordingAPI(base)
+
+    with caplog.at_level("INFO"):
+        plug.setStatusLed(SimpleNamespace(props={"mode": "off"}), dev)
+
+    assert any("Set Status LED -> off" in r.getMessage() for r in caplog.records
+               if r.levelname == "INFO")
+
+
+def test_set_mic_volume_success_log_states_outcome(fake_indigo, caplog):
+    base = {"featureFlags": {"hasMic": True}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+    plug.api = _RecordingAPI(base)
+
+    with caplog.at_level("INFO"):
+        plug.setMicVolume(SimpleNamespace(props={"micVolume": "50"}), dev)
+
+    assert any("Set Microphone Volume -> 50" in r.getMessage() for r in caplog.records
+               if r.levelname == "INFO")
+
+
+def test_set_osd_overlay_success_log_states_outcome(fake_indigo, caplog):
+    base = {"osdSettings": {"isNameEnabled": False, "isDateEnabled": True}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+    plug.api = _RecordingAPI(base)
+
+    with caplog.at_level("INFO"):
+        plug.setOsdOverlay(SimpleNamespace(props={
+            "showName": "on", "showDate": "off",
+            "showLogo": "unchanged", "overlayLocation": "unchanged"}), dev)
+
+    assert any("Set OSD Overlay -> name on, date off" in r.getMessage() for r in caplog.records
+               if r.levelname == "INFO")
+
+
+def test_set_video_mode_success_log_states_outcome(fake_indigo, caplog):
+    base = {"featureFlags": {"videoModes": ["default", "sport"]}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+    plug.api = _RecordingAPI(base)
+
+    with caplog.at_level("INFO"):
+        plug.setVideoMode(SimpleNamespace(props={"videoMode": "sport"}), dev)
+
+    assert any("Set Video Mode -> sport" in r.getMessage() for r in caplog.records
+               if r.levelname == "INFO")
+
+
+def test_set_hdr_mode_success_log_states_outcome(fake_indigo, caplog):
+    base = {"featureFlags": {"hasHdr": True}}
+    plug, dev = _configured_plugin(fake_indigo, base)
+    plug.api = _RecordingAPI(base)
+
+    with caplog.at_level("INFO"):
+        plug.setHdrMode(SimpleNamespace(props={"hdrType": "auto"}), dev)
+
+    assert any("Set HDR Mode -> auto" in r.getMessage() for r in caplog.records
+               if r.levelname == "INFO")
+
+
+def test_state_update_failure_after_patch_does_not_escape(fake_indigo, caplog):
+    """Fatal-ish safety net: the PATCH already succeeded on the camera when
+    the Indigo-side state write blows up. The exception must not escape the
+    action callback, and the log must say the write applied -- NOT that the
+    whole action failed, which would leave the user thinking nothing
+    happened when the camera itself already changed."""
+    base = {"featureFlags": {"hasHdr": True}, "hdrType": "auto"}
+    plug, dev = _configured_plugin(fake_indigo, base)
+    plug.api = _RecordingAPI(base)
+
+    def boom(states):
+        raise RuntimeError("server busy")
+
+    dev.updateStatesOnServer = boom
+
+    with caplog.at_level("ERROR"):
+        plug.setHdrMode(SimpleNamespace(props={"hdrType": "on"}), dev)   # must not raise
+
+    assert any("applied on the camera" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_validate_action_config_ui_video_mode_empty_rejected(fake_indigo):
+    plug = make_plugin({})
+
+    valid, _values, errors = plug.validateActionConfigUi({"videoMode": ""}, "setVideoMode", 1001)
+
+    assert valid is False
+    assert "videoMode" in errors
+
+
+def test_validate_action_config_ui_video_mode_selected_accepted(fake_indigo):
+    plug = make_plugin({})
+
+    result = plug.validateActionConfigUi({"videoMode": "sport"}, "setVideoMode", 1001)
+
+    assert result[0] is True

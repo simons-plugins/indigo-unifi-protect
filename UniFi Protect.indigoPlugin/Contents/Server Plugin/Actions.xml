@@ -70,7 +70,7 @@
         <Name>Set Video Mode</Name>
         <CallbackMethod>setVideoMode</CallbackMethod>
         <ConfigUI>
-            <Field id="videoMode" type="menu">
+            <Field id="videoMode" type="menu" defaultValue="">
                 <Label>Video mode:</Label>
                 <List class="self" method="getVideoModeList" dynamicReload="true"/>
             </Field>
