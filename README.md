@@ -259,6 +259,16 @@ or paste the same URL into VLC's **Open Network Stream** dialog.
 > attach its output alongside a `GET /sensors` (or `/lights`, `/chimes`)
 > JSON dump from your console. The NVR device below is the one exception
 > -- its arm-state fields were captured live.
+>
+> **One known limitation, independent of the spec-derived caveat above:**
+> a leak that began before the plugin started (or before the event socket
+> last reconnected) is not shown until the sensor reports again -- the
+> `leakDetected`/`alarmTriggered`/`tampered` booleans only ever reflect a
+> LIVE event, because Protect's own poll response has no "currently
+> active" flag for these three, only a timestamp of when it was last
+> reported. The timestamps themselves (`lastLeak`/`lastAlarm`/
+> `lastTamper` on Protect Sensor) are still shown, so the information
+> isn't lost -- just not folded into the boolean.
 
 Each class gets its own Indigo device type, added and configured the same
 way as a camera: create a device, pick the Protect object from the
@@ -307,7 +317,7 @@ temperature/humidity/light-level readings on models that have them).
 States: `isOpen`, `motionDetected`, `leakDetected`, `alarmTriggered`,
 `alarmType`, `tampered`, `batteryLow`, `temperature`, `humidity`,
 `lightLevel`, `mountType`, `sensorState`, `connected`, `lastMotion`,
-`lastOpenChange`, `lastPoll`.
+`lastOpenChange`, `lastLeak`, `lastAlarm`, `lastTamper`, `lastPoll`.
 
 **Which state drives the device's on/off status** (what a "device turned
 on" trigger watches) is the **Primary state** device setting: `Auto`
@@ -317,7 +327,9 @@ pin it explicitly to Open/Closed, Motion, Leak, or Alarm.
 
 **Battery percentage is Indigo's native battery state**, not a plugin
 state -- it shows up wherever Indigo already shows battery level for any
-device, via the `SupportsBatteryLevel` device property.
+device, via the `SupportsBatteryLevel` device property. (The controller
+API marks the field this reads, `batteryStatus`, "deprecated" in favour of
+one that doesn't otherwise exist in the spec -- see `docs/CONTRACT.md`.)
 
 `motionDetected`/`leakDetected`/`alarmTriggered`/`tampered` are
 live-event-driven, so they follow the same honesty rule as camera motion:
@@ -325,6 +337,15 @@ when the event socket is down they go `False`, not "unknown". Everything
 else here (`isOpen`, `batteryLow`, `temperature`, ...) comes from the
 60-second poll and is kept at its last-known value through a socket
 outage, the same way a camera's hardware states survive one.
+
+**`leakDetected`/`alarmTriggered`/`tampered` cannot recover a pre-existing
+condition across a restart** (see the banner above): Protect's poll only
+gives a timestamp of the last report for these three, never a "still
+active" flag, so the boolean starts `False` until a new live event
+arrives. `lastLeak`, `lastAlarm`, and `lastTamper` hold the poll's own
+timestamp for each (blank if the sensor has never reported one), so the
+fact isn't lost even while the boolean can't show it. `isOpen` doesn't
+have this gap -- Protect's poll gives a real current open/closed flag.
 
 ### Protect Light (floodlight)
 

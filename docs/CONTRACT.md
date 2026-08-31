@@ -746,18 +746,25 @@ isinstance(parsed.get("featureFlags"), dict)` — raising
 been accepted and cached, blanking every hardware state and making every
 later capability gate lie "camera does not support X".
 
-**`_describe_api_error(exc)` maps `exc.kind` to one line of actionable
-Event Log text**, shared by `_patch_camera`'s error log and
+**`_describe_api_error(exc, entity="camera")` maps `exc.kind` to one line
+of actionable Event Log text**, shared by `_patch_camera`'s error log and
 `_refresh_camera_info`'s (NOT used by `takeSnapshot`/`discoverCameras`,
-whose existing wording predates this):
+whose existing wording predates this). `entity` names the noun in the
+`not_found`/`shape` wording -- the default keeps every existing
+camera-only caller's wording unchanged; issue #8's sensor/light/chime/NVR
+poll, RequestStatus, and action-error paths pass their own class name
+(`"sensor"`/`"light"`/`"chime"`/`"nvr"`) so e.g. a sensor 404 says "sensor
+not found", not "camera not found" (this was a real gap: the method was
+camera-only text applied verbatim to every device class' poll failures
+until `entity` was added):
 
 | `exc.kind` | Wording |
 |---|---|
 | `auth` | "UniFi Protect rejected the API key. Regenerate it in UniFi OS (Settings > Control Plane > Integrations) and update the plugin config" — a 403 specifically appends "or the key lacks permission for this operation" |
 | `rate_limited` | "rate limited by the controller" + " - retry in {N}s" when `retry_after` is known |
-| `not_found` | "camera not found on the controller (removed or re-adopted?) - reselect it in the device settings" |
+| `not_found` | "{entity} not found on the controller (removed or re-adopted?) - reselect it in the device settings" |
 | `transport` / `server` | "controller unreachable or errored ({exc}) - outcome unknown, states will update on the next refresh" — deliberately does NOT say "refused": the write may well have landed |
-| `shape` | "applied, but the response was unusable - refreshing camera info" |
+| `shape` | "applied, but the response was unusable - refreshing {entity} info" |
 | `bad_request` | "refused by the controller: " + the AJV `issues`, or `str(exc)` if there are none |
 
 On `shape`, `transport`, or `server` — the three kinds where the PATCH's
@@ -1138,8 +1145,15 @@ polls, the live event stream drives the boolean):
   fallback, a `null` `openStatusChangedAt` compares as "always older" than
   any real timestamp, so a single stale pulse would win FOREVER instead of
   self-expiring at the next poll like every other override in this
-  module. The winning timestamp doubles as `lastOpenChange`. Every pulse
-  that loses this comparison is DEBUG-logged with both timestamps.
+  module. The poll-baseline fallback is a COMPARISON ANCHOR ONLY and is
+  never itself reported: `lastOpenChange` is written only when the
+  winning timestamp is a REAL one -- `openStatusChangedAt` itself, or an
+  actual `sensorOpened`/`sensorClosed` pulse -- and is simply omitted
+  (not written as `""`, not re-written) otherwise. An earlier version
+  reported the poll-baseline fallback as `lastOpenChange` directly, which
+  made it advance by one poll interval every cycle forever even when
+  nothing about the sensor had changed. Every pulse that loses this
+  comparison is DEBUG-logged with both timestamps.
 - Sensor `batteryLow`: poll's `batteryStatus.isLow`, OR a `sensorBatteryLow`
   pulse newer than `_device_last_poll_ms[sensor_id]` -- self-expiring,
   since the next poll always advances that timestamp. A losing pulse is
@@ -1177,6 +1191,24 @@ failing first poll after reconnect could leave these devices reporting
 socket, which is what `connected` actually means here, is genuinely back
 up.
 
+**Recovery limitation (documented, not fixed -- there is no fix available
+from this API):** after a plugin restart, `leakDetected`/`alarmTriggered`+
+`alarmType`/`tampered` read `False` until a NEW live event arrives, even
+if the sensor's last-reported condition was still active when the plugin
+went down. The poll object carries only a `*DetectedAt`/`alarmTriggeredAt`
+timestamp for these three, never a "currently active" flag the way
+`isOpened`/`isMotionDetected` exist for open/motion -- so there is no
+honest way to reconstruct "is it STILL leaking/alarming/tampered right
+now" from a poll alone, and the plugin does not guess. What it does
+instead: `lastLeak` (newest of `leakDetectedAt`/`externalLeakDetectedAt`),
+`lastAlarm` (`alarmTriggeredAt`), and `lastTamper` (`tamperingDetectedAt`)
+surface those raw poll timestamps as their own String states (ISO or
+omitted when the poll never reported one) so the information is at least
+visible, even while the boolean itself is silent. Sensor `isOpen` and
+light `pirMotionDetected` do NOT have this gap -- the poll gives a real
+current-state field for both (`isOpened`, `isPirMotionDetected`), so no
+information is lost across a restart there.
+
 **`primaryState` resolution** (`protectSensor` only): `"auto"` (default)
 maps mount type to a boolean via `SENSOR_MOUNT_PRIMARY_STATE` --
 `door`/`window`/`garage` -> `isOpen`, `leak` -> `leakDetected`, `none` (or
@@ -1211,6 +1243,16 @@ of guessing the new shape; a failure on that re-`GET` logs "...set, but
 could not re-read... - states may be stale until the next poll" the same
 way the light-action path does.
 
+`setChimeVolume` specifically: on a cache miss (nothing in `chime_info`
+yet -- before the first poll, or after a poll failure), it `GET`s the
+chime FIRST, mirroring the light Toggle path's same rule -- "no
+ringSettings" is only ever reported after an actual read, never guessed
+from an empty cache. The PATCH body sends only the four documented
+`ringSettings` keys (`cameraId`, `repeatTimes`, `ringtoneId`, `volume`)
+per entry, dropping anything else a cached entry might carry: the PATCH
+item schema is `additionalProperties: false` while the GET schema is not,
+so echoing a cached entry wholesale can be rejected by the controller.
+
 **`actionControlUniversal` RequestStatus**, every new type: an immediate
 single-device `GET` (not the batch `GET .../sensors` etc.) + state write,
 mirroring the camera path's `_refresh_camera_info()` + `_apply_camera_state`,
@@ -1234,10 +1276,13 @@ five different physical sensor kinds):
 | `mountType` | String | poll `mountType` |
 | `sensorState` | String | poll `state`, or `STATE_UNAVAILABLE` |
 | `connected` | Boolean | event socket health |
-| `lastMotion` | String | ISO or `""`, from `last_family_ms(FAMILY_SENSOR_MOTION, ...)` |
-| `lastOpenChange` | String | ISO or `""`, the `isOpen` reconciliation's winning timestamp |
+| `lastMotion` | String | ISO or `""`; `_sensor_last_motion_ms` merges the tracker's `last_family_ms(FAMILY_SENSOR_MOTION, ...)` with the poll's `motionDetectedAt` (newest wins) -- without the poll side, this read `""` after every restart |
+| `lastOpenChange` | String | ISO, omitted (not `""`, never re-written) unless the `isOpen` reconciliation's winning timestamp was REAL (`openStatusChangedAt` or an actual pulse) -- the internal poll-baseline fallback must never be reported |
+| `lastLeak` | String | ISO, omitted if null; newest of poll `leakDetectedAt`/`externalLeakDetectedAt` -- see "Recovery limitation" above |
+| `lastAlarm` | String | ISO, omitted if null; poll `alarmTriggeredAt` -- see "Recovery limitation" above |
+| `lastTamper` | String | ISO, omitted if null; poll `tamperingDetectedAt` -- see "Recovery limitation" above |
 | `lastPoll` | String | ISO, only present on a poll-triggered write |
-| *(native)* `batteryLevel` | -- | poll `batteryStatus.percentage`, via `updateStateOnServer` -- **not** a `<State>` |
+| *(native)* `batteryLevel` | -- | poll `batteryStatus.percentage`, via `updateStateOnServer` -- **not** a `<State>`. The OpenAPI spec marks `batteryStatus` "[DEPRECATED] Use wirelessConnectionState.batteryStatus instead", but `wirelessConnectionState` appears nowhere else in the spec -- real firmware may still populate this field, or may already use the undocumented one; a likely first hardware-report item |
 
 **protectLight** (`type="relay"`): `onOffState` = `isLightOn`.
 
@@ -1381,3 +1426,27 @@ question is "when could this report idle/unavailable/kept and be wrong?":
   `test_every_written_state_is_declared_and_legal` is scoped to
   `protectSensor` only, so another type accidentally writing it would
   still be caught as undeclared
+
+#### Round-3 review coverage (final code-quality pass, PR #15)
+
+- `lastOpenChange` is never written across three consecutive polls with a
+  null `openStatusChangedAt` and no pulses (the fabrication bug); a real
+  `openStatusChangedAt` still writes it once
+- `_describe_api_error`'s default `entity="camera"` keeps existing
+  camera-only wording unchanged; a sensor 404 says "sensor not found", not
+  "camera not found"
+- `Devices.xml`: all four issue #8 device types (`protectSensor`,
+  `protectLight`, `protectChime`, `protectNvr`) declare the hidden
+  `SupportsStatusRequest` field
+- `setChimeVolume` on a cache miss `GET`s the chime before ever reporting
+  "no ringSettings"; the PATCH body carries only the four documented
+  `ringSettings` keys, dropping any extra field a cached entry might carry
+- a bool battery percentage is skipped, not written as a fabricated
+  battery level
+- sensor `lastMotion` merges the poll's `motionDetectedAt` with the
+  tracker's own timestamp (newest wins), proven both when only the poll
+  has one (post-restart) and when the tracker's is newer
+- `lastLeak`/`lastAlarm`/`lastTamper` are written from the poll's own
+  timestamps and skipped when null; a dedicated test pins the recovery
+  limitation directly: `leakDetected` reads `False` post-restart while
+  `lastLeak` still shows the poll's `leakDetectedAt`
