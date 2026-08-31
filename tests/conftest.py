@@ -32,6 +32,16 @@ SERVER_PLUGIN_DIR = (
 sys.path.insert(0, str(SERVER_PLUGIN_DIR))
 
 
+class _OrderingViolation(BaseException):
+    """Raised (never asserted) by ``_FakeDevice.stateListOrDisplayStateIdChanged``
+    when it is called after a state write has already happened. It derives
+    from ``BaseException``, not ``Exception``/``AssertionError``, because
+    plugin.py wraps that call in ``except Exception`` -- an AssertionError
+    would be silently swallowed there, hiding the very ordering bug this
+    exists to catch.
+    """
+
+
 class _FakeDevice:
     """Just enough of an Indigo device to record what a plugin writes to it."""
 
@@ -49,6 +59,10 @@ class _FakeDevice:
         self.state_writes = []
         self.image_writes = []
         self.replace_on_server_calls = 0
+        self.state_list_changed_calls = 0
+        # Set to an exception instance to make stateListOrDisplayStateIdChanged
+        # raise, for testing the deviceStartComm degradation path.
+        self.state_list_changed_raises = None
 
     def updateStateOnServer(self, key, value=None, **kwargs):
         self.states[key] = value
@@ -64,6 +78,25 @@ class _FakeDevice:
 
     def replaceOnServer(self):
         self.replace_on_server_calls += 1
+    def stateListOrDisplayStateIdChanged(self):
+        # Fatal ordering check, first call only: if THE FIRST call for this
+        # device happens after a state write, a plugin upgrade adding new
+        # Devices.xml states would silently drop writes to them -- this must
+        # run before the first write. Guarded to the first call (not "no
+        # writes ever") because the invariant is per-start, not per-lifetime:
+        # a deviceStartComm -> deviceStopComm -> deviceStartComm sequence
+        # legitimately has writes on the device before the second call.
+        # Raises _OrderingViolation rather than asserting, because plugin.py
+        # wraps this call in `except Exception`, which would otherwise hide
+        # the failure instead of surfacing it as a test failure.
+        if self.state_list_changed_calls == 0 and self.state_writes:
+            raise _OrderingViolation(
+                f"{self.name}: stateListOrDisplayStateIdChanged() called after "
+                "state writes had already started - it must run first"
+            )
+        self.state_list_changed_calls += 1
+        if self.state_list_changed_raises is not None:
+            raise self.state_list_changed_raises
 
 
 class _FakeDevices:
