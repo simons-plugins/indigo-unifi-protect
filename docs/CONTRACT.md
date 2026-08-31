@@ -140,15 +140,20 @@ are the audio add/classify/end sequence proving facts 1-2 above.
 
 ```python
 class ProtectAPIError(Exception):
-    """Raised for any non-2xx response or transport failure.
+    """Raised for any non-2xx response or transport failure -- or, since
+    the #6 review, for a 2xx whose body isn't trustworthy (kind="shape").
 
     Attributes:
         status (int|None), body (str), url (str)
-        kind (str): coarse failure category derived from `status`, so
-            callers can react without hardcoding numeric codes: "auth"
-            (401/403), "not_found" (404), "rate_limited" (429),
+        kind (str): coarse failure category, so callers can react without
+            hardcoding numeric codes. Derived from `status` by default:
+            "auth" (401/403), "not_found" (404), "rate_limited" (429),
             "bad_request" (400), "server" (5xx), "transport" (status is
-            None), "http" (any other non-2xx status).
+            None), "http" (any other non-2xx status). A constructor `kind`
+            argument overrides the derived value -- used for "shape" (a
+            2xx response that parsed fine but isn't recognizably the
+            object it claims to be; `status` is None there too, since it
+            isn't an HTTP failure).
         retry_after (float|None): seconds to wait before retrying, parsed
             from the response's `Retry-After` header when present (most
             relevant for kind == "rate_limited"). None when absent or
@@ -159,10 +164,12 @@ class ProtectAPIError(Exception):
     def issues(self) -> list[str]:
         """Field-level AJV validation issues from a 400 body, as
         "<instancePath>: <message>" strings (instancePath defaults to "/").
-        Lazily parsed from `body` on every access. [] when `body` isn't a
-        JSON object, has no `issues` list, or the error wasn't a
-        bad_request at all -- a refused PATCH does not always have issues
-        to show."""
+        Lazily parsed from `body` on every access. Falls back to `[error]`
+        when there's no `issues` list but `body` has a string `error` field
+        (e.g. a 404's `{"error":"Entity 'camera' not found"}`) -- the
+        controller's own one-line explanation is worth surfacing even
+        outside the AJV shape. [] only when `body` isn't JSON, or has
+        neither `issues` nor `error`."""
 
 class ProtectAPI:
     def __init__(self, host: str, api_key: str, verify_ssl: bool = False,
@@ -187,8 +194,16 @@ class ProtectAPI:
         Returns the FULL camera object from the response, same shape as
         get_camera, so a caller can replace its cached copy with it
         directly. Raises ProtectAPIError, including when the response
-        isn't a JSON object -- mirrors get_camera. On a refusal, the
-        server's AJV issues (if any) are on the raised error's `.issues`."""
+        isn't a JSON object -- mirrors get_camera -- AND when it IS a dict
+        but doesn't look like the real camera object (checked as
+        `parsed.get("id") == camera_id and
+        isinstance(parsed.get("featureFlags"), dict)`), raised with
+        kind="shape" so a caller can react distinctly from an actual
+        400/404 refusal. Without this second check, a 200 like
+        `{"id": "cam-1"}` -- a proxy wrapper with none of the real fields --
+        would be accepted and cached, blanking every hardware state.
+        On a refusal, the server's AJV issues (if any) are on the raised
+        error's `.issues`."""
 
     def get_snapshot(self, camera_id: str, high_quality: bool = False,
                       supports_high_quality: bool | None = None) -> bytes:
@@ -565,30 +580,82 @@ are written together in one batched call —
 Five `Actions.xml` entries, all `deviceFilter="self.protectCamera"`,
 `uiPath="DeviceActions"`, dispatched to a same-named `plugin.py` method:
 
-| Action id | Gate (`featureFlags`) | PATCH body |
-|---|---|---|
-| `setStatusLed` | `hasLedStatus` | `{"ledSettings": {"isEnabled": <bool>}}` — `mode` is `on`/`off`/literal, or `toggle` (inverts the cached `ledSettings.isEnabled`) |
-| `setOsdOverlay` | none | `{"osdSettings": {...}}`, built only from the fields the user set away from `unchanged` (`showName`→`isNameEnabled`, `showDate`→`isDateEnabled`, `showLogo`→`isLogoEnabled`, `overlayLocation`) |
-| `setVideoMode` | value ∈ `videoModes` | `{"videoMode": <str>}` |
-| `setHdrMode` | `hasHdr` | `{"hdrType": <str>}` |
-| `setMicVolume` | `hasMic` | `{"micVolume": <int 0-100>}` |
+| Action id | Gate (`featureFlags`) | `mode`/value enum | PATCH body |
+|---|---|---|---|
+| `setStatusLed` | `hasLedStatus` | `mode` ∈ `{on, off, toggle}` | `{"ledSettings": {"isEnabled": <bool>}}` |
+| `setOsdOverlay` | none | each of `showName`/`showDate`/`showLogo` ∈ `{unchanged, on, off}`, `overlayLocation` ∈ `{unchanged}` + the six-way enum | `{"osdSettings": {...}}`, built only from the fields set away from `unchanged` (`showName`→`isNameEnabled`, `showDate`→`isDateEnabled`, `showLogo`→`isLogoEnabled`, `overlayLocation`) |
+| `setVideoMode` | value ∈ camera's own `videoModes` | (gate doubles as the enum check) | `{"videoMode": <str>}` |
+| `setHdrMode` | `hasHdr` | `hdrType` ∈ `{auto, on, off}` | `{"hdrType": <str>}` |
+| `setMicVolume` | `hasMic` | int 0–100 | `{"micVolume": <int>}` |
+
+`setStatusLed`'s `mode="toggle"` does **not** invert the cached
+`ledSettings.isEnabled` directly — the cache can be days stale (last
+changed from the UniFi app, not this plugin), so toggle first re-reads the
+camera via `self._rest(self.api.get_camera, camera_id)`, updates
+`camera_info` from that read, and inverts the FRESH value. A failed
+re-read aborts with an ERROR and sends no PATCH.
+
+**Every enum/int prop is validated in the callback itself, not just
+trusted from the dialog** — `mode not in LED_MODES` (etc, per column
+above), naming the field and the invalid value in the ERROR log, no
+request made. This exists because a scripter can call `executeAction()`
+directly with any value: `mode="ON"` previously read as falsy under
+`mode == "on"` and silently turned the LED *off* while logging success.
 
 All five share `_resolve_camera(dev, what)` (resolves `cameraId`, confirms
 the plugin is configured, returns the cached camera object — refreshing
-once via `_refresh_camera_info()` if it isn't cached yet) and
-`_patch_camera(dev, camera_id, body, what)` (sends the PATCH via `_rest`,
-so it obeys `MIN_REST_INTERVAL` like every other call).
+once via `_refresh_camera_info()` if it isn't cached yet, which now
+returns `True`/`False` so `_resolve_camera` can tell "the id isn't in a
+fresh read" — the camera is genuinely gone, an ERROR names it and says to
+reselect it — from "the read itself failed", whose cause was already
+logged separately by `_refresh_camera_info`) and
+`_patch_camera(dev, camera_id, body, what, outcome)` (sends the PATCH via
+`_rest`, so it obeys `MIN_REST_INTERVAL` like every other call).
 
-**A refused PATCH is an ERROR in the Event Log naming the field the
-controller rejected; `camera_info` is only ever replaced by a 2xx
-response.** On success, `_patch_camera` replaces `self.camera_info[camera_id]`
-with the PATCH response (the full camera object) and calls
-`_apply_camera_state(camera_id, force=True)`, so the issue #4
-hardware/config states update immediately rather than waiting for the next
-`GET /cameras` refresh. On a `ProtectAPIError`, `camera_info` is left
-untouched and the log line is
-`f"{dev.name}: {what} refused - {exc}"` plus, when `exc.issues` is
-non-empty, `" (" + "; ".join(exc.issues) + ")"`.
+**`patch_camera` validates the response IS the camera object, not merely
+a dict** — `parsed.get("id") == camera_id and
+isinstance(parsed.get("featureFlags"), dict)` — raising
+`ProtectAPIError(..., kind="shape")` otherwise. Without this, a 200 like
+`{"id": "cam-1"}` (a proxy wrapper, none of the real fields) would have
+been accepted and cached, blanking every hardware state and making every
+later capability gate lie "camera does not support X".
+
+**`_describe_api_error(exc)` maps `exc.kind` to one line of actionable
+Event Log text**, shared by `_patch_camera`'s error log and
+`_refresh_camera_info`'s (NOT used by `takeSnapshot`/`discoverCameras`,
+whose existing wording predates this):
+
+| `exc.kind` | Wording |
+|---|---|
+| `auth` | "UniFi Protect rejected the API key. Regenerate it in UniFi OS (Settings > Control Plane > Integrations) and update the plugin config" — a 403 specifically appends "or the key lacks permission for this operation" |
+| `rate_limited` | "rate limited by the controller" + " - retry in {N}s" when `retry_after` is known |
+| `not_found` | "camera not found on the controller (removed or re-adopted?) - reselect it in the device settings" |
+| `transport` / `server` | "controller unreachable or errored ({exc}) - outcome unknown, states will update on the next refresh" — deliberately does NOT say "refused": the write may well have landed |
+| `shape` | "applied, but the response was unusable - refreshing camera info" |
+| `bad_request` | "refused by the controller: " + the AJV `issues`, or `str(exc)` if there are none |
+
+On `shape`, `transport`, or `server` — the three kinds where the PATCH's
+actual outcome on the camera is genuinely unknown — `_patch_camera`
+additionally calls `_refresh_camera_info()` so state catches up to
+whatever really happened on the controller, rather than waiting for the
+plugin's next scheduled refresh. `camera_info` is left untouched by the
+failed PATCH response itself in every case; a refresh may still legitimately
+replace it with real data.
+
+**A refused/errored PATCH is always an ERROR in the Event Log, described
+via the table above; `camera_info` is only ever replaced by the PATCH's
+own response when that response passes the shape check.** On success,
+`_patch_camera` replaces `self.camera_info[camera_id]` with the PATCH
+response and calls `_apply_camera_state(camera_id, force=True)` — itself
+wrapped in `try`/`except`, logging `"{what} applied on the camera, but the
+Indigo state update failed: {type}: {exc}"` rather than letting a
+`dev.updateStatesOnServer` failure escape the action callback, since the
+PATCH already landed on the camera even if Indigo's own state write then
+blows up. The success log states the outcome, e.g. `"Set Status LED ->
+off"`, `"Set Video Mode -> sport"`, `"Set OSD Overlay -> name on, date
+off"` — built by each caller, since only it knows what the PATCH meant
+(`_describe_osd_outcome` renders the OSD summary in the same field order
+the callback checks them).
 
 **Capability gating happens BEFORE any request**, using the cached
 `featureFlags` — never assumed, per the issue (one camera on the reference
@@ -597,7 +664,8 @@ gate (OSD text/logo/date toggles are universal); `setVideoMode` gates on
 the *value* being a member of that camera's own `featureFlags.videoModes`
 rather than a fixed flag. A gate failure is an ERROR log naming the camera
 and the missing capability, and no request is made — proven in tests with
-a fatal-collaborator API stub whose `patch_camera` raises if ever called.
+a fatal-collaborator API stub whose `patch_camera` (and, for the toggle
+re-read, `get_camera`) raises if ever called.
 
 `setVideoMode`'s ConfigUI menu is populated by the dynamic list
 `getVideoModeList(filter, valuesDict, typeId, targetId)`, which resolves
@@ -610,17 +678,22 @@ suffixed `" (unverified)"` so the dialog doesn't imply every listed mode
 is confirmed to work on the user's hardware; the PATCH is still validated
 against the camera's real list in `setVideoMode`, so picking an unverified
 mode the camera doesn't actually support is refused there, not silently
-sent.
+sent. The menu field carries `defaultValue=""`, and
+`validateActionConfigUi` rejects an empty selection ("Select a video
+mode.") — the empty string can never be a legal mode, so it can only mean
+nothing was picked.
 
 `validateActionConfigUi(valuesDict, typeId, deviceId)` — note the third
 parameter is the Indigo device id, not an action id, per the SDK's own
-naming — handles the two checks that belong to the dialog rather than the
+naming — handles the checks that belong to the dialog rather than the
 camera: `setOsdOverlay` rejects the save when every one of `showName` /
 `showDate` / `showLogo` / `overlayLocation` is still `unchanged` (nothing
-to send), and `setMicVolume` rejects a `micVolume` that doesn't parse as
-an int 0–100. Both callbacks re-check defensively (an empty OSD body, an
-out-of-range mic volume) because a scripter can call `executeAction()`
-directly and bypass the dialog — and its validation — entirely.
+to send); `setMicVolume` rejects a `micVolume` that doesn't parse as an
+int 0–100; `setVideoMode` rejects an empty `videoMode`. All three
+callbacks re-check defensively (an empty OSD body, an out-of-range mic
+volume, the enum checks described above) because a scripter can call
+`executeAction()` directly and bypass the dialog — and its validation —
+entirely.
 
 ---
 

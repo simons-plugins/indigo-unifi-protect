@@ -192,7 +192,11 @@ a silently-ignored PATCH.
 field the controller rejected (e.g. `/videoMode: must be equal to one of
 the allowed values`) when Protect's API returns one. A successful write
 never gets silently swallowed either way — the camera-info states above
-are only ever updated from an actual 2xx response, never assumed.
+are only ever updated from an actual 2xx response, never assumed. A
+network problem or a controller error reports its outcome as **unknown**,
+not as a refusal — the write may well have landed even though this
+particular response couldn't confirm it — and the plugin re-reads the
+camera to catch up rather than guessing either way.
 
 Verified live against a UNVR on Protect **7.2.105**, 2026-08-31: the API
 key alone authorises these writes, the same as every read in this plugin —
