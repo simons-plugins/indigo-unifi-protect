@@ -103,6 +103,15 @@ HDR_TYPES = ("auto", "on", "off")
 # are servable to control pages at /images/<SNAPSHOT_SUBDIR>/...
 SNAPSHOT_SUBDIR = "unifi-protect"
 
+# Stream-quality key (as returned by the rtsps-stream endpoint) -> the state
+# it is written to (issue #7). Order matters only for the log message below.
+STREAM_URL_STATES = {
+    "high": "streamUrlHigh",
+    "medium": "streamUrlMedium",
+    "low": "streamUrlLow",
+    "package": "streamUrlPackage",
+}
+
 
 def _truthy(value, default=True):
     """Coerce a pluginProps checkbox value to bool.
@@ -178,6 +187,18 @@ def _camera_info_states(info):
             states.append({"key": "osdDateEnabled", "value": bool(osd["isDateEnabled"])})
 
     return states
+
+
+def _assert_no_url_in_message(message, streams):
+    """Defensive guard for issue #7, mirroring protect_api.py's
+    ``_assert_no_secret``: the RTSPS stream URLs embed an access token and
+    must never reach the Event Log. Called on the one log line
+    ``_refresh_stream_urls`` builds from a live response.
+    """
+    for value in streams.values():
+        if isinstance(value, str) and value and value in message:
+            raise AssertionError("a stream URL must never appear in a log message")
+    return message
 
 
 class Plugin(indigo.PluginBase):
@@ -288,6 +309,9 @@ class Plugin(indigo.PluginBase):
         # Indigo has not yet started runConcurrentThread, so there is no socket
         # and the honest answer is False.
         self._apply_camera_state(camera_id, force=True)
+        # REST, not the event socket -- fine to call before the socket
+        # exists. Throttled by _rest like every other REST call.
+        self._refresh_stream_urls(dev)
 
     def deviceStopComm(self, dev):
         # Remove by device id, not by the camera id in props: if the user just
@@ -480,6 +504,14 @@ class Plugin(indigo.PluginBase):
         self._refresh_camera_info()
         for camera_id in list(self.cameras):
             self._apply_camera_state(camera_id, force=True)
+            # One extra throttled REST call per opted-in camera device on
+            # every reconnect (issue #7) -- a device that has never asked
+            # for stream URLs costs nothing here, since _refresh_stream_urls
+            # returns immediately for it.
+            for dev_id in sorted(self.cameras.get(camera_id, ())):
+                dev = indigo.devices.get(dev_id, None)
+                if dev is not None and dev.enabled:
+                    self._refresh_stream_urls(dev)
 
     def _pump(self):
         last_ping = time.monotonic()
@@ -723,6 +755,7 @@ class Plugin(indigo.PluginBase):
                 return
             self._refresh_camera_info()
             self._apply_camera_state(camera_id, force=True)
+            self._refresh_stream_urls(dev)
             self.logger.info(
                 f"{dev.name}: refreshed (event socket "
                 f"{'connected' if self._is_connected() else 'DOWN'})"
@@ -1077,6 +1110,69 @@ class Plugin(indigo.PluginBase):
         self.debug = not self.debug
         self.pluginPrefs["showDebugInfo"] = self.debug
         self.logger.info(f"Debug logging {'enabled' if self.debug else 'disabled'}")
+
+    # ------------------------------------------------------------------
+    # Stream URLs (issue #7) -- opt-in, never logged
+    #
+    # The RTSPS URL embeds an access token: treat it like a credential.
+    # Turning the per-device checkbox off must remove it from the Indigo
+    # database, not merely stop refreshing it.
+    # ------------------------------------------------------------------
+
+    def refreshStreamUrls(self, action, dev):
+        self._refresh_stream_urls(dev)
+
+    def _refresh_stream_urls(self, dev):
+        """Write the four RTSPS stream-URL states for one camera device.
+
+        Opt-in via the `exposeStreamUrls` checkbox. When it is off (the
+        default), all four states are forced to "" and nothing is
+        requested from the controller -- turning the box off must clear
+        the token from the database, not just stop updating it.
+
+        When it is on: GET the current streams; if every quality comes
+        back null, POST to create them (package only when the cached
+        camera object says hasPackageCamera). Never logs a URL -- only
+        which qualities came back present. A request failure leaves the
+        existing states untouched, since a transient error blanking a
+        stream a viewer is actively using would be worse than a stale one.
+        """
+        expose = dev.pluginProps.get("exposeStreamUrls", False)
+        if isinstance(expose, str):
+            expose = expose.strip().lower() == "true"
+        if not expose:
+            dev.updateStatesOnServer(
+                [{"key": key, "value": ""} for key in STREAM_URL_STATES.values()])
+            return
+        if self.api is None:
+            return
+
+        camera_id = dev.pluginProps.get("cameraId", "")
+        if not camera_id:
+            return
+
+        try:
+            streams = self._rest(self.api.get_rtsps_streams, camera_id)
+            if all(streams.get(quality) is None for quality in STREAM_URL_STATES):
+                qualities = ["high", "medium", "low"]
+                info = self.camera_info.get(camera_id) or {}
+                if info.get("hasPackageCamera"):
+                    qualities.append("package")
+                streams = self._rest(self.api.create_rtsps_streams, camera_id, qualities)
+        except ProtectAPIError as exc:
+            self.logger.error(
+                f"{dev.name}: could not refresh stream URLs ({exc}) - the "
+                "stored URLs may now be stale."
+            )
+            return
+
+        present = sorted(quality for quality in STREAM_URL_STATES if streams.get(quality))
+        self.logger.info(_assert_no_url_in_message(
+            f"{dev.name}: stream URLs refreshed ({', '.join(present)})", streams))
+        dev.updateStatesOnServer([
+            {"key": key, "value": streams.get(quality) or ""}
+            for quality, key in STREAM_URL_STATES.items()
+        ])
 
     # ------------------------------------------------------------------
     # Helpers
