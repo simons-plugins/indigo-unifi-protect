@@ -220,3 +220,10 @@ state-write. This is fine for occupancy and security automation, but the
 off-latency in particular means this plugin is **not a PIR replacement for
 lighting triggers** — don't wire it directly to a "turn lights off when
 motion stops" rule expecting sub-second response.
+
+## Further reading
+
+[`docs/API-REFERENCE.md`](./docs/API-REFERENCE.md) — the full official API
+surface: every endpoint, every `/subscribe/events` event type, what the
+official API can't give you that the private one can, and why. Internal
+module contract is in [`docs/CONTRACT.md`](./docs/CONTRACT.md).
