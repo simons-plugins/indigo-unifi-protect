@@ -106,4 +106,9 @@
         <Name>Refresh Cameras</Name>
         <CallbackMethod>refreshCameras</CallbackMethod>
     </Action>
+
+    <Action id="refreshStreamUrls" deviceFilter="self.protectCamera" uiPath="DeviceActions">
+        <Name>Refresh Stream URLs</Name>
+        <CallbackMethod>refreshStreamUrls</CallbackMethod>
+    </Action>
 </Actions>
