@@ -251,21 +251,30 @@ class ProtectEventSocket:
             try:
                 return json.loads(payload.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                self._logger.warning("Discarding malformed WS event frame: %s", exc)
+                # F6: named by `self._label`, not hardcoded "event" -- a
+                # devices-socket parse problem must not read as a motion-path
+                # problem in the log. The default instance's label is still
+                # "event", so this text is byte-identical for every existing
+                # (events-socket) caller.
+                self._logger.warning(
+                    "Discarding malformed WS %s frame: %s", self._label, exc)
                 return None
         if opcode == _OP_BINARY:
-            # On Protect 7.2.105, /subscribe/events is plain-text JSON only
-            # (the *private* /proxy/protect/ws/updates API is the binary +
-            # deflate one -- we deliberately don't use it). If Protect ever
-            # switches this socket to binary, every event is silently
-            # dropped, so make that loud instead of quiet.
+            # On Protect 7.2.105, this socket is plain-text JSON only (the
+            # *private* /proxy/protect/ws/updates API is the binary + deflate
+            # one -- we deliberately don't use it). If Protect ever switches
+            # this socket to binary, every frame is silently dropped, so make
+            # that loud instead of quiet. F6: `self._path`/neutral wording so
+            # a devices-socket problem doesn't point the debugger at the
+            # motion path -- the default (events) instance's own path is
+            # still named here, so this text is unchanged for existing callers.
             if not self._binary_warned:
                 self._binary_warned = True
                 self._logger.warning(
-                    "Received a BINARY WS frame on /subscribe/events -- this "
-                    "endpoint is expected to be plain-text JSON on Protect "
-                    "7.2.105. The frame carries nothing usable and is being "
-                    "discarded; events may be silently lost from here on.")
+                    "Received a BINARY WS frame on %s -- this endpoint is "
+                    "expected to be plain-text JSON on Protect 7.2.105. The "
+                    "frame carries nothing usable and is being discarded; "
+                    "data may be silently lost from here on.", self._path)
             return None
         return None
 

@@ -9,7 +9,9 @@ Happy-path coverage is deliberately thin. A camera that correctly reports
 motion when motion happened is not where this plugin fails.
 """
 
+import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +19,8 @@ import pytest
 import indigo
 import plugin as plugin_module
 from protect_api import ProtectAPIError
+
+CAPTURE_PATH = Path(__file__).parent / "fixtures" / "ws_devices_capture.json"
 
 
 def make_plugin(prefs=None):
@@ -1855,6 +1859,13 @@ class _FakeStreamAPI:
         self.get_calls = []
         self.create_calls = []
 
+    def get_cameras(self):
+        # F1: with a camera registered and no device socket, _poll_devices
+        # now refreshes camera_info as part of every poll tick -- these
+        # pump-drain tests exercise that same tick, so the fake must answer
+        # this call rather than raise AttributeError.
+        return []
+
     def get_rtsps_streams(self, camera_id):
         self.get_calls.append(camera_id)
         return dict(self._get_response)
@@ -2429,7 +2440,13 @@ def add_nvr_device(fake_indigo, plug, dev_id=3004, name="UNVR"):
 class _FatalNonCameraAPI:
     """Fatal-collaborator: every method raises if called. Proves
     _poll_devices only touches the classes that actually have a registered
-    device -- not merely that it 'usually' skips the others."""
+    device -- not merely that it 'usually' skips the others. get_cameras is
+    the one exception: F1 makes _poll_devices refresh cameras too, whenever
+    at least one is registered and the device socket is down (which it is
+    by default in these tests), so it must answer rather than raise."""
+
+    def get_cameras(self):
+        return []
 
     def get_sensors(self):
         raise AssertionError("get_sensors must not be called with no sensor registered")
@@ -4278,3 +4295,518 @@ def test_report_ignored_models_logs_once_per_key_debug_vs_warning(fake_indigo, c
     assert len(records("WARNING", "'bridge'")) == 0
     assert len(records("WARNING", "'weirdKey'")) == 1
     assert len(records("DEBUG", "'weirdKey'")) == 0
+
+
+# ---------------------------------------------------------------------
+# Review-round fixes to the /subscribe/devices feature (PR #26): F1-F9.
+# Same stance as the rest of this file -- "when could this be wrong?"
+# ---------------------------------------------------------------------
+
+def test_handle_device_frame_containment_error_once_then_debug(fake_indigo, caplog):
+    """T1/F8: a defect in _apply_camera_state must never escape
+    _handle_device_frame's try/except (that would tear the event socket
+    down over an unrelated bug), and a REPEAT of the same (model_key,
+    exception type) must log DEBUG, not flood the Event Log at ERROR once
+    per frame."""
+    plug = make_plugin({})
+    add_camera_device(fake_indigo, plug, camera_id="cam-1")
+    plug.socket = object()
+    plug.camera_info = {"cam-1": {"id": "cam-1", "modelKey": "camera", "state": "CONNECTED"}}
+
+    def boom(camera_id, connected=None, force=False):
+        raise RuntimeError("Indigo state write exploded")
+    plug._apply_camera_state = boom
+
+    with caplog.at_level("DEBUG"):
+        plug._handle_device_frame("update", "camera", "cam-1", {
+            "id": "cam-1", "modelKey": "camera", "ledSettings": {"isEnabled": True},
+        })
+        plug._handle_device_frame("update", "camera", "cam-1", {
+            "id": "cam-1", "modelKey": "camera", "ledSettings": {"isEnabled": False},
+        })
+
+    errors = [r for r in caplog.records
+              if r.levelname == "ERROR" and "Could not apply device-socket" in r.getMessage()]
+    debugs = [r for r in caplog.records
+              if r.levelname == "DEBUG" and "Could not apply device-socket" in r.getMessage()]
+    assert len(errors) == 1, "must log ERROR exactly once per (model_key, exception type)"
+    assert len(debugs) == 1, "the repeat must log DEBUG, not a second ERROR"
+
+
+def test_pump_wires_device_socket_frames_end_to_end(fake_indigo, caplog):
+    """T2: one real _pump run with a live device socket -- the real
+    ws_devices_capture.json ledSettings update lands on the Indigo device,
+    an unrecognized modelKey is ignored+counted (_report_ignored_models),
+    and a malformed envelope fires the F4 malformed-frame WARNING once."""
+    plug = make_plugin({})
+    camera_id = "69be54f600574703e4000ff4"
+    dev = add_camera_device(fake_indigo, plug, camera_id=camera_id)
+    plug.camera_info = {camera_id: {
+        "id": camera_id, "modelKey": "camera", "state": "CONNECTED",
+        "ledSettings": {"isEnabled": False, "welcomeLed": True, "floodLed": True},
+    }}
+    plug._apply_camera_state(camera_id, force=True)
+    assert dev.states["ledEnabled"] is False
+
+    with open(CAPTURE_PATH, encoding="utf-8") as f:
+        led_update = json.load(f)[0]
+    unknown_model_frame = {"type": "update", "item": {"id": "x1", "modelKey": "somethingNew"}}
+    malformed_frame = {"type": "update", "item": "not-a-dict"}
+    device_frames = [led_update, unknown_model_frame, malformed_frame]
+
+    class QuietEventsSocket:
+        def __init__(self):
+            self.last_frame_at = time.monotonic()
+            self.reads = 0
+
+        def read_message(self, timeout=0.5):
+            self.reads += 1
+            if self.reads > 3:
+                raise plug.StopThread()
+            return None
+
+        def send_ping(self):
+            pass
+
+    class FeedDeviceSocket:
+        last_frame_at = time.monotonic()
+
+        def __init__(self, msgs):
+            self._msgs = list(msgs)
+
+        def read_message(self, timeout=0.5):
+            if self._msgs:
+                return self._msgs.pop(0)
+            return None
+
+        def send_ping(self):
+            pass
+
+    plug.socket = QuietEventsSocket()
+    plug.device_socket = FeedDeviceSocket(device_frames)
+    plug._last_poll = time.monotonic()   # an unrelated poll firing must not confuse this test
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(plug.StopThread):
+            plug._pump()
+
+    assert dev.states["ledEnabled"] is True
+    assert plug.device_router.ignored_model_counts.get("somethingNew") == 1
+    malformed_warnings = [r for r in caplog.records
+                           if "unparseable device-socket frame" in r.getMessage()]
+    assert len(malformed_warnings) == 1
+
+
+def test_pump_device_socket_respects_retry_gate_then_reconnects(fake_indigo, monkeypatch):
+    """T3: a gate in the future must never construct a new socket at all
+    (fatal-collaborator ctor); once the gate has passed AND self.api is
+    set, _open_device_socket runs and a working fake reconnects."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    plug.startup()
+    plug.device_socket = None
+    plug._device_socket_retry_at = time.monotonic() + 100
+
+    def fatal_ctor(*_a, **_k):
+        raise AssertionError("ProtectEventSocket must not be constructed before the retry gate")
+    monkeypatch.setattr(plugin_module, "ProtectEventSocket", fatal_ctor)
+
+    now = time.monotonic()
+    sentinel = now - 5
+    result = plug._pump_device_socket(now, sentinel)
+    assert plug.device_socket is None
+    assert result == sentinel, "gate not passed -- last_device_ping must pass through unchanged"
+
+    class WorkingSocket:
+        last_frame_at = time.monotonic()
+
+        def connect(self):
+            pass
+
+    monkeypatch.setattr(plugin_module, "ProtectEventSocket", lambda *a, **k: WorkingSocket())
+    plug._device_socket_retry_at = time.monotonic() - 1
+
+    now2 = time.monotonic()
+    result2 = plug._pump_device_socket(now2, now2)
+    assert plug.device_socket is not None
+    assert result2 == now2
+
+
+def test_device_socket_ping_failure_tears_down_without_touching_events(fake_indigo, caplog):
+    """T4 (ping)."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = add_camera_device(fake_indigo, plug, camera_id="cam-1")
+    plug.socket = object()
+    plug._apply_camera_state("cam-1", connected=True, force=True)
+
+    closed = []
+
+    class PingFailSocket:
+        def __init__(self):
+            self.last_frame_at = time.monotonic()
+
+        def read_message(self, timeout=0.5):
+            return None
+
+        def send_ping(self):
+            raise ConnectionError("ping failed")
+
+        def close(self):
+            closed.append(True)
+
+    plug.device_socket = PingFailSocket()
+    now = time.monotonic()
+
+    with caplog.at_level("WARNING"):
+        plug._pump_device_socket(now, now - plugin_module.PING_INTERVAL - 1)
+
+    assert plug.device_socket is None
+    assert closed == [True]
+    warnings = [r for r in caplog.records if "Device-update socket lost" in r.getMessage()]
+    assert len(warnings) == 1
+    assert dev.states["connected"] is True, "the events socket state must be untouched"
+
+
+def test_device_socket_staleness_timeout_tears_down_without_touching_events(fake_indigo, caplog):
+    """T4 (staleness)."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = add_camera_device(fake_indigo, plug, camera_id="cam-1")
+    plug.socket = object()
+    plug._apply_camera_state("cam-1", connected=True, force=True)
+
+    closed = []
+
+    class StaleSocket:
+        def __init__(self):
+            self.last_frame_at = time.monotonic() - (plugin_module.STALE_TIMEOUT + 10)
+
+        def read_message(self, timeout=0.5):
+            return None
+
+        def send_ping(self):
+            raise AssertionError("must not ping -- recent last_device_ping takes the elif branch")
+
+        def close(self):
+            closed.append(True)
+
+    plug.device_socket = StaleSocket()
+    now = time.monotonic()
+
+    with caplog.at_level("WARNING"):
+        plug._pump_device_socket(now, now)   # recent last_device_ping -> no ping, falls to elif
+
+    assert plug.device_socket is None
+    assert closed == [True]
+    warnings = [r for r in caplog.records if "Device-update socket looks dead" in r.getMessage()]
+    assert len(warnings) == 1
+    assert dev.states["connected"] is True, "the events socket state must be untouched"
+
+
+def test_device_socket_nvr_add_rekeys_registry_from_placeholder(fake_indigo):
+    """T5: makes docs/CONTRACT.md's existing NVR-add claim actually true --
+    a device registered under the "nvr" placeholder must be MOVED by
+    _rekey_nvr once a real id arrives via `add`, not left orphaned."""
+    plug = make_plugin({})
+    dev = add_nvr_device(fake_indigo, plug)
+    plug.socket = object()
+    assert plug.nvrs == {"nvr": {dev.id}}
+    assert plug._nvr_known_id is None
+
+    plug._handle_device_frame("add", "nvr", "real-nvr-id", {
+        "id": "real-nvr-id", "modelKey": "nvr", "name": "UNVR",
+        "armMode": {"status": "disabled", "breachEventCount": 0},
+    })
+
+    assert plug._nvr_known_id == "real-nvr-id"
+    assert "nvr" not in plug.nvrs
+    assert plug.nvrs["real-nvr-id"] == {dev.id}
+    assert dev.states["armStatus"] == "disabled"
+
+
+def test_device_socket_flap_warns_once_then_recovers_after_stable_connection(
+        fake_indigo, monkeypatch, caplog):
+    """T6/F7: repeated connect-then-die cycles must log exactly ONE
+    WARNING total (not once per cycle) and grow backoff monotonically. A
+    connection that then stays up for >= STABLE_AFTER is forgiven
+    (warned reset, backoff reset, one "recovered" INFO) -- and a FRESH
+    outage after that warns again."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    plug.startup()
+
+    class FlappySocket:
+        """Connects fine, but the very first read raises -- an
+        accept-then-drop server."""
+        def __init__(self):
+            self.last_frame_at = time.monotonic()
+
+        def connect(self):
+            pass
+
+        def read_message(self, timeout=0.5):
+            raise ConnectionError("dropped immediately")
+
+        def send_ping(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(plugin_module, "ProtectEventSocket", lambda *a, **k: FlappySocket())
+
+    backoffs = []
+    with caplog.at_level("WARNING"):
+        for _ in range(5):
+            now = time.monotonic()
+            plug._device_socket_retry_at = now
+            plug._pump_device_socket(now, now)              # (re)connects
+            plug._pump_device_socket(time.monotonic(), time.monotonic())  # dies immediately
+            backoffs.append(plug._device_socket_backoff)
+
+    flap_warnings = [r for r in caplog.records
+                      if "falling back to 60s polling" in r.getMessage()
+                      or "Device-update socket lost" in r.getMessage()]
+    assert len(flap_warnings) == 1, "exactly one WARNING across the whole flap, not one per cycle"
+    assert backoffs == sorted(backoffs), "backoff must grow monotonically"
+    assert backoffs[-1] <= plugin_module.BACKOFF_MAX
+    assert backoffs[-1] > plugin_module.BACKOFF_START
+
+    # A connection that stays up for >= STABLE_AFTER must be forgiven.
+    class GoodSocket:
+        def __init__(self):
+            self.last_frame_at = time.monotonic()
+
+        def connect(self):
+            pass
+
+        def read_message(self, timeout=0.5):
+            return None
+
+        def send_ping(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(plugin_module, "ProtectEventSocket", lambda *a, **k: GoodSocket())
+    plug._device_socket_retry_at = time.monotonic()
+    now = time.monotonic()
+    plug._pump_device_socket(now, now)   # reconnects -- still "warned" from the flap
+    assert plug.device_socket is not None
+    assert plug._device_socket_warned is True
+
+    # Force the connection to look like it has survived STABLE_AFTER, without a real sleep.
+    plug._device_socket_connected_at = time.monotonic() - plugin_module.STABLE_AFTER - 1
+
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        plug._pump_device_socket(time.monotonic(), time.monotonic())
+
+    assert plug._device_socket_warned is False
+    assert plug._device_socket_backoff == plugin_module.BACKOFF_START
+    recovered = [r for r in caplog.records if "Device-update socket recovered" in r.getMessage()]
+    assert len(recovered) == 1
+
+    # A FRESH outage after recovery must warn again.
+    class DropAgain:
+        last_frame_at = time.monotonic()
+
+        def read_message(self, timeout=0.5):
+            raise ConnectionError("dropped again")
+
+        def send_ping(self):
+            pass
+
+        def close(self):
+            pass
+
+    plug.device_socket = DropAgain()
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        plug._pump_device_socket(time.monotonic(), time.monotonic())
+
+    fresh_warnings = [r for r in caplog.records if "Device-update socket lost" in r.getMessage()]
+    assert len(fresh_warnings) == 1
+
+
+@pytest.mark.parametrize("model_key,add_device_fn,cache_attr,initial,update_item,state_key,expected", [
+    ("sensor", "add_sensor_device", "sensor_info",
+     {"id": "sensor-1", "modelKey": "sensor", "isOpened": False},
+     {"id": "sensor-1", "modelKey": "sensor", "isOpened": True},
+     "isOpen", True),
+    ("light", "add_light_device", "light_info",
+     {"id": "light-1", "modelKey": "light", "isLightOn": False},
+     {"id": "light-1", "modelKey": "light", "isLightOn": True},
+     "onOffState", True),
+    ("chime", "add_chime_device", "chime_info",
+     {"id": "chime-1", "modelKey": "chime", "cameraIds": []},
+     {"id": "chime-1", "modelKey": "chime", "cameraIds": ["cam-a", "cam-b"]},
+     "pairedCameraCount", 2),
+])
+def test_device_socket_update_dispatch_table_per_class(
+        fake_indigo, model_key, add_device_fn, cache_attr, initial, update_item,
+        state_key, expected):
+    """T7: pins _handle_device_frame's per-class dispatch table -- a cached
+    + registered id of each non-camera/non-NVR class merges its update and
+    runs its own apply_fn (not some other class's)."""
+    add_device = globals()[add_device_fn]
+    plug = make_plugin({})
+    dev = add_device(fake_indigo, plug)
+    plug.socket = object()
+    device_id = initial["id"]
+    getattr(plug, cache_attr)[device_id] = dict(initial)
+    apply_fn = {
+        "sensor": plug._apply_sensor_state,
+        "light": plug._apply_light_state,
+        "chime": plug._apply_chime_state,
+    }[model_key]
+    apply_fn(device_id, force=True)
+
+    plug._handle_device_frame("update", model_key, device_id, update_item)
+
+    assert getattr(plug, cache_attr)[device_id] == {**initial, **update_item}
+    assert dev.states[state_key] == expected
+
+
+def test_poll_devices_camera_fallback_refreshes_when_device_socket_down(fake_indigo):
+    """T8 (down): with only cameras registered and no device socket, the
+    poll tick must refresh camera_info and re-apply camera state -- this is
+    F1 itself, the fix that makes the "falling back to 60s polling"
+    WARNING's promise actually true for cameras."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug, camera_id="cam-1")
+    plug.device_socket = None
+
+    class API:
+        def get_cameras(self):
+            return [{"id": "cam-1", "state": "CONNECTED", "ledSettings": {"isEnabled": True}}]
+
+    plug.api = API()
+    plug._last_rest_call = 0.0
+
+    plug._poll_devices()
+
+    assert plug.camera_info["cam-1"]["state"] == "CONNECTED"
+    assert dev.states["ledEnabled"] is True
+
+
+def test_poll_devices_camera_fallback_skipped_when_device_socket_up(fake_indigo):
+    """T8 (up): fatal-collaborator -- when the device socket is alive, push
+    already covers cameras, so the poll tick must NEVER touch get_cameras."""
+    plug = make_plugin({})
+    add_camera_device(fake_indigo, plug, camera_id="cam-1")
+    plug.device_socket = object()   # "up"
+
+    class FatalAPI:
+        def get_cameras(self):
+            raise AssertionError("get_cameras must not be called while the device socket is up")
+
+    plug.api = FatalAPI()
+    plug._last_rest_call = 0.0
+
+    plug._poll_devices()   # must not raise
+
+
+def test_device_socket_camera_remove_add_remove_warns_twice(fake_indigo, caplog):
+    """T9 (camera)/F2: the intervening `add` must clear the absence
+    episode, so a second `remove` warns again -- cameras have no list poll
+    of their own to clear it the way sensors/lights/chimes self-heal."""
+    plug = make_plugin({})
+    add_camera_device(fake_indigo, plug, camera_id="cam-1")
+    plug.socket = object()
+    plug.camera_info = {"cam-1": {"id": "cam-1", "modelKey": "camera", "state": "CONNECTED"}}
+    plug._apply_camera_state("cam-1", force=True)
+
+    with caplog.at_level("WARNING"):
+        plug._handle_device_frame("remove", "camera", "cam-1", {"id": "cam-1", "modelKey": "camera"})
+        plug._handle_device_frame(
+            "add", "camera", "cam-1", {"id": "cam-1", "modelKey": "camera", "state": "CONNECTED"})
+        plug._handle_device_frame("remove", "camera", "cam-1", {"id": "cam-1", "modelKey": "camera"})
+
+    warnings = [r for r in caplog.records if "not in the controller's list" in r.getMessage()]
+    assert len(warnings) == 2, "the intervening add must clear the episode so remove warns again"
+
+
+def test_device_socket_nvr_remove_warn_clear_warn_cycle(fake_indigo, caplog):
+    """T9 (NVR)/F3: an NVR remove was previously silent. A second remove
+    with no intervening add is the SAME absence episode (quiet); an add in
+    between clears it, so a following remove warns again."""
+    plug = make_plugin({})
+    dev = add_nvr_device(fake_indigo, plug)
+    plug.socket = object()
+    plug._nvr_known_id = "nvr1"
+    plug.nvrs = {"nvr1": {dev.id}}
+    plug.nvr_info = {"id": "nvr1", "modelKey": "nvr", "armMode": {"status": "disabled"}}
+    plug._apply_nvr_state(force=True)
+
+    with caplog.at_level("WARNING"):
+        plug._handle_device_frame("remove", "nvr", "nvr1", {"id": "nvr1", "modelKey": "nvr"})
+        plug._handle_device_frame("remove", "nvr", "nvr1", {"id": "nvr1", "modelKey": "nvr"})
+
+    warnings = [r for r in caplog.records if "not in the controller's list" in r.getMessage()]
+    assert len(warnings) == 1, "a second remove with no intervening add is the same episode"
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        plug._handle_device_frame(
+            "add", "nvr", "nvr1", {"id": "nvr1", "modelKey": "nvr", "armMode": {"status": "armed"}})
+        plug._handle_device_frame("remove", "nvr", "nvr1", {"id": "nvr1", "modelKey": "nvr"})
+
+    warnings2 = [r for r in caplog.records if "not in the controller's list" in r.getMessage()]
+    assert len(warnings2) == 1, "the intervening add must clear the episode so remove warns again"
+
+
+def test_open_device_socket_contains_non_connection_error(fake_indigo, monkeypatch, caplog):
+    """T10/F5: an AssertionError (e.g. protect_ws's _assert_no_secret) out
+    of connect() must be contained exactly like a ConnectionError -- warned
+    once, backed off, never escapes to runConcurrentThread's generic
+    handler."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    plug.startup()
+
+    class BoomSocket:
+        def connect(self):
+            raise AssertionError("simulated protect_ws _assert_no_secret failure")
+
+    monkeypatch.setattr(plugin_module, "ProtectEventSocket", lambda *a, **k: BoomSocket())
+
+    with caplog.at_level("WARNING"):
+        plug._open_device_socket()   # must not raise
+
+    assert plug.device_socket is None
+    warnings = [r for r in caplog.records
+                if "Device-update socket could not connect" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "AssertionError" in warnings[0].getMessage()
+
+
+def test_pump_device_socket_contains_non_connection_error_from_read(fake_indigo, caplog):
+    """T10/F5: a non-ConnectionError out of read_message mid-pump (e.g. a
+    future struct.error in the shared frame parser) must be contained the
+    same way a ConnectionError is -- the events socket/motion path must be
+    completely untouched."""
+    plug = make_plugin({})
+    dev = add_camera_device(fake_indigo, plug, camera_id="cam-1")
+    plug.socket = object()
+    plug._apply_camera_state("cam-1", connected=True, force=True)
+
+    class BoomReadSocket:
+        last_frame_at = time.monotonic()
+
+        def read_message(self, timeout=0.5):
+            raise AssertionError("simulated frame-parser bug")
+
+        def send_ping(self):
+            raise AssertionError("must not be reached")
+
+        def close(self):
+            pass
+
+    plug.device_socket = BoomReadSocket()
+    now = time.monotonic()
+
+    with caplog.at_level("WARNING"):
+        plug._pump_device_socket(now, now)
+
+    assert plug.device_socket is None
+    warnings = [r for r in caplog.records if "Device-update socket lost" in r.getMessage()]
+    assert len(warnings) == 1
+    assert dev.states["connected"] is True, "the events socket state must be untouched"

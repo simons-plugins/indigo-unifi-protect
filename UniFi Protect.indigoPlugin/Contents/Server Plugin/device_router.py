@@ -40,13 +40,21 @@ _FRAME_TYPES = frozenset({"add", "update", "remove"})
 # or not a string -- distinct from any real (if unhandled) modelKey string.
 MISSING_MODEL_KEY = "<missing>"
 
+# Cap on distinct keys tracked by ignored_model_counts, mirroring
+# event_tracker.MAX_IGNORED_TYPE_KEYS -- a stream sending an unbounded
+# variety of modelKey strings (or a misbehaving one) would otherwise grow
+# this dict without bound; past the cap, every NEW key is folded into
+# OTHER_MODEL_KEY instead.
+MAX_IGNORED_MODEL_KEYS = 64
+OTHER_MODEL_KEY = "<other>"
+
 
 class DeviceUpdateRouter:
     """Classifies one `/subscribe/devices` frame at a time.
 
     `route()` never raises. A frame that cannot be parsed at all (the
-    message/item isn't a dict, `id` is missing/empty, or `type` is
-    missing/not one of add/update/remove) is counted in `malformed_count`
+    message/item isn't a dict, `id` is missing/empty/non-string, or `type`
+    is missing/not one of add/update/remove) is counted in `malformed_count`
     and `route()` returns None. A frame that parses fine but names a
     `modelKey` this plugin doesn't act on (viewer, speaker, bridge,
     aiprocessor, aiport, linkstation, or an absent/non-string value) is
@@ -70,7 +78,11 @@ class DeviceUpdateRouter:
     def ignored_model_counts(self) -> dict:
         """Count of well-formed frames whose `item.modelKey` is not in
         HANDLED_MODEL_KEYS, keyed by that modelKey (`"<missing>"` when
-        absent or not a string). A copy, so callers can't mutate
+        absent or not a string). NOT malformed -- these frames parsed fine,
+        they just aren't a class this plugin has an Indigo device type for.
+        Capped at `MAX_IGNORED_MODEL_KEYS` distinct keys -- mirroring
+        event_tracker.ignored_type_counts's own cap -- with anything past
+        that folded into `OTHER_MODEL_KEY`. A copy, so callers can't mutate
         router-internal state through it."""
         return dict(self._ignored_model_counts)
 
@@ -116,6 +128,9 @@ class DeviceUpdateRouter:
         model_key = item.get("modelKey")
         if model_key not in HANDLED_MODEL_KEYS:
             key = model_key if isinstance(model_key, str) and model_key else MISSING_MODEL_KEY
+            if (key not in self._ignored_model_counts
+                    and len(self._ignored_model_counts) >= MAX_IGNORED_MODEL_KEYS):
+                key = OTHER_MODEL_KEY
             self._ignored_model_counts[key] = self._ignored_model_counts.get(key, 0) + 1
             return None
 

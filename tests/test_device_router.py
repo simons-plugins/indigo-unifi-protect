@@ -12,7 +12,9 @@ import pytest
 
 from device_router import (
     HANDLED_MODEL_KEYS,
+    MAX_IGNORED_MODEL_KEYS,
     MISSING_MODEL_KEY,
+    OTHER_MODEL_KEY,
     DeviceUpdateRouter,
     merge_update,
 )
@@ -237,3 +239,27 @@ def test_capture_all_four_frames_replay_with_expected_tallies():
     assert [r is not None for r in results] == [True, False, True, True]
     assert router.malformed_count == 0
     assert router.ignored_model_counts == {"bridge": 1}
+
+
+# ---------------------------------------------------------------------
+# T12 (F9): ignored_model_counts is capped at MAX_IGNORED_MODEL_KEYS
+# distinct keys, mirroring event_tracker's own ignored_type_counts cap --
+# see test_event_tracker.py::test_ignored_type_counts_caps_distinct_keys_and_buckets_overflow.
+# ---------------------------------------------------------------------
+
+def test_ignored_model_counts_caps_distinct_keys_and_buckets_overflow():
+    router = DeviceUpdateRouter()
+    for i in range(MAX_IGNORED_MODEL_KEYS):
+        router.route({"type": "update", "item": {"id": f"d{i}", "modelKey": f"weirdModel{i}"}})
+
+    assert len(router.ignored_model_counts) == MAX_IGNORED_MODEL_KEYS
+
+    # The next two distinct modelKeys must be bucketed under OTHER_MODEL_KEY,
+    # not get their own keys.
+    router.route({"type": "update", "item": {"id": "over1", "modelKey": "weirdModelOverflow1"}})
+    router.route({"type": "update", "item": {"id": "over2", "modelKey": "weirdModelOverflow2"}})
+
+    assert len(router.ignored_model_counts) == MAX_IGNORED_MODEL_KEYS + 1
+    assert "weirdModelOverflow1" not in router.ignored_model_counts
+    assert "weirdModelOverflow2" not in router.ignored_model_counts
+    assert router.ignored_model_counts[OTHER_MODEL_KEY] == 2

@@ -92,10 +92,15 @@ class FakeSocket:
         self.closed = True
 
 
-def make_socket(chunks=None) -> ProtectEventSocket:
+def make_socket(chunks=None, label="event", path=None) -> ProtectEventSocket:
     """A ProtectEventSocket wired directly to a FakeSocket, bypassing
-    connect() (and therefore the network) entirely."""
-    ws = ProtectEventSocket("192.0.2.1", "fake-api-key")
+    connect() (and therefore the network) entirely. `label`/`path` let a
+    test build a /subscribe/devices-shaped instance (issue #18, F6) without
+    duplicating this wiring."""
+    kwargs = {"label": label}
+    if path is not None:
+        kwargs["path"] = path
+    ws = ProtectEventSocket("192.0.2.1", "fake-api-key", **kwargs)
     ws._sock = FakeSocket(chunks)  # pylint: disable=protected-access
     ws._buffer = b""  # pylint: disable=protected-access
     return ws
@@ -538,3 +543,51 @@ def test_custom_label_set_via_constructor_appears_in_error_text():
     ws = ProtectEventSocket("192.0.2.1", "fake-api-key", label="device")
     with pytest.raises(ConnectionError, match="Protect device socket"):
         ws.send_ping()
+
+
+# ---------------------------------------------------------------------
+# T11 (F6): the malformed-frame and BINARY log lines must name whichever
+# socket actually saw the problem, not hardcode "event"/"/subscribe/events"
+# -- a devices-socket defect must not point the debugger at the motion path.
+# ---------------------------------------------------------------------
+
+_DEVICE_PATH = "/proxy/protect/integration/v1/subscribe/devices"
+
+
+def test_device_labeled_socket_names_itself_in_malformed_and_binary_warnings(caplog):
+    ws = make_socket([
+        build_frame(_OP_TEXT, b"not json", fin=True),
+        build_frame(_OP_BINARY, b"\x00", fin=True),
+        text_frame('{"after": true}'),
+    ], label="device", path=_DEVICE_PATH)
+
+    with caplog.at_level("WARNING"):
+        msg = ws.read_message(timeout=1.0)
+
+    assert msg == {"after": True}
+    malformed = [r for r in caplog.records if "Discarding malformed WS" in r.getMessage()]
+    binary = [r for r in caplog.records if "BINARY WS frame" in r.getMessage()]
+    assert len(malformed) == 1
+    assert "device" in malformed[0].getMessage()
+    assert len(binary) == 1
+    assert "subscribe/devices" in binary[0].getMessage()
+    assert "subscribe/events" not in binary[0].getMessage()
+
+
+def test_default_instance_malformed_and_binary_wording_stays_pinned(caplog):
+    """The default (events) instance keeps naming itself -- byte-compatible
+    with the pre-F6 "event" label for the malformed case, and still names
+    /subscribe/events for the binary case."""
+    ws = make_socket([
+        build_frame(_OP_TEXT, b"not json", fin=True),
+        build_frame(_OP_BINARY, b"\x00", fin=True),
+        text_frame('{"after": true}'),
+    ])
+
+    with caplog.at_level("WARNING"):
+        ws.read_message(timeout=1.0)
+
+    malformed = [r for r in caplog.records if "Discarding malformed WS" in r.getMessage()]
+    binary = [r for r in caplog.records if "BINARY WS frame" in r.getMessage()]
+    assert "event" in malformed[0].getMessage()
+    assert "/subscribe/events" in binary[0].getMessage()

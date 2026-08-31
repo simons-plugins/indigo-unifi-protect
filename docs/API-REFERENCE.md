@@ -184,8 +184,9 @@ aiprocessor, aiport, linkstation`.
 **Used by the plugin since issue #18** (v2026.8.0) as a second, independent
 push source alongside `/subscribe/events`: a `runConcurrentThread`-owned
 `ProtectEventSocket` instance (the same class, just a different `path`/
-`label`) is opened right after the events socket in `_open_socket`, polled
-in the same `_pump()` tick, and routed through `device_router.py`
+`label`) is opened at the END of `_open_socket` — after the initial poll,
+not "right after" the events socket handshake — polled in the same
+`_pump()` tick, and routed through `device_router.py`
 (`DeviceUpdateRouter.route()` + `merge_update()`) into the existing
 camera/sensor/light/chime/nvr caches — see `docs/CONTRACT.md`'s "second
 socket" section for the full design. It replaces the previous need to wait
@@ -194,9 +195,15 @@ flipped from the UniFi app, or a camera's `state` transitioning) — a
 successful `update`/`add`/`remove` frame updates Indigo state immediately.
 
 It does **not** replace the poll: chimes and the NVR have no other live
-feed, sensors/lights still need it for measurements the socket doesn't
-push, and the socket's own retry/backoff is independent of (and may be
-down while) the poll keeps working. It also does **not** affect
+feed, and the socket's own retry/backoff is independent of (and may be
+down while) the poll keeps working -- the poll surviving a device-socket
+outage is the durable justification, not a verified claim about what the
+socket pushes. (Whether `/subscribe/devices` ever pushes a sensor/light
+`stats`/measurement change has NOT been verified against real hardware --
+the reference rig's `/sensors`/`/lights` are both empty, so there is
+nothing to capture against; treat "sensors/lights still need the poll for
+measurements" as unconfirmed, not as a proven wire fact.) It also does
+**not** affect
 `connected` or camera motion in any way — those remain entirely driven by
 `/subscribe/events`; losing the device socket only means config/state
 states go back to being poll-only (60s) freshness until it reconnects.
