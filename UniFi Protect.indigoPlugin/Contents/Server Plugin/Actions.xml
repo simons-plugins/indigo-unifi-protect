@@ -111,4 +111,24 @@
         <Name>Refresh Stream URLs</Name>
         <CallbackMethod>refreshStreamUrls</CallbackMethod>
     </Action>
+
+    <Action id="setLightLevel" deviceFilter="self.protectLight" uiPath="DeviceActions">
+        <Name>Set LED Level</Name>
+        <CallbackMethod>setLightLevel</CallbackMethod>
+        <ConfigUI>
+            <Field id="ledLevel" type="textfield" defaultValue="3">
+                <Label>LED level (1-6):</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="setChimeVolume" deviceFilter="self.protectChime" uiPath="DeviceActions">
+        <Name>Set Chime Volume</Name>
+        <CallbackMethod>setChimeVolume</CallbackMethod>
+        <ConfigUI>
+            <Field id="volume" type="textfield" defaultValue="50">
+                <Label>Ring volume (0-100):</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
 </Actions>
