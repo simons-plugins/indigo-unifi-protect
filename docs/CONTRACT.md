@@ -405,6 +405,9 @@ Standard Indigo lifecycle. Key points:
   mapping Protect camera id → the set of Indigo device ids pointed at it (a
   set, not a scalar, because Indigo's Duplicate command trivially produces
   two devices on one camera).
+- `deviceStartComm` must call `stateListOrDisplayStateIdChanged()` before its
+  first state write — Indigo does not add new Devices.xml states to existing
+  devices otherwise.
 
 ### State IDs — strict, undocumented Indigo rule
 
