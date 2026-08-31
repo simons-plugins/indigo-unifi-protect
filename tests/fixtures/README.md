@@ -20,3 +20,14 @@ not the array the plural path name might suggest), so this fixture blends
 the spec's `nvr` schema (`doorbellSettings`, etc.) with the live-observed
 `armMode`/`type`/`guid`/`mac` fields that are not in the spec at all — see
 docs/CONTRACT.md for exactly which parts of the NVR shape are verified.
+
+`ws_devices_capture.json` (issue #18) is a mix: the two `update` frames
+mirror the real `/subscribe/devices` capture described in
+`docs/API-REFERENCE.md` (a `PATCH ledSettings.isEnabled` producing a camera
+`update` whose `ledSettings` arrives as the whole sub-object, plus an
+unrelated `bridge` `update` carrying only `id`/`modelKey`/`guid`) — the ids
+and exact field values are synthesized, not the literal captured payload.
+The `add` (sensor) and `remove` (camera) frames were never observed live —
+they are built from the spec's documented envelope (`add` = full object,
+`remove` = bare `id`+`modelKey`) since the reference rig's devices socket
+was only ever exercised for an `update`.

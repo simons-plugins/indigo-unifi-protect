@@ -25,6 +25,7 @@ from datetime import datetime
 
 import indigo
 
+from device_router import DeviceUpdateRouter, MISSING_MODEL_KEY, merge_update
 from event_tracker import (
     EventTracker,
     FAMILY_SENSOR_ALARM,
@@ -36,6 +37,17 @@ from event_tracker import (
 )
 from protect_api import ProtectAPI, ProtectAPIError
 from protect_ws import ProtectEventSocket
+
+# issue #18: modelKeys the /subscribe/devices spec documents but this plugin
+# has no Indigo device type for. An unhandled key OUTSIDE this set is either
+# a brand-new modelKey or a parsing gap -- worth a WARNING. One of these is
+# expected/unremarkable -- DEBUG, mirroring KNOWN_UNSUPPORTED_EVENT_TYPES's
+# same ring/DEBUG treatment on the events socket.
+KNOWN_UNHANDLED_MODEL_KEYS = frozenset({
+    "viewer", "speaker", "bridge", "aiprocessor", "aiport", "linkstation",
+})
+
+DEVICE_SOCKET_PATH = "/proxy/protect/integration/v1/subscribe/devices"
 
 # The controller rate-limits. Measured on Protect 7.2.105: ~5 req/s earned
 # HTTP 429; one request per 3s was clean. Nothing was measured in between, so
@@ -281,6 +293,42 @@ class Plugin(indigo.PluginBase):
         self.api = None
         self.socket = None
         self.tracker = EventTracker()
+
+        # Issue #18: a second, independent WebSocket for device-object
+        # (config/state) push, alongside the events socket above. Its own
+        # retry/backoff state is deliberately separate from the reconnect
+        # loop in runConcurrentThread -- a device-socket outage must never
+        # be able to affect the events socket, which is the only thing
+        # `connected` (and therefore motion validity) means. See
+        # docs/CONTRACT.md, "second socket" for the full rationale.
+        self.device_socket = None
+        self.device_router = DeviceUpdateRouter()
+        self._device_socket_retry_at = 0.0
+        self._device_socket_backoff = BACKOFF_START
+        self._device_socket_warned = False
+        # F7: monotonic time the device socket last completed a successful
+        # handshake. Backoff/warned are deliberately NOT reset the instant
+        # connect() succeeds -- only once a connection has stayed up for
+        # >= STABLE_AFTER is it trusted (see _pump_device_socket). Without
+        # this, an accept-then-drop server produces a hot ~1s reconnect/
+        # WARNING/INFO loop forever, the exact failure STABLE_AFTER already
+        # exists to prevent on the events socket.
+        self._device_socket_connected_at = None
+        # Which modelKey strings we've already logged this plugin run (an
+        # unhandled-but-known key at DEBUG, anything else at WARNING) --
+        # same one-per-key-per-run pattern as _reported_ignored_types.
+        self._reported_ignored_models = set()
+        # F4: device_router.malformed_count already reported this run --
+        # 0 means "never reported"; same delta-report shape as
+        # _reported_dropped, but WARNING only on the first increase (a
+        # firmware envelope change would otherwise flood the Event Log at
+        # WARNING once per malformed frame forever).
+        self._reported_device_malformed = 0
+        # F8: (model_key, exception type name) already logged at ERROR this
+        # plugin run -- same one-per-key pattern as _reported_ignored_types,
+        # so a persistent defect on chatty NVR/etc update frames doesn't
+        # flood the Event Log once per frame.
+        self._device_frame_error_reported = set()
 
         # Protect camera id -> set of Indigo device ids. A set, not a scalar:
         # two Indigo devices pointed at one camera is trivially produced by the
@@ -762,8 +810,68 @@ class Plugin(indigo.PluginBase):
         if self.sensors or self.lights or self.chimes or self.nvrs:
             self._poll_devices()
 
+        self._open_device_socket()
+
+    def _open_device_socket(self):
+        """Best-effort connect for the /subscribe/devices socket (issue
+        #18). Failure here must NEVER be treated like an events-socket
+        failure -- it does not raise, does not touch `connected`, and does
+        not touch the tracker. On failure it just sets a monotonic retry
+        gate (exponential backoff, same shape as the events socket's) and
+        leaves self.device_socket None; _pump() retries once that gate
+        passes.
+        """
+        try:
+            sock = ProtectEventSocket(
+                self.host, self.api_key, verify_ssl=self.verify_ssl, logger=self.logger,
+                path=DEVICE_SOCKET_PATH, label="device",
+            )
+            sock.connect()
+        except ConnectionError as exc:
+            self._note_device_socket_connect_failure(str(exc))
+            return
+        except Exception as exc:  # pylint: disable=broad-except
+            # F5: mirrors device_router.route()'s belt-and-braces
+            # rationale -- protect_ws's deliberate _assert_no_secret
+            # AssertionError, or a future struct.error in the shared frame
+            # parser, must never escape here and be mistaken for an
+            # EVENTS-socket fault by runConcurrentThread's generic handler.
+            # Contain and surface, don't crash the motion feed.
+            self.logger.debug("device socket connect traceback", exc_info=True)
+            self._note_device_socket_connect_failure(f"{type(exc).__name__}: {exc}")
+            return
+
+        self.device_socket = sock
+        # F7: do NOT reset backoff/warned here -- a connection is only
+        # trusted (forgiven) once it has stayed up for >= STABLE_AFTER; see
+        # _pump_device_socket. Resetting on every successful handshake is
+        # exactly what let an accept-then-drop server produce a hot ~1s
+        # reconnect/WARNING/INFO loop forever.
+        self._device_socket_connected_at = time.monotonic()
+        if not self._device_socket_warned:
+            self.logger.info("Device-update socket connected")
+        else:
+            # Mid-flap reconnect -- still within an outage that already
+            # warned once. Must not spam INFO on every retry.
+            self.logger.debug("Device-update socket connected (not yet stable)")
+
+    def _note_device_socket_connect_failure(self, reason):
+        """Shared warn-once/backoff bookkeeping for a failed connect
+        attempt, used by both the ConnectionError and generic-Exception
+        branches of _open_device_socket (F5) so they share one outage
+        counter/message shape."""
+        if not self._device_socket_warned:
+            self._device_socket_warned = True
+            self.logger.warning(
+                f"Device-update socket could not connect ({reason}); falling back to "
+                "60s polling for config/state freshness - camera motion is unaffected"
+            )
+        self._device_socket_retry_at = time.monotonic() + self._device_socket_backoff
+        self._device_socket_backoff = min(self._device_socket_backoff * 2, BACKOFF_MAX)
+
     def _pump(self):
         last_ping = time.monotonic()
+        last_device_ping = time.monotonic()
         while True:
             # Only self.sleep() raises StopThread, and this loop blocks in
             # recv() rather than sleeping -- so check the flag explicitly or a
@@ -774,7 +882,10 @@ class Plugin(indigo.PluginBase):
                 self._reconnect_requested = False
                 raise ConnectionError("reconnect requested after a configuration change")
 
-            message = self.socket.read_message(timeout=1.0)
+            # Read timeout halved (was 1.0) so the combined per-tick budget
+            # with the device-socket read below stays ~1s -- shutdown/
+            # reconnect responsiveness is unchanged.
+            message = self.socket.read_message(timeout=0.5)
             now = time.monotonic()
 
             if message is not None:
@@ -822,6 +933,267 @@ class Plugin(indigo.PluginBase):
                     "treating the socket as dead"
                 )
 
+            last_device_ping = self._pump_device_socket(now, last_device_ping)
+
+    def _pump_device_socket(self, now, last_device_ping):
+        """One tick of the /subscribe/devices socket (issue #18).
+
+        Entirely independent of the events socket handled above: any
+        failure here is caught, logged at most once per outage, and re-gated
+        with its own backoff -- it must NEVER raise out of _pump (that would
+        be mistaken for an events-socket fault and tear the motion feed
+        down), and must never touch `connected` or the tracker. Returns the
+        (possibly updated) last-ping timestamp for the caller to carry into
+        the next tick.
+        """
+        if self.device_socket is None:
+            if self.api and now >= self._device_socket_retry_at:
+                self._open_device_socket()
+                return now
+            return last_device_ping
+
+        try:
+            message = self.device_socket.read_message(timeout=0.5)
+        except ConnectionError as exc:
+            self._fail_device_socket(f"Device-update socket lost ({exc})")
+            return last_device_ping
+        except Exception as exc:  # pylint: disable=broad-except
+            # F5: same containment as _open_device_socket's connect -- a
+            # non-ConnectionError defect here (e.g. protect_ws's
+            # _assert_no_secret AssertionError) must never escape and be
+            # mistaken for an events-socket fault.
+            self.logger.debug("device socket read traceback", exc_info=True)
+            self._fail_device_socket(f"Device-update socket lost ({type(exc).__name__}: {exc})")
+            return last_device_ping
+
+        if message is not None:
+            routed = self.device_router.route(message)
+            if routed is None:
+                self._report_ignored_models()
+                self._report_malformed_device_frames()
+            else:
+                self._handle_device_frame(*routed)
+
+        if self.device_socket is None:
+            return last_device_ping
+
+        # F7: a connection is only forgiven (backoff/warned reset) once it
+        # has stayed up for >= STABLE_AFTER -- this is the one place that
+        # forgiveness happens. Without it, an accept-then-drop server would
+        # warn/reconnect in a hot ~1s loop forever, since _open_device_socket
+        # itself deliberately no longer resets on a bare successful connect.
+        if (self._device_socket_warned and self._device_socket_connected_at is not None
+                and now - self._device_socket_connected_at >= STABLE_AFTER):
+            self._device_socket_warned = False
+            self._device_socket_backoff = BACKOFF_START
+            self.logger.info("Device-update socket recovered")
+
+        if now - last_device_ping >= PING_INTERVAL:
+            try:
+                self.device_socket.send_ping()
+            except ConnectionError as exc:
+                self._fail_device_socket(f"Device-update socket lost ({exc})")
+                return last_device_ping
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.debug("device socket ping traceback", exc_info=True)
+                self._fail_device_socket(
+                    f"Device-update socket lost ({type(exc).__name__}: {exc})")
+                return last_device_ping
+            last_device_ping = now
+        elif now - self.device_socket.last_frame_at > STALE_TIMEOUT:
+            self._fail_device_socket(
+                f"Device-update socket looks dead (no frame for {STALE_TIMEOUT:.0f}s "
+                "despite pings)"
+            )
+        return last_device_ping
+
+    def _fail_device_socket(self, reason):
+        """Tear the device socket down after a read/ping failure or a
+        staleness timeout -- same containment and one-per-outage WARNING as
+        _open_device_socket's connect failure (both toggle
+        _device_socket_warned), just a different message for a socket that
+        WAS working rather than one that never connected."""
+        try:
+            self.device_socket.close()
+        except Exception:  # pylint: disable=broad-except
+            pass
+        self.device_socket = None
+        if not self._device_socket_warned:
+            self._device_socket_warned = True
+            self.logger.warning(
+                f"{reason}; falling back to 60s polling for config/state freshness - "
+                "camera motion is unaffected"
+            )
+        self._device_socket_retry_at = time.monotonic() + self._device_socket_backoff
+        self._device_socket_backoff = min(self._device_socket_backoff * 2, BACKOFF_MAX)
+
+    def _report_ignored_models(self):
+        """Surface the device router's ignore-and-count for modelKey values
+        this plugin has no Indigo device type for, once per modelKey per
+        plugin run -- mirrors _report_ignored_types. A documented-but-
+        unhandled key (viewer, speaker, bridge, ...) is expected and
+        unremarkable -- DEBUG. Anything else is either a genuinely new
+        modelKey or a parsing gap -- WARNING."""
+        for model_key in self.device_router.ignored_model_counts:
+            if model_key in self._reported_ignored_models:
+                continue
+            self._reported_ignored_models.add(model_key)
+            if model_key == MISSING_MODEL_KEY:
+                what = "device frames with no `modelKey` field"
+            else:
+                what = f"'{model_key}' device frames"
+            if model_key in KNOWN_UNHANDLED_MODEL_KEYS:
+                self.logger.debug(f"Ignoring {what} on the device socket - not supported yet")
+            else:
+                self.logger.warning(
+                    f"Ignoring {what} on the device socket - unrecognized modelKey. "
+                    "Please report this on GitHub with a debug capture."
+                )
+
+    def _report_malformed_device_frames(self):
+        """F4: surface device_router's malformed_count, mirroring
+        _report_dropped_frames -- without this, a firmware envelope change
+        could silently kill the whole /subscribe/devices feature while the
+        socket looks healthy (frames still refresh last_frame_at). WARNING
+        on the first increase this plugin run; every increase after that
+        logs at DEBUG so a persistently malformed stream doesn't flood the
+        Event Log at WARNING once per frame forever."""
+        malformed = self.device_router.malformed_count
+        if malformed <= self._reported_device_malformed:
+            return
+        delta = malformed - self._reported_device_malformed
+        first_time = self._reported_device_malformed == 0
+        self._reported_device_malformed = malformed
+        if first_time:
+            self.logger.warning(
+                f"Discarding {delta} unparseable device-socket frame(s) - the "
+                "device-config push may be broken; sensor/light/chime/NVR polling "
+                "still applies and cameras fall back to 60s refresh"
+            )
+        else:
+            self.logger.debug(f"Discarding {delta} more unparseable device-socket frame(s)")
+
+    # -- Issue #18: applying routed /subscribe/devices frames -------------
+
+    def _handle_device_frame(self, kind, model_key, device_id, item):
+        """Apply one routed /subscribe/devices frame to the matching cache
+        + Indigo state.
+
+        Wrapped entirely in try/except: a defect in this NEW speculative
+        path must never be able to discard a result the OLD reliable
+        motion path already produced, or take the event socket down --
+        mirrors the containment `_drain_one_pending_stream_refresh` and
+        `_apply_polled_write` already have for their own per-frame/per-poll
+        work.
+        """
+        try:
+            if model_key == "nvr":
+                self._handle_nvr_device_frame(kind, device_id, item)
+                return
+
+            registry, cache, apply_fn = {
+                "camera": (self.cameras, self.camera_info, self._apply_camera_state),
+                "sensor": (self.sensors, self.sensor_info, self._apply_sensor_state),
+                "light": (self.lights, self.light_info, self._apply_light_state),
+                "chime": (self.chimes, self.chime_info, self._apply_chime_state),
+            }[model_key]
+
+            if kind == "update":
+                # Merging onto nothing would fabricate a partial object
+                # that _write_*_states would then treat as a full,
+                # confirmed read -- an uncached id is ignored outright, not
+                # seeded from a partial frame.
+                if device_id not in cache:
+                    self.logger.debug(
+                        f"{model_key} {device_id}: ignoring a device-socket update for an "
+                        "id with no cached object yet"
+                    )
+                    return
+                cache[device_id] = merge_update(cache[device_id], item)
+                apply_fn(device_id)
+            elif kind == "add":
+                # add is a FULL object per spec, unlike update.
+                cache[device_id] = item
+                # F2: a remove->add->remove sequence must warn on BOTH
+                # removes, not just the first -- cameras have no list poll
+                # to clear this episode the way sensors/lights/chimes
+                # self-heal within 60s, so an `add` is the only signal that
+                # the absence is over. Harmless no-op if it was never set.
+                self._clear_absent_from_list(model_key, device_id)
+                if device_id in registry:
+                    apply_fn(device_id)
+                else:
+                    self.logger.debug(f"new {model_key} appeared on the controller: {device_id}")
+            elif kind == "remove":
+                cache.pop(device_id, None)
+                if device_id in registry:
+                    self._warn_absent_from_list(model_key, device_id, registry)
+                    apply_fn(device_id)
+        except Exception as exc:  # pylint: disable=broad-except
+            # F8: once per (model_key, exception type) per plugin run --
+            # otherwise a persistent defect on chatty update frames (e.g.
+            # NVR) floods the Event Log with one ERROR per frame forever.
+            error_key = (model_key, type(exc).__name__)
+            message = (
+                f"Could not apply device-socket {kind} frame for {model_key} {device_id} "
+                f"({type(exc).__name__}: {exc}) - the event socket is unaffected"
+            )
+            if error_key in self._device_frame_error_reported:
+                self.logger.debug(message)
+            else:
+                self._device_frame_error_reported.add(error_key)
+                self.logger.error(message)
+            self.logger.debug("device-socket frame traceback", exc_info=True)
+
+    def _handle_nvr_device_frame(self, kind, device_id, item):
+        """NVR special case: `self.nvr_info` is a single dict, not a
+        dict-by-id cache, and `_apply_nvr_state()` takes no id argument --
+        it looks its own registered devices up via `self._nvr_known_id or
+        "nvr"`, mirroring `_poll_nvr`/`_rekey_nvr`. Called only from
+        `_handle_device_frame`, which already provides the try/except
+        containment."""
+        if kind == "update":
+            # "Ids match" honours _nvr_known_id too, not just nvr_info's own
+            # id -- there is exactly one NVR, so the two agree once either
+            # a poll or an earlier add frame has told us the real id, but
+            # relying on nvr_info alone would miss that this IS the known
+            # NVR the moment _rekey_nvr has run without nvr_info yet
+            # reflecting it (not reachable today, but a single source of
+            # truth for "is this the NVR we know about" is cheap and safer
+            # than two that could disagree).
+            if self.nvr_info is None or device_id not in (
+                    self.nvr_info.get("id"), self._nvr_known_id):
+                self.logger.debug(
+                    f"nvr {device_id}: ignoring a device-socket update - no cached NVR "
+                    "with that id yet"
+                )
+                return
+            self.nvr_info = merge_update(self.nvr_info, item)
+            self._apply_nvr_state()
+        elif kind == "add":
+            self.nvr_info = item
+            self._rekey_nvr(device_id)
+            registry_key = self._nvr_known_id or "nvr"
+            # F3: mirrors _handle_device_frame's clear-on-add (F2) -- an
+            # add is the only signal a prior remove's absence episode is
+            # over, since the NVR has no list poll of its own to clear it.
+            self._clear_absent_from_list("nvr", registry_key)
+            if self.nvrs.get(registry_key):
+                self._apply_nvr_state()
+            else:
+                self.logger.debug(f"new nvr appeared on the controller: {device_id}")
+        elif kind == "remove":
+            # F3: an NVR remove was previously silent -- warn once per
+            # absence episode, reusing _warn_absent_from_list's registry/key
+            # mechanics exactly like every other class (self.nvrs is keyed
+            # by _nvr_known_id, falling back to the "nvr" placeholder before
+            # the first successful poll/add has told us the real id).
+            registry_key = self._nvr_known_id or "nvr"
+            if self.nvrs.get(registry_key):
+                self._warn_absent_from_list("nvr", registry_key, self.nvrs)
+            self.nvr_info = None
+            self._apply_nvr_state()
+
     def _report_dropped_frames(self):
         """Surface the tracker's swallow. A destroyed frame that carried an
         `end` means we may have lost an active event, which is not the same as
@@ -861,6 +1233,18 @@ class Plugin(indigo.PluginBase):
                 )
 
     def _close_socket(self):
+        # Also tears down the device socket (issue #18) -- both sockets are
+        # opened together by _open_socket, so they are closed together here
+        # too. The device socket's own health never factors into whether
+        # THIS method needs to run; it is simply along for the ride.
+        if self.device_socket is not None:
+            try:
+                self.device_socket.close()
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning(f"Error closing device socket: {type(exc).__name__}: {exc}")
+            finally:
+                self.device_socket = None
+
         if self.socket is None:
             return
         try:
@@ -895,6 +1279,14 @@ class Plugin(indigo.PluginBase):
         fields, ...) is REST-poll-derived and is deliberately left alone
         here, the same way a camera's cameraModel/videoMode survive a
         socket loss -- poll-derived values are kept, not fabricated.
+
+        Issue #18: the device socket is deliberately NOT part of this
+        method's definition of "disconnected". `connected` here means the
+        EVENTS socket only -- that is the one signal motion validity
+        depends on. The device socket only affects the freshness of
+        poll-derived config/state between polls; losing it degrades
+        gracefully to the existing 60s poll cadence and must never make a
+        healthy events socket look unhealthy.
         """
         for camera_id in list(self.cameras):
             self.tracker.clear_camera(camera_id)
@@ -918,6 +1310,13 @@ class Plugin(indigo.PluginBase):
     def _is_connected(self):
         # self.socket is only ever set after a successful handshake (_open_socket)
         # and is cleared by _close_socket, so its presence IS connectedness.
+        # Deliberately the EVENTS socket only -- issue #18's device socket
+        # (self.device_socket) is never consulted here. Motion validity
+        # depends solely on the events socket; the device socket only feeds
+        # freshness of polled config/state and has its own independent
+        # retry/backoff, so folding it into `connected` would make a
+        # healthy motion feed report itself unhealthy over an unrelated
+        # freshness-only outage.
         return self.socket is not None
 
     def _apply_camera_state(self, camera_id, connected=None, force=False):
@@ -1073,6 +1472,34 @@ class Plugin(indigo.PluginBase):
             self._poll_chimes()
         if self.nvrs:
             self._poll_nvr()
+        # F1: the device-socket-down WARNINGs (_open_device_socket,
+        # _fail_device_socket) promise "falling back to 60s polling for
+        # config/state freshness" -- a promise that must hold for EVERY
+        # class the device socket normally pushes, cameras included.
+        # Without this, camera config states (ledEnabled/videoMode/
+        # hdrType/micVolume/osd*) would go stale INDEFINITELY during a
+        # device-socket-only outage, since nothing else in this poll cycle
+        # ever touches camera_info. Only runs while the device socket is
+        # actually down -- when it's up, push already covers cameras and
+        # this REST call would be pure waste.
+        if self.cameras and self.device_socket is None:
+            if self._refresh_camera_info():
+                for camera_id in list(self.cameras):
+                    # Same containment as _apply_polled_write's per-device
+                    # writes below (issue #8's own rule: "a poll bug must
+                    # never be able to kill the motion socket") -- a write
+                    # failure for one camera here must not escape into
+                    # _pump/runConcurrentThread, which would tear the event
+                    # socket down over an unrelated camera-state bug.
+                    try:
+                        self._apply_camera_state(camera_id)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        self.logger.error(
+                            f"Could not apply camera {camera_id} state during the "
+                            f"device-socket-down fallback poll ({type(exc).__name__}: "
+                            f"{exc}) - the event socket is unaffected"
+                        )
+                        self.logger.debug("camera fallback poll traceback", exc_info=True)
 
     def _report_poll_failure(self, class_name, exc):
         """ERROR once per (class, failure kind) per outage; DEBUG for every

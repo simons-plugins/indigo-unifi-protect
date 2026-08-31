@@ -1,0 +1,40 @@
+[
+ {
+  "type": "update",
+  "item": {
+   "id": "69be54f600574703e4000ff4",
+   "modelKey": "camera",
+   "ledSettings": {
+    "isEnabled": true,
+    "welcomeLed": true,
+    "floodLed": true
+   }
+  }
+ },
+ {
+  "type": "update",
+  "item": {
+   "id": "6a1f0c9e00aa4703e4009911",
+   "modelKey": "bridge",
+   "guid": "00000000-0000-4000-8000-000000000099"
+  }
+ },
+ {
+  "type": "add",
+  "item": {
+   "id": "6a2b1d8f00bb4703e400aa22",
+   "modelKey": "sensor",
+   "name": "New Front Door",
+   "state": "CONNECTED",
+   "mountType": "door",
+   "isOpened": false
+  }
+ },
+ {
+  "type": "remove",
+  "item": {
+   "id": "69be54f600574703e4000ff4",
+   "modelKey": "camera"
+  }
+ }
+]

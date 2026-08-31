@@ -34,6 +34,13 @@ reads as an empty house. See [`docs/CONTRACT.md`](./docs/CONTRACT.md) for the
 full verified API contract, the WS frame shape, and the two
 duplicate/stale-keepalive traps `event_tracker.py` must handle.
 
+**A second WebSocket, `/subscribe/devices`, pushes camera/sensor/light/chime/
+NVR config+state changes live** (issue #18) — freshness-only, and
+independent of the above: it has its own retry/backoff, and `connected`
+still means the **events** socket alone. Losing the device socket never
+touches motion, audio, or `connected`; it only means hardware/config states
+fall back to the existing 60s poll cadence until it reconnects.
+
 ## Related projects
 
 Standalone — no sibling dependencies in this workspace.

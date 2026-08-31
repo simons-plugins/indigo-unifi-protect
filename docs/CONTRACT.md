@@ -486,6 +486,62 @@ class EventTracker:
 
 ---
 
+## `device_router.py` (issue #18)
+
+Pure logic, no Indigo imports, no I/O — same contract as `event_tracker.py`,
+fully unit-testable. Classifies frames from the `/subscribe/devices`
+WebSocket (see `docs/API-REFERENCE.md`, "`/subscribe/devices` WebSocket —
+VERIFIED 2026-08-31" for the wire facts this module is built against).
+
+```python
+HANDLED_MODEL_KEYS = frozenset({"camera", "sensor", "light", "chime", "nvr"})
+
+class DeviceUpdateRouter:
+    def route(self, message) -> tuple[str, str, str, dict] | None:
+        """(kind, model_key, device_id, item) for a well-formed frame whose
+        `type` is add/update/remove AND whose `item.modelKey` is in
+        HANDLED_MODEL_KEYS AND `item.id` is a non-empty string. None
+        otherwise. Never raises on any input."""
+
+    @property
+    def malformed_count(self) -> int: ...
+        # message/item not a dict, missing/empty/non-string id, or the
+        # message's own `type` missing/not one of add/update/remove.
+
+    @property
+    def ignored_model_counts(self) -> dict: ...
+        # well-formed frames whose modelKey isn't handled (viewer, speaker,
+        # bridge, aiprocessor, aiport, linkstation, or absent/non-string --
+        # "<missing>"), keyed by modelKey. NOT malformed -- the frame
+        # parsed fine, it just isn't a class this plugin has a device type
+        # for. Mirrors event_tracker.ignored_type_counts so plugin.py can
+        # surface new keys once per run the same way.
+
+def merge_update(cached: dict, item: dict) -> dict:
+    """A NEW dict: `cached` with `item`'s top-level keys overwriting.
+    Never mutates either argument. Never raises -- a non-dict `item`
+    degrades to an unchanged copy of `cached`."""
+```
+
+**The one fact this module exists to encode:** an `update` frame is
+partial **top-level only**. `item` carries `id`/`modelKey` plus whichever
+top-level keys actually changed, but a nested settings object (e.g.
+`ledSettings`) arrives **whole** — verified live 2026-08-31: a `PATCH
+ledSettings.isEnabled` produced an `update` whose `ledSettings` held
+`isEnabled`, `welcomeLed`, AND `floodLed`, though only `isEnabled` was
+patched. `merge_update` is therefore a plain top-level `dict.update()`,
+never a recursive/deep merge — deep-merging would keep a stale nested key
+under a value the controller never actually sent in that frame. A test
+pins this directly: a key present only in the CACHED nested dict must be
+GONE after the merge.
+
+`add` is a full object (unlike `update`); `remove` is a bare
+`id`+`modelKey` reference. Both are handled by `plugin.py`, not this
+module — `device_router.py` only classifies the frame envelope, it never
+touches a cache itself.
+
+---
+
 ## `plugin.py`
 
 Standard Indigo lifecycle. Key points:
@@ -494,9 +550,11 @@ Standard Indigo lifecycle. Key points:
   DB access, **no** network.
 - `startup()` — do **not** call `super().startup()`, it does not exist.
 - `runConcurrentThread()` — owns the WS read loop directly. Do **not** spawn a
-  second thread; Indigo already manages this one. Loop on
-  `self.read_message(timeout=1.0)` so `self.StopThread` is honoured within ~1s.
-  Use `self.sleep()`, never `time.sleep()`.
+  second thread; Indigo already manages this one. `_pump()` drives BOTH the
+  events socket and the device socket (issue #18) from that one thread:
+  each ties up to `timeout=0.5` per tick (halved from the original 1.0s so
+  the combined per-tick budget stays ~1s), so `self.StopThread` is still
+  honoured within ~1s overall. Use `self.sleep()`, never `time.sleep()`.
 - Reconnect with exponential backoff 1s → 60s. On disconnect, set every camera
   device's `connected` state False and call `tracker.clear_camera` for each, so
   a dead socket reads as "unknown", not as "no motion".
@@ -507,6 +565,131 @@ Standard Indigo lifecycle. Key points:
 - `deviceStartComm` must call `stateListOrDisplayStateIdChanged()` before its
   first state write — Indigo does not add new Devices.xml states to existing
   devices otherwise.
+
+### Second socket (issue #18): `/subscribe/devices`
+
+`runConcurrentThread` is still the **only** thread — the device socket is
+pumped from the same `_pump()` tick as the events socket, not a second
+thread. `ProtectEventSocket` gained `path`/`label` constructor kwargs
+(defaulting to the original events-socket values, so every existing caller
+is byte-identical) so the same class serves both sockets.
+
+- **`connected` means the EVENTS socket only, on purpose.** `_is_connected()`
+  and `_mark_all_disconnected()` were deliberately left untouched — motion
+  validity depends solely on `/subscribe/events`. The device socket only
+  feeds freshness of poll-derived camera/sensor/light/chime/nvr config
+  between polls; folding it into `connected` would make a healthy motion
+  feed report itself unhealthy over an unrelated freshness-only outage.
+- **Camera fallback is real (F1).** The device-socket-down WARNING promises
+  "falling back to 60s polling for config/state freshness" — a promise that
+  must hold for every class the device socket normally pushes, cameras
+  included. `_poll_devices()` therefore also calls `_refresh_camera_info()`
+  and re-applies every registered camera's state whenever `self.cameras`
+  is non-empty AND `self.device_socket is None` — only while the device
+  socket is actually down; when it's up, push already covers cameras and
+  the extra `GET /cameras` would be pure waste. Each camera's re-apply is
+  individually wrapped in `try`/`except`, the same "a poll bug must never
+  kill the motion socket" rule `_apply_polled_write` already enforces for
+  sensors/lights/chimes/NVR.
+- **Independent retry/backoff, with a stability gate (F7).**
+  `self._device_socket_retry_at` (monotonic gate) and
+  `self._device_socket_backoff` (same `BACKOFF_START`→`BACKOFF_MAX` shape
+  as the events socket) are separate state from the main reconnect loop.
+  `_open_device_socket()` is best-effort and never raises: on failure it
+  logs one WARNING per outage (`self._device_socket_warned`), sets the
+  retry gate, and leaves `self.device_socket` None. `_pump()`'s own
+  per-tick handling (`_pump_device_socket`/`_fail_device_socket`) reuses
+  the exact same warned-flag/backoff state for a read/ping failure or a
+  staleness timeout mid-session, so a socket that dies AFTER connecting
+  logs exactly as many WARNINGs as one that never connected at all: one,
+  per outage. Critically, a bare successful `connect()` does **not** reset
+  `warned`/`backoff` any more — `self._device_socket_connected_at`
+  (monotonic) is recorded instead, and `_pump_device_socket` only forgives
+  (resets `warned=False`, `backoff=BACKOFF_START`, logs INFO "Device-update
+  socket recovered") once a connection has stayed up for `>= STABLE_AFTER`.
+  Without this gate, an accept-then-drop server produces a hot ~1s
+  reconnect/WARNING/INFO loop forever — the exact failure `STABLE_AFTER`
+  already exists to prevent on the events socket.
+- **Uncached update is ignored, not seeded.** `update` only applies when
+  the id is ALREADY in the relevant cache (`camera_info`/`sensor_info`/
+  `light_info`/`chime_info`, or `nvr_info` for the NVR, keyed by
+  `_nvr_known_id`). Merging an `update`'s partial fields onto nothing would
+  fabricate a partial object that `_write_*_states` would then treat as a
+  full, confirmed read. `add` has no such restriction — it IS a full
+  object per spec, so it seeds the cache unconditionally and applies state
+  only if the id is registered (Indigo has a device pointed at it);
+  otherwise a DEBUG log ("new `<modelKey>` appeared on the controller") is
+  the only trace. **`add` also clears any absence episode (F2/F3)** via
+  `_clear_absent_from_list` — cameras have no list poll of their own to
+  clear it the way sensors/lights/chimes self-heal within 60s, so without
+  this a camera's remove→add→remove sequence would warn only once per
+  plugin run. The NVR's `add` branch does the same for symmetry.
+- **`remove` drops the cache entry and reuses `_warn_absent_from_list`'s
+  once-per-absence-episode WARNING** when the id is registered — a
+  removed camera then applies state exactly like any other "id absent from
+  a successful poll" case: `cameraState`/`sensorState`/etc. read
+  `STATE_UNAVAILABLE`, `connected` stays whatever the events socket says.
+  **The NVR follows the same rule (F3)** — an NVR `remove` was previously
+  silent; it now calls `_warn_absent_from_list("nvr", self._nvr_known_id or
+  "nvr", self.nvrs)` when the NVR is registered, the same once-per-episode
+  WARNING every other class gets.
+- **Malformed frames are surfaced (F4).** `device_router.malformed_count`
+  existed but was never read — a firmware envelope change could silently
+  kill the whole feature while the socket looked healthy (frames keep
+  refreshing `last_frame_at`). `_report_malformed_device_frames()` mirrors
+  `_report_dropped_frames`: WARNING on the first increase this plugin run
+  ("the device-config push may be broken; sensor/light/chime/NVR polling
+  still applies and cameras fall back to 60s refresh"), DEBUG for every
+  increase after that. Called from `_pump_device_socket` alongside
+  `_report_ignored_models()` whenever `route()` returns `None`.
+- **Broad exception containment at all three socket-lifecycle sites (F5).**
+  `_open_device_socket`'s connect and both `_pump_device_socket` sites
+  (`read_message`, `send_ping`) now catch `Exception`, not just
+  `ConnectionError` — a non-`ConnectionError` defect (protect_ws's
+  deliberate `_assert_no_secret` `AssertionError`, or a future
+  `struct.error` in the shared frame parser) must never escape and be
+  mistaken for an EVENTS-socket fault by `runConcurrentThread`'s generic
+  handler, which would tear the healthy motion feed down. Mirrors
+  `device_router.route()`'s own belt-and-braces rationale: contain and
+  surface, don't crash the motion feed. Each generic-exception branch logs
+  `type(exc).__name__` plus a DEBUG traceback, then takes the exact same
+  fail/backoff path as the `ConnectionError` case.
+- **`_handle_device_frame` is wrapped in try/except**, mirroring
+  `_apply_polled_write`/`_drain_one_pending_stream_refresh`'s existing
+  containment: a defect in this NEW speculative path must never be able to
+  discard a result the OLD reliable motion path already produced, or tear
+  the event socket down over an unrelated bug. **Guarded once per
+  `(model_key, exception type name)` per plugin run (F8)** — ERROR on the
+  first occurrence, DEBUG for repeats — so a persistent defect on chatty
+  NVR (or any other class's) update frames can't flood the Event Log with
+  one ERROR per frame.
+- `_close_socket` now also closes+`None`s `self.device_socket` — both
+  sockets are opened together in `_open_socket` (device socket last, after
+  every existing camera/sensor/light/chime/nvr setup), so they are closed
+  together too.
+
+New tests: `test_device_router.py` (route/merge_update in isolation, the
+real-shaped `ws_devices_capture.json` capture replayed end-to-end, and
+`ignored_model_counts`'s `MAX_IGNORED_MODEL_KEYS` overflow bucketing,
+mirroring `event_tracker`'s own cap test) and a `test_plugin.py` section
+covering: containment of a fatal `_apply_camera_state` with ERROR-once/
+DEBUG-repeat (F8); a full `_pump` tick wiring the real capture's
+`ledSettings` update onto an Indigo device, alongside an ignored modelKey
+and a malformed envelope firing the F4 WARNING once; the retry gate
+refusing to construct a socket early (fatal-collaborator constructor) and
+succeeding once the gate passes; a device-socket ping failure and a
+staleness timeout each tearing down via `_fail_device_socket` without
+touching the events socket/`connected`; an NVR `add` actually moving the
+registry off the `"nvr"` placeholder via `_rekey_nvr` (making the
+pre-existing NVR-add claim true); a full flap scenario (repeated
+connect-then-die cycles logging exactly one WARNING with growing backoff,
+then a forgiven recovery after `STABLE_AFTER`, then a fresh outage warning
+again); a parametrized update-dispatch test pinning the per-class table for
+sensor/light/chime; the F1 camera fallback poll (refreshes when the device
+socket is down, and is fatal-collaborator-proven to never touch
+`get_cameras` when it's up); camera and NVR remove→add→remove
+episode-clearing (F2/F3); and F5's broad-exception containment at both the
+connect and mid-pump read sites, driven with a real `AssertionError`.
 
 ### State IDs — strict, undocumented Indigo rule
 
