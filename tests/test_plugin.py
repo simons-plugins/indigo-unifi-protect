@@ -4810,3 +4810,369 @@ def test_pump_device_socket_contains_non_connection_error_from_read(fake_indigo,
     warnings = [r for r in caplog.records if "Device-update socket lost" in r.getMessage()]
     assert len(warnings) == 1
     assert dev.states["connected"] is True, "the events socket state must be untouched"
+
+
+# ---------------------------------------------------------------------
+# Issue #27: bundle cameras.html and auto-install/update it into Web
+# Assets on startup. The question, per workspace convention: how many
+# distinct ways can this degrade, and does each one stay non-fatal and
+# say so in the Event Log?
+# ---------------------------------------------------------------------
+
+class _FakeServerRaisesIfTouched:
+    """Fatal-collaborator form of indigo.server: proves the pref-off path
+    never even asks for the install folder, let alone touches a disk."""
+
+    @staticmethod
+    def getInstallFolderPath():
+        raise AssertionError("must not be called when managePage is off")
+
+
+def _fake_server(install_dir):
+    return type(
+        "S", (), {"getInstallFolderPath": staticmethod(lambda: str(install_dir))}
+    )()
+
+
+def _bundle_source_path(install_dir):
+    return (
+        Path(install_dir) / "Plugins" / "UniFi Protect.indigoPlugin" / "Contents"
+        / "Resources" / "pages" / "cameras.html"
+    )
+
+
+def _installed_dest_path(install_dir):
+    return Path(install_dir) / "Web Assets" / "static" / "pages" / "cameras.html"
+
+
+def test_sync_web_page_pref_off_path_failure_is_debug_only(fake_indigo, monkeypatch, caplog):
+    """Pref off: the read-only staleness check (X3) IS allowed to touch the
+    filesystem, so this no longer pins "never touches" -- it pins the
+    containment instead: a failure anywhere in the off-path check (here the
+    path resolver itself, fatal if touched) must neither raise nor produce
+    a WARNING/INFO. An opted-out user must never be nagged about a file the
+    plugin isn't managing; DEBUG is the ceiling."""
+    monkeypatch.setattr(fake_indigo, "server", _FakeServerRaisesIfTouched(), raising=False)
+    plug = make_plugin({"managePage": False})
+
+    with caplog.at_level("DEBUG"):
+        plug._sync_web_page()  # must not raise
+
+    noisy = [r for r in caplog.records
+             if r.levelname in ("WARNING", "ERROR", "INFO") and "page" in r.getMessage().lower()]
+    assert noisy == []
+
+
+def test_sync_web_page_installs_when_absent(fake_indigo, monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>v1</html>")
+    dest = _installed_dest_path(tmp_path)
+    assert not dest.exists()
+
+    plug = make_plugin({"managePage": True})
+    with caplog.at_level("INFO"):
+        plug._sync_web_page()
+
+    assert dest.read_bytes() == b"<html>v1</html>"
+    infos = [r for r in caplog.records
+             if r.levelname == "INFO" and "Cameras page" in r.getMessage()]
+    assert len(infos) == 1, "exactly one INFO line, not two"
+
+
+def test_sync_web_page_identical_writes_nothing(fake_indigo, monkeypatch, tmp_path):
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>same</html>")
+    dest = _installed_dest_path(tmp_path)
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"<html>same</html>")
+
+    plug = make_plugin({"managePage": True})
+    monkeypatch.setattr(
+        plugin_module.os, "replace",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not write when identical")),
+    )
+
+    plug._sync_web_page()  # must not raise -- os.replace is fatal if touched
+
+    assert dest.read_bytes() == b"<html>same</html>"
+
+
+def test_sync_web_page_overwrites_when_different(fake_indigo, monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>new</html>")
+    dest = _installed_dest_path(tmp_path)
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"<html>old, hand-edited</html>")
+
+    plug = make_plugin({"managePage": True})
+    with caplog.at_level("INFO"):
+        plug._sync_web_page()
+
+    assert dest.read_bytes() == b"<html>new</html>"
+    infos = [r for r in caplog.records
+             if r.levelname == "INFO" and "Installed/updated" in r.getMessage()]
+    assert len(infos) == 1
+
+
+def test_sync_web_page_source_missing_warns_and_does_not_raise(fake_indigo, monkeypatch,
+                                                                tmp_path, caplog):
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    # tmp_path has no Plugins/... tree at all -- the bundle is missing.
+    plug = make_plugin({"managePage": True})
+
+    with caplog.at_level("WARNING"):
+        plug._sync_web_page()  # must not raise
+
+    warnings = [r for r in caplog.records
+                if r.levelname == "WARNING" and "not found in the plugin bundle" in r.getMessage()]
+    assert len(warnings) == 1
+    assert not _installed_dest_path(tmp_path).exists()
+
+
+def test_sync_web_page_write_failure_warns_naming_destination(fake_indigo, monkeypatch,
+                                                                tmp_path, caplog):
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>v2</html>")
+    dest = _installed_dest_path(tmp_path)
+
+    plug = make_plugin({"managePage": True})
+
+    def boom(*_a, **_k):
+        raise PermissionError("no write access")
+
+    monkeypatch.setattr(plugin_module.os, "makedirs", boom)
+
+    with caplog.at_level("WARNING"):
+        plug._sync_web_page()  # must not raise
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert str(dest) in warnings[0].getMessage()
+    assert "no write access" in warnings[0].getMessage()
+
+
+def test_sync_web_page_default_pref_is_on_when_unset(fake_indigo, monkeypatch, tmp_path, caplog):
+    """The checkbox's Devices.xml default is True, but an existing prefs
+    dict from before this feature shipped has no `managePage` key at all --
+    that must still behave as managed, not silently opt everyone out."""
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>v3</html>")
+
+    plug = make_plugin({})  # no managePage key at all
+
+    with caplog.at_level("INFO"):
+        plug._sync_web_page()
+
+    assert _installed_dest_path(tmp_path).read_bytes() == b"<html>v3</html>"
+
+
+def test_closed_prefs_config_ui_installs_page_when_flipped_on(fake_indigo, monkeypatch,
+                                                                tmp_path, caplog):
+    """Ticking the box must take effect immediately, without a restart --
+    and must still work when Indigo has already folded valuesDict into
+    self.pluginPrefs before calling this method, which is the observed
+    real-world ordering (see closedPrefsConfigUi's comment)."""
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>flip-on</html>")
+
+    plug = make_plugin({"host": "h", "apiKey": "k", "managePage": False})
+    values = {"host": "h", "apiKey": "k", "verifySSL": False, "managePage": True}
+    plug.pluginPrefs.update(values)  # the write-back Indigo actually performs first
+
+    with caplog.at_level("INFO"):
+        plug.closedPrefsConfigUi(values, userCancelled=False)
+
+    assert _installed_dest_path(tmp_path).read_bytes() == b"<html>flip-on</html>"
+
+
+def test_closed_prefs_config_ui_installs_page_when_flipped_on_without_prewrite(
+        fake_indigo, monkeypatch, tmp_path, caplog):
+    """Same flip-on, but WITHOUT the pluginPrefs write-back happening first
+    (the old assumed ordering) -- must install either way, since the sync
+    is now order-independent rather than gated on a before/after read of
+    self.pluginPrefs."""
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>flip-on-no-prewrite</html>")
+
+    plug = make_plugin({"host": "h", "apiKey": "k", "managePage": False})
+
+    with caplog.at_level("INFO"):
+        plug.closedPrefsConfigUi(
+            {"host": "h", "apiKey": "k", "verifySSL": False, "managePage": True},
+            userCancelled=False,
+        )
+
+    assert _installed_dest_path(tmp_path).read_bytes() == b"<html>flip-on-no-prewrite</html>"
+
+
+def test_closed_prefs_config_ui_identical_resave_does_not_rewrite(fake_indigo, monkeypatch,
+                                                                    tmp_path):
+    """True -> True with an already-current installed page must not write
+    again -- fatal os.replace collaborator -- though reading/comparing to
+    reach that conclusion is expected and fine."""
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>already-current</html>")
+    dest = _installed_dest_path(tmp_path)
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"<html>already-current</html>")
+
+    plug = make_plugin({"host": "h", "apiKey": "k", "managePage": True})
+    monkeypatch.setattr(
+        plugin_module.os, "replace",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not write when identical")),
+    )
+
+    plug.closedPrefsConfigUi(
+        {"host": "h", "apiKey": "k", "verifySSL": False, "managePage": True},
+        userCancelled=False,
+    )  # must not raise -- os.replace is fatal if touched
+
+    assert dest.read_bytes() == b"<html>already-current</html>"
+
+
+def test_closed_prefs_config_ui_resave_retries_after_a_failed_sync(fake_indigo, monkeypatch,
+                                                                     tmp_path, caplog):
+    """A sync that failed (e.g. on startup) must not be the plugin's last
+    word: the next config save, even with the box already ticked (True ->
+    True, no transition), retries and this time installs -- the retry
+    gesture the WARNING promises actually works."""
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>retry-me</html>")
+
+    plug = make_plugin({"host": "h", "apiKey": "k", "managePage": True})
+
+    real_replace = plugin_module.os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient failure")
+        return real_replace(*a, **k)
+
+    monkeypatch.setattr(plugin_module.os, "replace", flaky_replace)
+
+    with caplog.at_level("WARNING"):
+        plug._sync_web_page()  # simulates the failed startup sync
+
+    assert not _installed_dest_path(tmp_path).exists()
+
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        plug.closedPrefsConfigUi(
+            {"host": "h", "apiKey": "k", "verifySSL": False, "managePage": True},
+            userCancelled=False,
+        )
+
+    assert _installed_dest_path(tmp_path).read_bytes() == b"<html>retry-me</html>"
+
+
+def test_sync_web_page_failed_write_leaves_no_orphan_tmp_file(fake_indigo, monkeypatch,
+                                                                tmp_path, caplog):
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>v4</html>")
+
+    plug = make_plugin({"managePage": True})
+    monkeypatch.setattr(
+        plugin_module.os, "replace",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with caplog.at_level("WARNING"):
+        plug._sync_web_page()  # must not raise
+
+    dest = _installed_dest_path(tmp_path)
+    assert not dest.exists()
+    assert not Path(f"{dest}.tmp").exists(), "a failed write must not leave a .tmp orphan"
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "retry" in warnings[0].getMessage().lower()
+
+
+def test_sync_web_page_empty_source_warns_and_leaves_destination_untouched(
+        fake_indigo, monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"")
+    dest = _installed_dest_path(tmp_path)
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"<html>working copy</html>")
+
+    plug = make_plugin({"managePage": True})
+    monkeypatch.setattr(
+        plugin_module.os, "replace",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not install an empty source")),
+    )
+
+    with caplog.at_level("WARNING"):
+        plug._sync_web_page()  # must not raise
+
+    assert dest.read_bytes() == b"<html>working copy</html>"
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "empty" in warnings[0].getMessage().lower()
+
+
+def test_sync_web_page_pref_off_stale_page_logs_one_info(fake_indigo, monkeypatch,
+                                                           tmp_path, caplog):
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>new bundled</html>")
+    dest = _installed_dest_path(tmp_path)
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"<html>old hand-edited</html>")
+
+    plug = make_plugin({"managePage": False})
+    monkeypatch.setattr(
+        plugin_module.os, "replace",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not write when off")),
+    )
+
+    with caplog.at_level("INFO"):
+        plug._sync_web_page()  # must not raise
+
+    assert dest.read_bytes() == b"<html>old hand-edited</html>"
+    infos = [r for r in caplog.records if r.levelname == "INFO"]
+    assert len(infos) == 1
+    assert "differs from the bundled" in infos[0].getMessage()
+
+
+def test_sync_web_page_pref_off_identical_page_logs_no_info(fake_indigo, monkeypatch,
+                                                              tmp_path, caplog):
+    monkeypatch.setattr(fake_indigo, "server", _fake_server(tmp_path), raising=False)
+    source = _bundle_source_path(tmp_path)
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"<html>same</html>")
+    dest = _installed_dest_path(tmp_path)
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"<html>same</html>")
+
+    plug = make_plugin({"managePage": False})
+
+    with caplog.at_level("INFO"):
+        plug._sync_web_page()  # must not raise
+
+    infos = [r for r in caplog.records if r.levelname == "INFO"]
+    assert len(infos) == 0

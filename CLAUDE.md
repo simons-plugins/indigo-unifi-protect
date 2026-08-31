@@ -54,10 +54,22 @@ Inherits workspace standards from [root CLAUDE.md](../CLAUDE.md#common-standards
 - **Merge**: GitHub PR only, never `--admin`, never squash, wait for CI green, wait for user go-ahead.
 - **Any PR touching `pages/*.html` must say so in the PR title.** This repo's
   releases use `generate_release_notes: true`, which builds the changelog
-  entirely from PR titles, and `pages/cameras.html` is installed manually
-  into `Web Assets/static/pages/` — it does not ship in the plugin bundle,
-  so users only know to update their copy if the release notes mention it.
-  A page change with a title that doesn't mention it is a page nobody updates.
+  entirely from PR titles. Since 2026.10.0 (issue #27) the plugin
+  auto-installs `pages/cameras.html` into `Web Assets/static/pages/` on
+  every startup, but that install compares content, not the PR title — a
+  reader still relies on release notes to know a page changed at all,
+  especially anyone who has unticked "Manage the Cameras web page" and
+  copies it by hand.
+- **`pages/cameras.html` is physically duplicated, not symlinked, into the
+  plugin bundle** at
+  `UniFi Protect.indigoPlugin/Contents/Resources/pages/cameras.html` — a
+  symlink is not safe here because zip/release bundling and Indigo may not
+  preserve it. `pages/cameras.html` remains the single source of truth;
+  after editing it, sync the bundled copy:
+  ```bash
+  cp pages/cameras.html "UniFi Protect.indigoPlugin/Contents/Resources/pages/cameras.html"
+  ```
+  `tests/test_page_bundle.py` fails the build if the two ever drift apart.
 
 ---
 

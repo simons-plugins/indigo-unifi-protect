@@ -29,6 +29,16 @@
         <Label>UniFi OS consoles serve a self-signed certificate by default. Leave unchecked unless you have installed your own trusted certificate.</Label>
     </Field>
 
+    <Field id="sep2b" type="separator"/>
+
+    <Field id="managePage" type="checkbox" defaultValue="true">
+        <Label>Manage the Cameras web page:</Label>
+        <Description>Install/update cameras.html into Web Assets automatically</Description>
+    </Field>
+    <Field id="managePageHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+        <Label>On startup (and whenever you save this config with the box ticked), the plugin copies its bundled cameras.html into Web Assets/static/pages/ if it is missing or out of date. Untick this if you hand-edit the installed copy - the plugin will otherwise overwrite your changes the next time it starts.</Label>
+    </Field>
+
     <Field id="sep3" type="separator"/>
 
     <Field id="showDebugInfo" type="checkbox" defaultValue="false">
