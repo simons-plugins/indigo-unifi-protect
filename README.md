@@ -42,6 +42,11 @@ that turns the camera devices into something you can actually look at:
 - **Auto-refresh** every 30s (off by default) for a rough live view.
 - **Live motion state** — motion, person, vehicle, animal, camera state and
   event-socket health, polled every 5s.
+- **Camera config** — status LED, mic (with volume), video mode, HDR, and
+  OSD name/date, polled every 5s. These are the states the plugin pushes
+  live over `/subscribe/devices` (issue #18, 2026.8.0+); against an older
+  plugin the states simply don't exist yet, so the page shows nothing for
+  them rather than a confident "off".
 
 It also does two things deliberately:
 

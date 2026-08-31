@@ -42,6 +42,10 @@ blob URL, because an `<img src>` tag cannot carry an Authorization header.
   via `plugin.executeAction`, so no per-camera action group is needed
 - Auto-refresh every 30s (off by default)
 - Live motion / person / vehicle / animal state, polled every 5s
+- Camera config — status LED, mic (with volume), video mode, HDR, and OSD
+  name/date — polled every 5s. Values are live-pushed by the plugin
+  (>= 2026.8.0, issue #18); on an older plugin the states don't exist yet,
+  so the page shows nothing for them rather than a confident "off"
 
 Two things it does on purpose:
 
