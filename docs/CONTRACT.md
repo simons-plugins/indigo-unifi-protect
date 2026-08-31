@@ -36,6 +36,29 @@ Proven live on 2026-08-26 against a UNVR at `192.168.0.10`, UniFi Protect
 - **Rate limit (2026-08-26):** ~5 req/s earned HTTP 429; one request per 3s
   was clean. Nothing was measured in between. `plugin.py`'s `MIN_REST_INTERVAL`
   (3.0s) is set from this finding.
+- **`PATCH /cameras/{id}`, verified live 2026-08-31 on 7.2.105 — the
+  plugin's first write path (issue #6).** `X-API-KEY` alone authorises it,
+  same as every GET; no separate write credential. Partial JSON bodies are
+  accepted. The response is the **full** camera object (same shape as
+  `GET /cameras/{id}`), not just the changed fields — callers should use it
+  to refresh their cache rather than issuing a follow-up GET. Verified
+  writable fields: `ledSettings.isEnabled` (bool), `osdSettings.isNameEnabled`
+  / `isDateEnabled` / `isLogoEnabled` (bool), `osdSettings.overlayLocation`
+  (enum `topLeft|topMiddle|topRight|bottomLeft|bottomMiddle|bottomRight`),
+  `videoMode` (must be one of that camera's own `featureFlags.videoModes`;
+  spec enum `default|highFps|sport|slowShutter|lprReflex|lprNoneReflex`),
+  `hdrType` (`auto|on|off`), `micVolume` (0–100 int), `name`.
+  - A bad enum/type/unknown field → **400** with body
+    `{"error":"Failed to parse 'request-body'","name":"AJV_PARSE_ERROR",
+    "entity":"request-body","issues":[{"instancePath":"/videoMode",
+    "message":"must be equal to one of the allowed values","keyword":"enum"}],
+    "body":{...},"isUserError":true}`. `additionalProperties` is rejected.
+  - An unknown camera id → **404** `{"error":"Entity 'camera' not found",
+    "name":"NOT_FOUND"}`.
+  - Camera `featureFlags` carries `hasLedStatus`, `hasHdr`, `hasMic`,
+    `hasSpeaker`, `videoModes` — the write actions gate on these rather than
+    assuming support; one camera on the reference rig reports
+    `hasSpeaker: false`.
 
 **Consequence: the WebSocket is the only motion source. There is no polling
 fallback.** If the socket is down, motion is unknowable — say so in device
@@ -132,14 +155,40 @@ class ProtectAPIError(Exception):
             unparseable.
     """
 
+    @property
+    def issues(self) -> list[str]:
+        """Field-level AJV validation issues from a 400 body, as
+        "<instancePath>: <message>" strings (instancePath defaults to "/").
+        Lazily parsed from `body` on every access. [] when `body` isn't a
+        JSON object, has no `issues` list, or the error wasn't a
+        bad_request at all -- a refused PATCH does not always have issues
+        to show."""
+
 class ProtectAPI:
     def __init__(self, host: str, api_key: str, verify_ssl: bool = False,
                  timeout: int = 15) -> None: ...
+
+    def _request(self, method: str, path: str, params: dict[str, str] | None = None,
+                 body: dict | None = None) -> bytes:
+        """Shared HTTP core for every call below. `body`, when given, is
+        JSON-encoded with Content-Type/Accept: application/json headers.
+        `X-API-KEY` is the only auth, on every method including PATCH.
+        `_get` is a thin wrapper over this with no body -- existing GET
+        callers are unaffected by this method existing."""
 
     def get_cameras(self) -> list[dict]:
         """GET /cameras. Raises ProtectAPIError."""
 
     def get_camera(self, camera_id: str) -> dict: ...
+
+    def patch_camera(self, camera_id: str, body: dict) -> dict:
+        """PATCH /cameras/{id}. `body` is a partial camera object (issue
+        #6) -- see "Verified facts" above for the fields proven writable.
+        Returns the FULL camera object from the response, same shape as
+        get_camera, so a caller can replace its cached copy with it
+        directly. Raises ProtectAPIError, including when the response
+        isn't a JSON object -- mirrors get_camera. On a refusal, the
+        server's AJV issues (if any) are on the raised error's `.issues`."""
 
     def get_snapshot(self, camera_id: str, high_quality: bool = False,
                       supports_high_quality: bool | None = None) -> bytes:
@@ -510,6 +559,68 @@ are written together in one batched call —
 `updateStateOnServer()` calls. The state image
 (`MotionSensorTripped`/`MotionSensor`) tracks `onOffState`, not
 `motionDetected` alone.
+
+### Actions (issue #6) — the plugin's first write path
+
+Five `Actions.xml` entries, all `deviceFilter="self.protectCamera"`,
+`uiPath="DeviceActions"`, dispatched to a same-named `plugin.py` method:
+
+| Action id | Gate (`featureFlags`) | PATCH body |
+|---|---|---|
+| `setStatusLed` | `hasLedStatus` | `{"ledSettings": {"isEnabled": <bool>}}` — `mode` is `on`/`off`/literal, or `toggle` (inverts the cached `ledSettings.isEnabled`) |
+| `setOsdOverlay` | none | `{"osdSettings": {...}}`, built only from the fields the user set away from `unchanged` (`showName`→`isNameEnabled`, `showDate`→`isDateEnabled`, `showLogo`→`isLogoEnabled`, `overlayLocation`) |
+| `setVideoMode` | value ∈ `videoModes` | `{"videoMode": <str>}` |
+| `setHdrMode` | `hasHdr` | `{"hdrType": <str>}` |
+| `setMicVolume` | `hasMic` | `{"micVolume": <int 0-100>}` |
+
+All five share `_resolve_camera(dev, what)` (resolves `cameraId`, confirms
+the plugin is configured, returns the cached camera object — refreshing
+once via `_refresh_camera_info()` if it isn't cached yet) and
+`_patch_camera(dev, camera_id, body, what)` (sends the PATCH via `_rest`,
+so it obeys `MIN_REST_INTERVAL` like every other call).
+
+**A refused PATCH is an ERROR in the Event Log naming the field the
+controller rejected; `camera_info` is only ever replaced by a 2xx
+response.** On success, `_patch_camera` replaces `self.camera_info[camera_id]`
+with the PATCH response (the full camera object) and calls
+`_apply_camera_state(camera_id, force=True)`, so the issue #4
+hardware/config states update immediately rather than waiting for the next
+`GET /cameras` refresh. On a `ProtectAPIError`, `camera_info` is left
+untouched and the log line is
+`f"{dev.name}: {what} refused - {exc}"` plus, when `exc.issues` is
+non-empty, `" (" + "; ".join(exc.issues) + ")"`.
+
+**Capability gating happens BEFORE any request**, using the cached
+`featureFlags` — never assumed, per the issue (one camera on the reference
+rig reports `hasSpeaker: false`). `setOsdOverlay` has no `featureFlags`
+gate (OSD text/logo/date toggles are universal); `setVideoMode` gates on
+the *value* being a member of that camera's own `featureFlags.videoModes`
+rather than a fixed flag. A gate failure is an ERROR log naming the camera
+and the missing capability, and no request is made — proven in tests with
+a fatal-collaborator API stub whose `patch_camera` raises if ever called.
+
+`setVideoMode`'s ConfigUI menu is populated by the dynamic list
+`getVideoModeList(filter, valuesDict, typeId, targetId)`, which resolves
+`targetId` (the Indigo device id Indigo passes for a `deviceFilter`
+action) to its `cameraId` and reads `featureFlags.videoModes` from
+`self.camera_info`. When the camera isn't cached yet, it falls back to
+`VIDEO_MODE_SPEC_ENUM` — Protect's published OpenAPI enum, only
+`default`/`sport`/`slowShutter` proven on the wire — with each label
+suffixed `" (unverified)"` so the dialog doesn't imply every listed mode
+is confirmed to work on the user's hardware; the PATCH is still validated
+against the camera's real list in `setVideoMode`, so picking an unverified
+mode the camera doesn't actually support is refused there, not silently
+sent.
+
+`validateActionConfigUi(valuesDict, typeId, deviceId)` — note the third
+parameter is the Indigo device id, not an action id, per the SDK's own
+naming — handles the two checks that belong to the dialog rather than the
+camera: `setOsdOverlay` rejects the save when every one of `showName` /
+`showDate` / `showLogo` / `overlayLocation` is still `unchanged` (nothing
+to send), and `setMicVolume` rejects a `micVolume` that doesn't parse as
+an int 0–100. Both callbacks re-check defensively (an empty OSD body, an
+out-of-range mic volume) because a scripter can call `executeAction()`
+directly and bypass the dialog — and its validation — entirely.
 
 ---
 

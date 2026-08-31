@@ -156,6 +156,48 @@ mode/level, zoom position, motion tuning, and wifi stats. See
 [`docs/API-REFERENCE.md`](./docs/API-REFERENCE.md) (added by PR #10) for
 the full verified field list.
 
+### Camera control actions
+
+This is the plugin's first **write** path — everything above only reads.
+Five device actions, all under **Device Actions**, send a partial
+`PATCH /cameras/{id}`; the console applies just the fields sent and the
+plugin refreshes the camera-info states above from the response
+immediately, rather than waiting for the next refresh:
+
+- **Set Status LED** — on / off / toggle. Toggle inverts the camera's own
+  current `ledEnabled` state, so it does the right thing even if the LED
+  was last changed from the UniFi app, not this plugin.
+- **Set OSD Overlay** — show/hide the camera name, date, and logo, and set
+  the overlay location (top/bottom, left/middle/right). Each field
+  defaults to **Unchanged**; only the fields you actually change are sent,
+  and leaving everything unchanged is rejected — there would be nothing to
+  do.
+- **Set Video Mode** — the picker is populated live from the camera's own
+  `featureFlags.videoModes`, so it only ever offers modes that camera
+  actually supports. If the camera isn't cached yet, it falls back to
+  Protect's published mode list with each option marked *(unverified)* —
+  picking one there is still checked against the real camera before
+  anything is sent.
+- **Set HDR Mode** — auto / on / off.
+- **Set Microphone Volume** — 0–100.
+
+Each action checks the camera's `featureFlags` **before** sending
+anything — `setStatusLed` needs `hasLedStatus`, `setHdrMode` needs
+`hasHdr`, `setMicVolume` needs `hasMic` — because not every camera has
+every capability (one on the reference rig reports no speaker at all). A
+camera that doesn't support the action gets an Event Log error instead of
+a silently-ignored PATCH.
+
+**A refused write always shows up in the Event Log**, including the exact
+field the controller rejected (e.g. `/videoMode: must be equal to one of
+the allowed values`) when Protect's API returns one. A successful write
+never gets silently swallowed either way — the camera-info states above
+are only ever updated from an actual 2xx response, never assumed.
+
+Verified live against a UNVR on Protect **7.2.105**, 2026-08-31: the API
+key alone authorises these writes, the same as every read in this plugin —
+no separate write credential was needed.
+
 ## Latency
 
 Motion detection rides the Protect event WebSocket, not polling. Measured
