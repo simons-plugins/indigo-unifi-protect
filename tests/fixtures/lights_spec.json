@@ -1,0 +1,36 @@
+[
+  {
+    "id": "6a1f2e3d0057a8034e002201",
+    "modelKey": "light",
+    "state": "CONNECTED",
+    "name": "Driveway Floodlight",
+    "mac": "F09FC2010401",
+    "lightModeSettings": {"mode": "motion", "enableAt": "dark"},
+    "lightDeviceSettings": {
+      "isIndicatorEnabled": true, "pirDuration": 30000, "pirSensitivity": 50, "ledLevel": 3
+    },
+    "isDark": true,
+    "isLightOn": false,
+    "isLightForceEnabled": false,
+    "lastMotion": null,
+    "isPirMotionDetected": false,
+    "camera": null
+  },
+  {
+    "id": "6a1f2e3d0057a8034e002202",
+    "modelKey": "light",
+    "state": "CONNECTED",
+    "name": "Back Garden Floodlight",
+    "mac": "F09FC2010402",
+    "lightModeSettings": {"mode": "always", "enableAt": "fulltime"},
+    "lightDeviceSettings": {
+      "isIndicatorEnabled": false, "pirDuration": 15000, "pirSensitivity": 75, "ledLevel": 6
+    },
+    "isDark": false,
+    "isLightOn": true,
+    "isLightForceEnabled": true,
+    "lastMotion": 1787756557000,
+    "isPirMotionDetected": true,
+    "camera": "6a1f2e3d0057a8034e000101"
+  }
+]

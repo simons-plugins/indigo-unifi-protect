@@ -1,0 +1,58 @@
+[
+  {
+    "id": "6a1f2e3d0057a8034e001111",
+    "modelKey": "sensor",
+    "state": "CONNECTED",
+    "name": "Front Door",
+    "mac": "F09FC2010301",
+    "mountType": "door",
+    "batteryStatus": {"percentage": 87, "isLow": false},
+    "stats": {
+      "light": {"value": null, "status": "unknown"},
+      "humidity": {"value": null, "status": "unknown"},
+      "temperature": {"value": null, "status": "unknown"}
+    },
+    "lightSettings": {"isEnabled": false, "margin": 5, "lowThreshold": null, "highThreshold": null},
+    "humiditySettings": {"isEnabled": false, "margin": 5, "lowThreshold": null, "highThreshold": null},
+    "temperatureSettings": {"isEnabled": false, "margin": 1, "lowThreshold": null, "highThreshold": null},
+    "isOpened": false,
+    "openStatusChangedAt": null,
+    "isMotionDetected": false,
+    "motionDetectedAt": null,
+    "motionSettings": {"isEnabled": true, "sensitivity": 50},
+    "alarmTriggeredAt": null,
+    "alarmSettings": {"isEnabled": true},
+    "leakDetectedAt": null,
+    "externalLeakDetectedAt": null,
+    "leakSettings": {"isInternalEnabled": true, "isExternalEnabled": false},
+    "tamperingDetectedAt": null
+  },
+  {
+    "id": "6a1f2e3d0057a8034e001112",
+    "modelKey": "sensor",
+    "state": "CONNECTED",
+    "name": "Utility Room",
+    "mac": "F09FC2010302",
+    "mountType": "leak",
+    "batteryStatus": {"percentage": 42, "isLow": true},
+    "stats": {
+      "light": {"value": 120.5, "status": "neutral"},
+      "humidity": {"value": 55.2, "status": "neutral"},
+      "temperature": {"value": 18.4, "status": "neutral"}
+    },
+    "lightSettings": {"isEnabled": true, "margin": 5, "lowThreshold": 1, "highThreshold": 5000},
+    "humiditySettings": {"isEnabled": true, "margin": 5, "lowThreshold": 20, "highThreshold": 80},
+    "temperatureSettings": {"isEnabled": true, "margin": 1, "lowThreshold": 0, "highThreshold": 35},
+    "isOpened": false,
+    "openStatusChangedAt": null,
+    "isMotionDetected": false,
+    "motionDetectedAt": null,
+    "motionSettings": {"isEnabled": false, "sensitivity": 50},
+    "alarmTriggeredAt": null,
+    "alarmSettings": {"isEnabled": false},
+    "leakDetectedAt": null,
+    "externalLeakDetectedAt": null,
+    "leakSettings": {"isInternalEnabled": true, "isExternalEnabled": true},
+    "tamperingDetectedAt": null
+  }
+]

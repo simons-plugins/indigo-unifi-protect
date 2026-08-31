@@ -1,0 +1,23 @@
+{
+  "id": "6a1f2e3d0057a8034e004401",
+  "modelKey": "nvr",
+  "name": "UNVR",
+  "type": "UNVRINSTANT",
+  "guid": "00000000-0000-4000-8000-000000000099",
+  "mac": "F09FC2010601",
+  "doorbellSettings": {
+    "defaultMessageText": "Welcome",
+    "defaultMessageResetTimeoutMs": 60000,
+    "customMessages": [],
+    "customImages": []
+  },
+  "armMode": {
+    "status": "disabled",
+    "armedAt": null,
+    "willBeArmedAt": null,
+    "breachDetectedAt": null,
+    "breachEventCount": 0,
+    "breachTriggerEventId": null,
+    "breachEventId": null
+  }
+}
