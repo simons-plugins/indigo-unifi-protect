@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
 <meta name="indigo-page-name" content="Cameras">
 <meta name="indigo-page-icon" content="video.fill">
-<meta name="indigo-page-description" content="UniFi Protect camera snapshots with live motion state">
+<meta name="indigo-page-description" content="UniFi Protect camera snapshots with live motion state and camera config">
 <title>Cameras</title>
 <style>
 :root{--bg:#f5f5f7;--card-bg:#fff;--text:#1d1d1f;--text-secondary:#86868b;--border:#d2d2d7;
@@ -43,8 +43,10 @@ border:none;border-radius:10px;padding:10px 20px;background:var(--accent);color:
 button:disabled{opacity:.45;cursor:default}
 button.sec{background:var(--bg);color:var(--text);border:1px solid var(--border)}
 .states{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:4px}
+.sep{margin-top:16px;padding-top:14px;border-top:1px solid var(--border)}
 .pill{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--border);
 border-radius:10px;padding:10px 12px;font-size:15px}
+.pill.chip{color:var(--text-secondary)}
 .dot{width:10px;height:10px;border-radius:50%;background:var(--off-color);flex:0 0 auto}
 .dot.on{background:var(--on-color)}.dot.bad{background:var(--bad)}.dot.warn{background:var(--warn)}
 .banner{border-radius:10px;padding:12px 14px;font-size:15px;line-height:1.4;margin-bottom:14px;display:none}
@@ -78,6 +80,9 @@ border-radius:10px;padding:10px 12px;font-size:15px}
   <label>Live state</label>
   <div class="states" id="states"></div>
   <div class="note" id="gate"></div>
+
+  <label class="sep">Camera config</label>
+  <div class="states" id="configStates"></div>
 </div>
 </div>
 <script>
@@ -541,9 +546,21 @@ function pill(label, on, cls) {
   return d;
 }
 
+// A text chip for a non-boolean config value (videoMode, hdrType, OSD
+// summary) — no dot, since there's no on/off to indicate.
+function chip(label) {
+  const d = document.createElement("div");
+  d.className = "pill chip";
+  const t = document.createElement("span");
+  t.textContent = label;
+  d.appendChild(t);
+  return d;
+}
+
 function renderStates(dev) {
   const box = $("states");
   box.innerHTML = "";
+  $("configStates").innerHTML = "";
   if (!dev) return;
   const s = dev.states || {};
   const connected = s.connected === true;
@@ -572,6 +589,54 @@ function renderStates(dev) {
   $("gate").textContent = s.lastMotion
     ? "Last motion: " + s.lastMotion
     : "No motion recorded since the plugin last connected.";
+
+  // Camera config states (ledEnabled, videoMode, hdrType, micEnabled,
+  // micVolume, osdNameEnabled, osdDateEnabled) are push-live over the
+  // /subscribe/devices socket since 2026.8.0 (issue #18). A simple
+  // `"ledEnabled" in s` guard is NOT enough here: Indigo materialises
+  // every state declared in Devices.xml with its type default (false/0),
+  // so on any plugin >= 2026.8.0 the keys always exist and a value the
+  // plugin deliberately never wrote is indistinguishable from a real
+  // "off"/0. The plugin itself skips-not-defaults these keys
+  // (_camera_info_states), so the page must not re-fabricate them.
+  // cameraModel is the tell: it is also skipped-not-defaulted and only
+  // ever written from a real camera read -- until it is non-empty, the
+  // config values are Indigo defaults, not readings, and rendering them
+  // as confident off/0% would be a lie. Older plugins never declare the
+  // keys at all, which the same gate covers.
+  const cfg = $("configStates");
+  const cfgKnown = typeof s.cameraModel === "string" && !!s.cameraModel;
+
+  if (cfgKnown && "ledEnabled" in s) {
+    cfg.appendChild(pill(s.ledEnabled ? "Status LED on" : "Status LED off", !!s.ledEnabled));
+  }
+
+  if (cfgKnown && "micEnabled" in s) {
+    let micLabel = "Mic off";
+    if (s.micEnabled) {
+      // micVolume 0 is ambiguous even after a real read: Indigo's integer
+      // default and "the controller omitted micVolume" both look like 0.
+      // "Mic on" is the honest rendering there; a real, written volume
+      // > 0 gets the percentage.
+      micLabel = (typeof s.micVolume === "number" && s.micVolume > 0)
+        ? `Mic ${s.micVolume}%` : "Mic on";
+    }
+    cfg.appendChild(pill(micLabel, !!s.micEnabled));
+  }
+
+  if (typeof s.videoMode === "string" && s.videoMode) {
+    cfg.appendChild(chip("Video: " + s.videoMode));
+  }
+  if (typeof s.hdrType === "string" && s.hdrType) {
+    cfg.appendChild(chip("HDR: " + s.hdrType));
+  }
+
+  if (cfgKnown && ("osdNameEnabled" in s || "osdDateEnabled" in s)) {
+    const parts = [];
+    if (s.osdNameEnabled) parts.push("name");
+    if (s.osdDateEnabled) parts.push("date");
+    cfg.appendChild(chip("OSD: " + (parts.length ? parts.join("+") : "off")));
+  }
 }
 
 // ── wiring ──────────────────────────────────────────────────────────────

@@ -52,6 +52,12 @@ Inherits workspace standards from [root CLAUDE.md](../CLAUDE.md#common-standards
 - **Version bump per PR**: `Info.plist` `PluginVersion`
 - **Testing**: pytest + `pyproject.toml` (pylint with custom Indigo rules, 120-char lines) — mirrors `netro/tests/` (`unittest.mock`, `indigo` stubbed in `conftest.py`)
 - **Merge**: GitHub PR only, never `--admin`, never squash, wait for CI green, wait for user go-ahead.
+- **Any PR touching `pages/*.html` must say so in the PR title.** This repo's
+  releases use `generate_release_notes: true`, which builds the changelog
+  entirely from PR titles, and `pages/cameras.html` is installed manually
+  into `Web Assets/static/pages/` — it does not ship in the plugin bundle,
+  so users only know to update their copy if the release notes mention it.
+  A page change with a title that doesn't mention it is a page nobody updates.
 
 ---
 
