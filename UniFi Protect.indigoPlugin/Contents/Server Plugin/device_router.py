@@ -25,14 +25,14 @@ docs/API-REFERENCE.md, "`/subscribe/devices` WebSocket"):
 
 `modelKey` values the spec knows about: `nvr, camera, chime, light, viewer,
 speaker, bridge, sensor, aiprocessor, aiport, linkstation`. This plugin only
-acts on the five it already has Indigo device types for -- see
-HANDLED_MODEL_KEYS. Everything else (an observed `bridge` update frame
-carried only `id`/`modelKey`/`guid` in the same capture) is parsed
-successfully but not something this router hands back to the caller; see
-`ignored_model_counts`.
+acts on the six it already has Indigo device types for (issue #22 added
+`viewer`) -- see HANDLED_MODEL_KEYS. Everything else (an observed `bridge`
+update frame carried only `id`/`modelKey`/`guid` in the same capture) is
+parsed successfully but not something this router hands back to the
+caller; see `ignored_model_counts`.
 """
 
-HANDLED_MODEL_KEYS = frozenset({"camera", "sensor", "light", "chime", "nvr"})
+HANDLED_MODEL_KEYS = frozenset({"camera", "sensor", "light", "chime", "nvr", "viewer"})
 
 _FRAME_TYPES = frozenset({"add", "update", "remove"})
 
@@ -56,7 +56,7 @@ class DeviceUpdateRouter:
     message/item isn't a dict, `id` is missing/empty/non-string, or `type`
     is missing/not one of add/update/remove) is counted in `malformed_count`
     and `route()` returns None. A frame that parses fine but names a
-    `modelKey` this plugin doesn't act on (viewer, speaker, bridge,
+    `modelKey` this plugin doesn't act on (speaker, bridge,
     aiprocessor, aiport, linkstation, or an absent/non-string value) is
     counted separately in `ignored_model_counts`, keyed by that modelKey --
     it is NOT malformed, it just isn't a device class this plugin has an
