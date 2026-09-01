@@ -302,6 +302,38 @@ class ProtectAPI:
         above on every ProtectAPIError raised -- this endpoint family can
         echo a stream URL/token back in an error body. 204 No Content on
         success. SPEC-DERIVED, UNVERIFIED."""
+
+    def get_viewers(self) -> list[dict]:
+        """GET /viewers (issue #22). Raises ProtectAPIError, including when
+        the parsed body is not a JSON array of objects. SPEC-DERIVED,
+        UNVERIFIED -- the reference rig has no ViewPort, /viewers always
+        returns []."""
+
+    def get_viewer(self, viewer_id: str) -> dict:
+        """GET /viewers/{id}. Raises ProtectAPIError, including when the
+        parsed body is not a JSON object. SPEC-DERIVED, UNVERIFIED."""
+
+    def patch_viewer(self, viewer_id: str, body: dict) -> dict:
+        """PATCH /viewers/{id}. `body` is a partial viewer object --
+        `additionalProperties: false` per the spec, so it may only carry
+        `name` and/or `liveview` (a liveview id, or None to clear it).
+        Returns the FULL updated viewer object. Raises ProtectAPIError,
+        including when the parsed body is not a JSON object. SPEC-DERIVED,
+        UNVERIFIED."""
+
+    def get_liveviews(self) -> list[dict]:
+        """GET /liveviews (issue #23) -- READ-ONLY in this plugin; the
+        spec's POST/PATCH for liveviews are deliberately not implemented
+        (a liveview is console-side view configuration, not Protect
+        hardware, and creating/editing one is out of scope). Raises
+        ProtectAPIError, including when the parsed body is not a JSON
+        array of objects. SPEC-DERIVED, UNVERIFIED against the reference
+        rig -- /viewers is empty there, but /liveviews itself was never
+        exercised live either way."""
+
+    def get_liveview(self, liveview_id: str) -> dict:
+        """GET /liveviews/{id}. Raises ProtectAPIError, including when the
+        parsed body is not a JSON object. SPEC-DERIVED, UNVERIFIED."""
 ```
 
 Use `urllib.request` with an `ssl.SSLContext`. When `verify_ssl` is false set
@@ -542,7 +574,7 @@ WebSocket (see `docs/API-REFERENCE.md`, "`/subscribe/devices` WebSocket —
 VERIFIED 2026-08-31" for the wire facts this module is built against).
 
 ```python
-HANDLED_MODEL_KEYS = frozenset({"camera", "sensor", "light", "chime", "nvr"})
+HANDLED_MODEL_KEYS = frozenset({"camera", "sensor", "light", "chime", "nvr", "viewer"})
 
 class DeviceUpdateRouter:
     def route(self, message) -> tuple[str, str, str, dict] | None:
@@ -558,7 +590,7 @@ class DeviceUpdateRouter:
 
     @property
     def ignored_model_counts(self) -> dict: ...
-        # well-formed frames whose modelKey isn't handled (viewer, speaker,
+        # well-formed frames whose modelKey isn't handled (speaker,
         # bridge, aiprocessor, aiport, linkstation, or absent/non-string --
         # "<missing>"), keyed by modelKey. NOT malformed -- the frame
         # parsed fine, it just isn't a class this plugin has a device type
@@ -1861,3 +1893,159 @@ question is "when could this report idle/unavailable/kept and be wrong?":
   timestamps and skipped when null; a dedicated test pins the recovery
   limitation directly: `leakDetected` reads `False` post-restart while
   `lastLeak` still shows the poll's `leakDetectedAt`
+
+---
+
+## Issue #22/#23: viewers + live views
+
+> **UNVERIFIED -- spec-derived.** Same status as sensors/lights/chimes:
+> the reference rig's `GET /viewers` returns `[]` (no ViewPort hardware).
+> Unlike those three, `GET /liveviews` is NOT gated on owning a viewer --
+> every console has live views -- so the live-view LISTING half of this
+> feature (Discover Devices, the `setViewerLiveview` action's menu) can be
+> partially exercised on any rig even without one, and was.
+
+Follows the same pattern as Issue #8's sensor/light/chime/NVR classes,
+with one addition: a **second cache with no Indigo device of its own**.
+`self.viewers`/`self.viewer_info` are the usual `dict[protect_id ->
+set[indigo_device_id]]` / `dict[protect_id -> object]` pair; `
+self.liveview_info` is a plain `dict[liveview_id -> object]` -- live views
+are console-side view configuration, not hardware, so there is no
+`self.liveviews` registry and no Indigo device type for them.
+
+`HANDLED_MODEL_KEYS` (device_router.py) grew to six: `viewer` moved OUT of
+`KNOWN_UNHANDLED_MODEL_KEYS` in plugin.py at the same time -- a viewer
+`/subscribe/devices` frame now routes like camera/sensor/light/chime/nvr
+instead of being counted in `ignored_model_counts`. `liveview` is NOT a
+`/subscribe/devices` modelKey (the spec never lists it in that union) and
+is not handled there -- live views only ever arrive via the REST poll and
+the two menu-populating dynamic lists.
+
+### `_poll_viewers()` ordering and failure isolation
+
+Liveviews are fetched **before** viewers on every poll tick, so a
+viewer's `liveviewName` can resolve against the freshest cache on the
+same tick it changed. The two fetches fail independently:
+
+- A **liveviews** failure is reported via `_report_poll_failure("liveview",
+  exc)` and does **not** abort the viewer poll -- `self.liveview_info` is
+  left at its last-known contents (never cleared on failure, same rule as
+  every other info cache in this plugin) and the viewer poll proceeds
+  normally: `viewerState`/`liveviewId`/`streamLimit` all still get written
+  from the viewer's own successful fetch. Only `liveviewName` is affected,
+  and only indirectly (see below).
+- A **viewers** failure is reported via `_report_poll_failure("viewer",
+  exc)` and `_mark_class_unavailable(self.viewers, "viewerState")`,
+  identical in shape to every other issue #8 class, then returns.
+- **Liveviews must never be fetched when no viewer device is registered**
+  -- `_poll_devices()`'s `if self.viewers: self._poll_viewers()` guard is
+  what enforces this; pinned with a fatal-collaborator test on both
+  `get_liveviews` and `get_viewers`.
+
+### `liveviewName` resolution -- the one "skip, don't fabricate" state here
+
+| `liveview` field | `liveviewId` written | `liveviewName` written |
+|---|---|---|
+| absent / `null` | `""` | `""` |
+| a real id, found in `self.liveview_info` | that id | the resolved `name` |
+| a real id, NOT in `self.liveview_info` | that id | **omitted** -- last-known value held |
+
+The third row covers two situations identically: the liveview list has
+never successfully loaded yet (fresh cache, `{}`), or a poll failure left
+a stale cache that simply doesn't mention this id. Both mean "not a
+confirmed read" the same way, so both get the same treatment. This never
+writes the bare liveview id into the name field, and never fabricates a
+name -- the same "a key that can't be confirmed is skipped, not
+defaulted" rule the whole Issue #8 pattern already uses for
+`lastOpenChange`/`isOpen`/etc.
+
+### State table -- `protectViewer` (`type="custom"`)
+
+| State | Type | Source |
+|---|---|---|
+| `viewerState` | String | poll `state`, or `STATE_UNAVAILABLE` |
+| `liveviewId` | String | poll `liveview`, or `""` if null |
+| `liveviewName` | String | resolved from `self.liveview_info`; see table above -- omitted when unresolved |
+| `streamLimit` | Integer | poll `streamLimit`; same bool guard as `ringVolume`/`breachEventCount` -- skipped if bool/None/unparseable |
+| `connected` | Boolean | event socket health (same one signal as every other class -- viewers have no live feed of their own) |
+| `lastPoll` | String | ISO, poll-triggered writes only |
+
+No lifecycle-driven fields: unlike sensors/lights, a viewer has nothing
+event-socket-driven of its own, so `_mark_all_disconnected` only ever
+touches `connected` for this class -- same as chime/NVR.
+
+### `setViewerLiveview` action
+
+`PATCH /viewers/{id}` with body `{"liveview": <id>}` -> the full updated
+viewer object. Mirrors `_patch_camera`'s "validate before replacing the
+cache" rule rather than going through `_patch_camera` itself (there is no
+camera object here to gate capability on): the response is checked
+(`response.get("id") == viewer_id`) BEFORE it replaces
+`self.viewer_info[viewer_id]`. A shape mismatch does **not** cache the bad
+body -- it re-reads the real viewer via `get_viewer` and applies that
+instead, logging the shape problem first. A refused/errored PATCH (any
+`ProtectAPIError`) logs one ERROR via `_describe_api_error(exc,
+entity="viewer")` and leaves the cache untouched. An empty `liveviewId`
+(no selection) is rejected before any network call, in both
+`validateActionConfigUi` and the callback itself, matching every other
+action's double-check for a scripted `executeAction()` call.
+
+### `getLiveviewList` -- the one dynamic list that works everywhere
+
+Populates the `setViewerLiveview` action's menu (and doubles as the
+`_discover_liveviews` data source). Sorted by name, with `" (default)"`
+appended to the console's default live view (`isDefault`). Unlike every
+other `getXList` in this plugin, this one is not gated by "does the user
+own hardware of this class" -- `GET /liveviews` succeeds on any console.
+
+### `_request_status_viewer` / RequestStatus
+
+Single-device `GET /viewers/{id}`, mirroring every other class's
+RequestStatus path, **plus** a `get_liveviews` refresh so `liveviewName`
+can resolve immediately rather than waiting for the next 60s poll. The
+liveviews refresh failing here is a WARNING, not an ERROR -- the viewer
+itself DID refresh successfully; only the name lookup is stale.
+
+### Testing
+
+`tests/fixtures/` does not (yet) have a `viewers_spec.json`/
+`liveviews_spec.json` pair -- the declared-vs-written scenario for
+`protectViewer` is built inline in `test_every_written_state_is_declared_
+and_legal`'s `_scenario_viewer`, matching the other four classes' inline
+scenarios in that same test. Per workspace convention, the adversarial
+question asked throughout: "when could `liveviewName` look like a real
+answer and actually be fabricated or stale?" Covered:
+
+- fatal-collaborator: `_poll_devices()` with exactly one viewer registered
+  touches `get_liveviews` and `get_viewers` and nothing else non-camera;
+  with only a camera registered, neither is touched
+- `_poll_viewers` fetches liveviews before viewers (order pinned via a
+  recording API, not wall-clock timing)
+- a liveviews failure does not abort the viewer poll: `viewerState`/
+  `liveviewId`/`streamLimit` are written, `liveviewName` is skipped, and
+  exactly one ERROR is logged
+- a viewers failure marks `viewerState` unavailable and touches nothing
+  else -- proven by diffing the exact key set of the failure's write batch
+- `liveviewName` skipped when the id is present but not in a loaded cache
+  (covers both "never loaded" and "stale after a failure" -- same code
+  path); `""` when the API `liveview` field is null
+- `streamLimit` never written for a bool/None/non-numeric-string value;
+  written for a real int
+- device-socket `viewer` `update` frame merges onto a cached id and
+  re-applies state; an uncached id is ignored (not seeded from a partial
+  frame); a `remove` warns once per absence episode
+- `setViewerLiveview`: success updates the cache and resolves
+  `liveviewName` immediately; a refused PATCH (`bad_request`) and a
+  transport failure both log one ERROR and leave the cache untouched; a
+  shape-mismatched response (wrong `id`) does NOT replace the cache and
+  instead re-polls the real viewer via `get_viewer`; no-api and no-viewer
+  each log their own specific ERROR without touching the network; an
+  empty `liveviewId` is rejected before any network call (fatal-
+  collaborator form)
+- `getLiveviewList` appends `" (default)"` for the default live view and
+  returns `_menu_error_label`'s text on a poll failure
+- `validateActionConfigUi("setViewerLiveview", ...)` rejects an empty
+  `liveviewId`; a pre-existing typeId (`ptzGotoPreset`) is re-checked
+  after the new branch to prove routing wasn't broken by it
+- `discoverCameras` logs both the viewer list and the live view list, and
+  a viewer-discovery failure logs one ERROR without raising

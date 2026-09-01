@@ -319,21 +319,25 @@ A one-line example: copy the `streamUrlHigh` state's value and hand it
 straight to a player -- `ffplay "rtsps://192.168.0.10:7441/<token>?enableSrtp"`,
 or paste the same URL into VLC's **Open Network Stream** dialog.
 
-## Other Protect devices -- sensors, floodlights, chimes, NVR
+## Other Protect devices -- sensors, floodlights, chimes, NVR, viewers
 
 > **Built from the official OpenAPI spec, never exercised on real
 > hardware.** Every camera feature in this plugin (above) was verified
-> against a live UniFi Protect console. Sensors, floodlights, and chimes
-> were not: the reference console has none, and `GET /sensors`, `GET
-> /lights`, and `GET /chimes` all return `[]` there. This code is built
-> entirely from Protect's published OpenAPI 3.1 spec (v6.2.83) --
-> field names, shapes, and event types should be right, but nothing here
-> has been proven against a real Protect sensor, floodlight, or chime.
+> against a live UniFi Protect console. Sensors, floodlights, chimes, and
+> viewers (ViewPorts) were not: the reference console has none, and `GET
+> /sensors`, `GET /lights`, `GET /chimes`, and `GET /viewers` all return
+> `[]` there. This code is built entirely from Protect's published OpenAPI
+> 3.1 spec (v6.2.83) -- field names, shapes, and event types should be
+> right, but nothing here has been proven against a real Protect sensor,
+> floodlight, chime, or ViewPort.
 > **If something looks wrong, please open an issue with a debug capture**:
 > run `docs/ws_probe.py` while triggering the sensor/light/chime, and
-> attach its output alongside a `GET /sensors` (or `/lights`, `/chimes`)
-> JSON dump from your console. The NVR device below is the one exception
-> -- its arm-state fields were captured live.
+> attach its output alongside a `GET /sensors` (or `/lights`, `/chimes`,
+> `/viewers`) JSON dump from your console. The NVR device below is the one
+> exception -- its arm-state fields were captured live. The live view
+> LISTING under Protect Viewer below is a partial second exception: `GET
+> /liveviews` isn't gated on owning a ViewPort, so **Discover Devices**
+> can confirm that part of this class on any console.
 >
 > **One known limitation, independent of the spec-derived caveat above:**
 > a leak that began before the plugin started (or before the event socket
@@ -453,6 +457,31 @@ UniFi OS console's arm/disarm state: `nvrName`, `nvrModel`,
 `"unavailable"` before the first successful poll, or if the console never
 reports an arm state at all. Arm/disarm itself is not exposed as an
 action -- it isn't part of the published integration API.
+
+### Protect Viewer (ViewPort)
+
+Tracks a UniFi Protect ViewPort and which live view it is currently
+displaying.
+
+States: `viewerState`, `liveviewId`, `liveviewName`, `streamLimit`,
+`connected`, `lastPoll`.
+
+There's a **Set Live View** action that changes which live view the
+ViewPort shows, picked from a dropdown of every live view your console has
+(read-only listing -- creating or editing a live view is not exposed).
+
+`liveviewName` is resolved from a separately-polled live view cache, not
+from the viewer object itself (the API only gives a live view *id*). If
+that id can't be resolved yet -- the live view list hasn't loaded, or the
+id isn't in the last successful load -- `liveviewName` is left at its
+last-known value rather than showing the raw id or a blank; it reads `""`
+only when the ViewPort genuinely has no live view assigned.
+
+**How to confirm this class without owning a ViewPort:** run **Discover
+Devices** (plugin menu). It always lists your console's live views (`GET
+/liveviews` isn't gated on ViewPort hardware), even when the viewer list
+itself comes back empty -- so you can sanity-check the live-view half of
+this feature today, and it's the part `Set Live View`'s menu depends on.
 
 ## Latency
 
