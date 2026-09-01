@@ -58,7 +58,7 @@ def test_route_never_raises_on_deeply_wrong_input():
 # NOT malformed_count
 # ---------------------------------------------------------------------
 
-@pytest.mark.parametrize("model_key", ["viewer", "bridge", "speaker", "aiprocessor",
+@pytest.mark.parametrize("model_key", ["bridge", "speaker", "aiprocessor",
                                         "aiport", "linkstation", "somethingBrandNew"])
 def test_route_unhandled_model_key_is_ignored_not_malformed(model_key):
     router = DeviceUpdateRouter()
@@ -85,18 +85,18 @@ def test_route_non_string_model_key_is_ignored_under_missing_key():
 
 def test_ignored_model_counts_accumulate_per_key():
     router = DeviceUpdateRouter()
-    router.route({"type": "update", "item": {"id": "a", "modelKey": "viewer"}})
-    router.route({"type": "update", "item": {"id": "b", "modelKey": "viewer"}})
+    router.route({"type": "update", "item": {"id": "a", "modelKey": "speaker"}})
+    router.route({"type": "update", "item": {"id": "b", "modelKey": "speaker"}})
     router.route({"type": "update", "item": {"id": "c", "modelKey": "bridge"}})
-    assert router.ignored_model_counts == {"viewer": 2, "bridge": 1}
+    assert router.ignored_model_counts == {"speaker": 2, "bridge": 1}
 
 
 def test_ignored_model_counts_is_a_copy_not_live_state():
     router = DeviceUpdateRouter()
-    router.route({"type": "update", "item": {"id": "a", "modelKey": "viewer"}})
+    router.route({"type": "update", "item": {"id": "a", "modelKey": "speaker"}})
     counts = router.ignored_model_counts
-    counts["viewer"] = 999
-    assert router.ignored_model_counts == {"viewer": 1}
+    counts["speaker"] = 999
+    assert router.ignored_model_counts == {"speaker": 1}
 
 
 # ---------------------------------------------------------------------
@@ -115,8 +115,20 @@ def test_route_handled_model_key_returns_correct_tuple(frame_type, model_key):
     assert router.ignored_model_counts == {}
 
 
-def test_handled_model_keys_are_exactly_the_five_indigo_device_types():
-    assert HANDLED_MODEL_KEYS == {"camera", "sensor", "light", "chime", "nvr"}
+def test_handled_model_keys_are_exactly_the_six_indigo_device_types():
+    assert HANDLED_MODEL_KEYS == {"camera", "sensor", "light", "chime", "nvr", "viewer"}
+
+
+def test_route_viewer_update_frame_routes_not_ignored():
+    """Issue #22: viewer moved from ignored_model_counts into
+    HANDLED_MODEL_KEYS -- a viewer update frame must now route like any
+    other handled class, not fall into the ignore-and-count path."""
+    router = DeviceUpdateRouter()
+    item = {"id": "viewer-1", "modelKey": "viewer", "state": "CONNECTED"}
+    result = router.route({"type": "update", "item": item})
+    assert result == ("update", "viewer", "viewer-1", item)
+    assert router.malformed_count == 0
+    assert router.ignored_model_counts == {}
 
 
 # ---------------------------------------------------------------------

@@ -575,6 +575,50 @@ class ProtectAPI:
             body = body[0]
         return self._expect_dict(path, body)
 
+    # -- Viewers (issue #22) ------------------------------------------------
+    # Spec-derived (OpenAPI v6.2.83): the reference rig's /viewers always
+    # returned [] (no ViewPort hardware). UNVERIFIED against real hardware.
+
+    def get_viewers(self) -> list[dict]:
+        """GET /viewers. Raises ProtectAPIError, including when the parsed
+        body is not a JSON array of objects."""
+        path = "/viewers"
+        return self._expect_list_of_dicts(path, self._get_json(path))
+
+    def get_viewer(self, viewer_id: str) -> dict:
+        """GET /viewers/{id}. Raises ProtectAPIError, including when the
+        parsed body is not a JSON object."""
+        path = f"/viewers/{viewer_id}"
+        return self._expect_dict(path, self._get_json(path))
+
+    def patch_viewer(self, viewer_id: str, body: dict) -> dict:
+        """PATCH /viewers/{id}. `body` is a partial viewer object --
+        `additionalProperties: false` per the spec, so it may only carry
+        `name` and/or `liveview` (a liveview id, or ``None`` to clear it).
+        Returns the FULL updated viewer object. Raises ProtectAPIError,
+        including when the parsed body is not a JSON object."""
+        path = f"/viewers/{viewer_id}"
+        return self._expect_dict(path, self._patch_json(path, body))
+
+    # -- Liveviews (issue #23) -- READ-ONLY in this plugin -------------------
+    # The spec also documents POST (create) and PATCH (edit) for liveviews,
+    # but issue #23 scopes this plugin to LISTING only: a liveview is
+    # console-side view configuration, not a piece of Protect hardware, and
+    # creating/editing one is out of scope here. GET /liveviews LIVE-VERIFIED
+    # 2026-09-01 on the reference rig (Discover Devices listed the console's
+    # one live view, "Default (default, global) - 3 slot(s)"); /viewers is
+    # empty there, so the viewer methods above remain spec-only. There is deliberately no get_liveview
+    # (single-item GET /liveviews/{id}) either -- every caller in this
+    # plugin only ever needs the whole list (name resolution, the
+    # setViewerLiveview menu, Discover Devices); a dead single-item method
+    # would be untested, unverified, and unreachable code.
+
+    def get_liveviews(self) -> list[dict]:
+        """GET /liveviews. Raises ProtectAPIError, including when the
+        parsed body is not a JSON array of objects."""
+        path = "/liveviews"
+        return self._expect_list_of_dicts(path, self._get_json(path))
+
     def _request_no_content(self, method: str, path: str,
                              params: Optional[dict[str, str]] = None,
                              body: Optional[dict] = None) -> None:

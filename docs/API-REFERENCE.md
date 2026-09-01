@@ -71,11 +71,11 @@ the spec (see below the table):
 | `/v1/lights/{id}` | GET, PATCH | no |
 | `/v1/chimes` | GET | no — returns `[]` on reference rig |
 | `/v1/chimes/{id}` | GET, PATCH | no |
-| `/v1/viewers` | GET | no — returns `[]` on reference rig |
-| `/v1/viewers/{id}` | GET, PATCH | no |
+| `/v1/viewers` | GET | ✅ implemented, UNVERIFIED (issue #22) — returns `[]` on reference rig |
+| `/v1/viewers/{id}` | GET, PATCH | ✅ implemented, UNVERIFIED (issue #22) |
 | `/v1/nvrs` | GET | no (issue #8) |
-| `/v1/liveviews` | GET, POST | no |
-| `/v1/liveviews/{id}` | GET, PATCH | no |
+| `/v1/liveviews` | GET, POST | ✅ GET implemented, **verified live 2026-09-01** (1 live view listed via Discover Devices; issue #23); POST unbuilt — read-only in this plugin |
+| `/v1/liveviews/{id}` | GET, PATCH | no -- this plugin only ever needs the whole list (issue #29 follow-up); PATCH unbuilt |
 | `/v1/files/{fileType}` | GET, POST | no |
 | `/v1/alarm-manager/webhook/{id}` | POST | ✅ (issue #21) |
 | `/v1/subscribe/events` | GET (WS upgrade) | ✅ the only motion source |

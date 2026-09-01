@@ -1063,6 +1063,98 @@ def test_get_nvr_rejects_every_other_shape(monkeypatch, raw_body):
         api.get_nvr()
 
 
+# -- Viewers (issue #22) / Liveviews (issue #23, read-only) --------------
+
+def test_get_viewers_sends_get_and_parses_list(monkeypatch):
+    body = json.dumps([{"id": "v1", "modelKey": "viewer"}]).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+    api = make_api()
+    assert api.get_viewers() == [{"id": "v1", "modelKey": "viewer"}]
+
+
+def test_get_viewer_sends_get_with_id_in_path(monkeypatch):
+    body = json.dumps({"id": "v1"}).encode("utf-8")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(body))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+    api = make_api()
+    api.get_viewer("v1")
+    request = mock_urlopen.call_args[0][0]
+    assert request.full_url.endswith("/viewers/v1")
+
+
+def test_patch_viewer_sends_patch_with_liveview_body(monkeypatch):
+    body = json.dumps({"id": "v1", "liveview": "lv-1"}).encode("utf-8")
+    mock_urlopen = MagicMock(return_value=_FakeResponse(body))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    result = api.patch_viewer("v1", {"liveview": "lv-1"})
+
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "PATCH"
+    assert json.loads(request.data.decode("utf-8")) == {"liveview": "lv-1"}
+    assert result == {"id": "v1", "liveview": "lv-1"}
+
+
+def test_get_viewers_rejects_a_bare_object():
+    """Same shape guard every list endpoint gets -- a dict instead of a
+    list must not silently become an empty/[dict]-shaped iteration
+    surprise for a caller doing `for v in get_viewers()`."""
+    api = make_api()
+    with pytest.raises(ProtectAPIError):
+        api._expect_list_of_dicts("/viewers", {"id": "v1"})
+
+
+def test_get_viewers_dict_body_raises(monkeypatch):
+    """Issue #22 follow-up: exercise the guard through the real HTTP path
+    (urlopen), not just a direct _expect_list_of_dicts call -- mirrors
+    test_get_sensors_dict_body_raises."""
+    body = json.dumps({"not": "a list"}).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+    api = make_api()
+    with pytest.raises(ProtectAPIError):
+        api.get_viewers()
+
+
+def test_get_liveviews_sends_get_and_parses_list(monkeypatch):
+    body = json.dumps([{"id": "lv-1", "modelKey": "liveview", "isDefault": True}]).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+    api = make_api()
+    assert api.get_liveviews() == [{"id": "lv-1", "modelKey": "liveview", "isDefault": True}]
+
+
+def test_get_liveviews_dict_body_raises(monkeypatch):
+    """Issue #22 follow-up: same shape guard, through the real HTTP path,
+    for the ONE liveviews method this plugin actually calls."""
+    body = json.dumps({"not": "a list"}).encode("utf-8")
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(body)))
+    api = make_api()
+    with pytest.raises(ProtectAPIError):
+        api.get_liveviews()
+
+
+def test_protect_api_has_no_liveview_write_methods():
+    """Issue #23 scopes this plugin to READ-ONLY live views -- the spec
+    documents POST/PATCH for liveviews, but this client must not offer a
+    way to call them (a future caller reaching for one would otherwise
+    silently invent a wire contract nobody has verified)."""
+    api = make_api()
+    assert not hasattr(api, "create_liveview")
+    assert not hasattr(api, "patch_liveview")
+
+
+def test_protect_api_has_no_single_liveview_get_method():
+    """Issue #29 follow-up: no caller in this plugin ever needs a single
+    live view by id -- only the list. A get_liveview method would be dead,
+    untested, unverified code."""
+    api = make_api()
+    assert not hasattr(api, "get_liveview")
+
+
 def test_request_helper_returns_raw_bytes(monkeypatch):
     """_request (issue #6) returns the raw response body -- JSON parsing is
     each caller's own job (_get_json/_patch_json), matching patch_camera's

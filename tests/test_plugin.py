@@ -455,12 +455,28 @@ def _scenario_nvr(fake_indigo, plug):
     return dev, set()
 
 
+def _scenario_viewer(fake_indigo, plug):
+    from conftest import _FakeDevice
+    dev = _FakeDevice(2005, name="Hallway ViewPort", device_type_id="protectViewer",
+                       plugin_props={"viewerId": "viewer-1"})
+    fake_indigo.devices.add(dev)
+    plug.viewers = {"viewer-1": {dev.id}}
+    plug.socket = object()
+    plug.liveview_info = {"lv-1": {"id": "lv-1", "name": "Front Door"}}
+    plug.viewer_info = {"viewer-1": {
+        "id": "viewer-1", "state": "CONNECTED", "liveview": "lv-1", "streamLimit": 4,
+    }}
+    plug._apply_viewer_state("viewer-1", force=True, poll_timestamp_ms=1787756561000)
+    return dev, set()
+
+
 _SCENARIOS = {
     "protectCamera": _scenario_camera,
     "protectSensor": _scenario_sensor,
     "protectLight": _scenario_light,
     "protectChime": _scenario_chime,
     "protectNvr": _scenario_nvr,
+    "protectViewer": _scenario_viewer,
 }
 
 
@@ -3521,6 +3537,15 @@ def add_nvr_device(fake_indigo, plug, dev_id=3004, name="UNVR"):
     return dev
 
 
+def add_viewer_device(fake_indigo, plug, viewer_id="viewer-1", dev_id=3005, name="ViewPort"):
+    from conftest import _FakeDevice
+    dev = _FakeDevice(dev_id, name=name, device_type_id="protectViewer",
+                       plugin_props={"viewerId": viewer_id})
+    fake_indigo.devices.add(dev)
+    plug.deviceStartComm(dev)
+    return dev
+
+
 class _FatalNonCameraAPI:
     """Fatal-collaborator: every method raises if called. Proves
     _poll_devices only touches the classes that actually have a registered
@@ -3543,6 +3568,15 @@ class _FatalNonCameraAPI:
 
     def get_nvr(self):
         raise AssertionError("get_nvr must not be called with no NVR registered")
+
+    def get_viewers(self):
+        raise AssertionError("get_viewers must not be called with no viewer registered")
+
+    def get_liveviews(self):
+        raise AssertionError(
+            "get_liveviews must not be called with no viewer registered - live views "
+            "are only ever fetched alongside a viewer poll"
+        )
 
 
 def test_poll_devices_touches_nothing_with_only_cameras_registered(fake_indigo):
@@ -4163,6 +4197,140 @@ def test_request_status_nvr_uses_single_get(fake_indigo):
     assert api.get_calls == ["nvr"]
 
 
+# -- Issue #22 follow-up: _request_status_viewer had ZERO coverage --------
+
+def test_request_status_viewer_uses_single_get_and_refreshes_liveviews(fake_indigo):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+
+    class RecordingAPI:
+        def __init__(self):
+            self.get_calls = []
+            self.liveviews_calls = 0
+
+        def get_viewer(self, viewer_id):
+            self.get_calls.append(viewer_id)
+            return {"id": viewer_id, "state": "CONNECTED", "liveview": "lv-1"}
+
+        def get_liveviews(self):
+            self.liveviews_calls += 1
+            return [{"id": "lv-1", "name": "Front Door"}]
+
+    api = RecordingAPI()
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"deviceAction": indigo.kUniversalAction.RequestStatus})()
+    plug.actionControlUniversal(action, dev)
+
+    assert api.get_calls == ["viewer-1"]
+    assert api.liveviews_calls == 1
+    assert dev.states["liveviewName"] == "Front Door"
+    assert dev.states["lastPoll"] != ""
+
+
+def test_request_status_viewer_skips_liveviews_refresh_when_id_already_cached(fake_indigo):
+    """Issue #27: no wasted REST call when the viewer's liveview id already
+    resolves against the current cache -- a fatal collaborator on
+    get_liveviews proves it."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.liveview_info = {"lv-1": {"id": "lv-1", "name": "Front Door"}}
+
+    class FatalLiveviewsAPI:
+        def get_viewer(self, viewer_id):
+            return {"id": viewer_id, "state": "CONNECTED", "liveview": "lv-1"}
+
+        def get_liveviews(self):
+            raise AssertionError("get_liveviews must not be called - the id already resolves")
+
+    plug.api = FatalLiveviewsAPI()
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"deviceAction": indigo.kUniversalAction.RequestStatus})()
+    plug.actionControlUniversal(action, dev)
+
+    assert dev.states["liveviewName"] == "Front Door"
+
+
+def test_request_status_viewer_liveviews_failure_warns_not_errors(fake_indigo, caplog):
+    """The viewer itself DID refresh successfully -- a liveviews refresh
+    failure is a WARNING, never an ERROR, and the viewer states still
+    land."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+
+    class API:
+        def get_viewer(self, viewer_id):
+            return {"id": viewer_id, "state": "CONNECTED", "liveview": "lv-1"}
+
+        def get_liveviews(self):
+            raise ProtectAPIError("HTTP 500 for /liveviews", status=500)
+
+    plug.api = API()
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"deviceAction": indigo.kUniversalAction.RequestStatus})()
+    with caplog.at_level("WARNING"):
+        plug.actionControlUniversal(action, dev)
+
+    assert dev.states["viewerState"] == "CONNECTED"
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert errors == []
+    assert len(warnings) == 1
+
+
+def test_request_status_viewer_liveviews_404_uses_firmware_hint_not_reselect(fake_indigo, caplog):
+    """Issue #8: a 404 on /liveviews must use the firmware-gap wording, not
+    _describe_api_error's "reselect it in the device settings" (there is no
+    single device to reselect for a missing collection endpoint)."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+
+    class API:
+        def get_viewer(self, viewer_id):
+            return {"id": viewer_id, "state": "CONNECTED", "liveview": "lv-1"}
+
+        def get_liveviews(self):
+            raise ProtectAPIError("HTTP 404 for /liveviews", status=404)
+
+    plug.api = API()
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"deviceAction": indigo.kUniversalAction.RequestStatus})()
+    with caplog.at_level("WARNING"):
+        plug.actionControlUniversal(action, dev)
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "firmware" in warnings[0].getMessage()
+    assert "reselect" not in warnings[0].getMessage()
+
+
+def test_request_status_viewer_get_viewer_failure_errors_and_does_not_touch_liveviews(
+        fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+
+    class FatalLiveviewsAPI:
+        def get_viewer(self, viewer_id):
+            raise ProtectAPIError("HTTP 500 for /viewers/viewer-1", status=500)
+
+        def get_liveviews(self):
+            raise AssertionError("get_liveviews must not be called - the viewer GET itself failed")
+
+    plug.api = FatalLiveviewsAPI()
+    plug._last_rest_call = 0.0
+
+    action = type("Action", (), {"deviceAction": indigo.kUniversalAction.RequestStatus})()
+    with caplog.at_level("ERROR"):
+        plug.actionControlUniversal(action, dev)
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+
+
 def test_battery_low_pulse_override_cleared_by_next_poll(fake_indigo):
     """Deterministic epoch-ms timestamps throughout -- exercising this via
     two real _poll_sensors() calls (real wall-clock now_ms) would make the
@@ -4417,6 +4585,53 @@ def test_open_socket_reapplies_connected_true_for_sensors_before_polling(fake_in
     plug._open_socket()
 
     assert dev.states["connected"] is True
+
+
+def test_open_socket_reapplies_connected_true_for_viewers_before_polling(fake_indigo, monkeypatch):
+    """Same pinning as the sensor version above, for issue #22's viewer
+    class -- _open_socket's explicit reapply loop covers viewers too."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    plug.startup()
+    dev = add_viewer_device(fake_indigo, plug)
+    dev.states["connected"] = False
+
+    plug._poll_devices = lambda: None
+    plug._refresh_camera_info = lambda: None
+
+    class FakeSocket:
+        last_frame_at = time.monotonic()
+
+        def connect(self):
+            pass
+
+    monkeypatch.setattr(plugin_module, "ProtectEventSocket", lambda *a, **k: FakeSocket())
+
+    plug._open_socket()
+
+    assert dev.states["connected"] is True
+
+
+def test_mark_all_disconnected_forces_viewer_connected_false_and_keeps_poll_derived(fake_indigo):
+    """Issue #22: viewers have no lifecycle-driven fields of their own --
+    _mark_all_disconnected must touch ONLY `connected` for them, leaving
+    viewerState/liveviewId/liveviewName/streamLimit at their last-known
+    poll-derived values, exactly like chime/NVR."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.liveview_info = {"lv-1": {"id": "lv-1", "name": "Front Door"}}
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "state": "CONNECTED",
+                                      "liveview": "lv-1", "streamLimit": 3}}
+    plug._apply_viewer_state("viewer-1", force=True)
+    assert dev.states["connected"] is True
+
+    plug._mark_all_disconnected()
+
+    assert dev.states["connected"] is False
+    assert dev.states["viewerState"] == "CONNECTED", "poll-derived viewerState must survive"
+    assert dev.states["liveviewId"] == "lv-1"
+    assert dev.states["liveviewName"] == "Front Door"
+    assert dev.states["streamLimit"] == 3
 
 
 # -- Item 2: null-safe reads, never write None into a String state -------
@@ -4851,14 +5066,17 @@ def test_describe_api_error_generic_kind_appends_issues(fake_indigo):
     assert "I am a teapot" in message
 
 
-def test_devices_xml_all_four_new_types_support_status_request():
+def test_devices_xml_all_five_new_types_support_status_request():
+    """Issue #8 added four (sensor/light/chime/NVR); issue #22 added a
+    fifth (viewer) -- all five must declare SupportsStatusRequest."""
     import xml.etree.ElementTree as ET
     from pathlib import Path
 
     devices_xml = (Path(__file__).parent.parent / "UniFi Protect.indigoPlugin"
                    / "Contents" / "Server Plugin" / "Devices.xml")
     tree = ET.parse(devices_xml)
-    for type_id in ("protectSensor", "protectLight", "protectChime", "protectNvr"):
+    for type_id in ("protectSensor", "protectLight", "protectChime", "protectNvr",
+                     "protectViewer"):
         device_elem = tree.find(f".//Device[@id='{type_id}']")
         assert device_elem is not None, f"{type_id} device not found"
         field = device_elem.find(".//Field[@id='SupportsStatusRequest']")
@@ -6291,3 +6509,1392 @@ def test_sync_web_page_pref_off_identical_page_logs_no_info(fake_indigo, monkeyp
 
     infos = [r for r in caplog.records if r.levelname == "INFO"]
     assert len(infos) == 0
+
+
+# ---------------------------------------------------------------------
+# Issue #22/#23: Protect Viewer (ViewPort) + read-only live view listing.
+#
+# Spec-derived (OpenAPI v6.2.83) -- UNVERIFIED against real hardware, the
+# reference rig's /viewers returns []. Same adversarial question as every
+# other issue #8 class, plus one specific to this class: "when could
+# liveviewName look like a real answer and actually be fabricated or
+# stale?"
+# ---------------------------------------------------------------------
+
+def test_poll_devices_with_one_viewer_only_fetches_viewers_and_liveviews(fake_indigo):
+    """Fatal-collaborator: with exactly one viewer registered, _poll_devices
+    must touch get_liveviews and get_viewers, and nothing else non-camera."""
+    plug = make_plugin({})
+    add_viewer_device(fake_indigo, plug)
+
+    calls = []
+
+    class ViewerOnlyAPI(_FatalNonCameraAPI):
+        def get_liveviews(self):
+            calls.append("get_liveviews")
+            return []
+
+        def get_viewers(self):
+            calls.append("get_viewers")
+            return []
+
+    plug.api = ViewerOnlyAPI()
+    plug._last_rest_call = 0.0
+
+    plug._poll_devices()   # must not raise touching sensors/lights/chimes/nvr
+    # The positive half: both fetches actually happened (a _poll_devices
+    # that skipped viewers entirely would otherwise pass this test).
+    assert calls == ["get_liveviews", "get_viewers"]
+
+
+class _RecordingViewerPollAPI:
+    """Records call order across get_liveviews/get_viewers so a test can
+    pin "liveviews first" without depending on wall-clock timing."""
+
+    def __init__(self, liveviews, viewers):
+        self.calls = []
+        self._liveviews = liveviews
+        self._viewers = viewers
+
+    def get_liveviews(self):
+        self.calls.append("liveviews")
+        return self._liveviews
+
+    def get_viewers(self):
+        self.calls.append("viewers")
+        return self._viewers
+
+
+def test_poll_viewers_fetches_liveviews_before_viewers(fake_indigo):
+    plug = make_plugin({})
+    add_viewer_device(fake_indigo, plug)
+    api = _RecordingViewerPollAPI(
+        liveviews=[{"id": "lv-1", "name": "Front Door"}],
+        viewers=[{"id": "viewer-1", "state": "CONNECTED", "liveview": "lv-1"}],
+    )
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    plug._poll_viewers()
+
+    assert api.calls == ["liveviews", "viewers"], (
+        "liveviews must be fetched BEFORE viewers so a viewer's liveviewName "
+        "resolves against the freshest cache on the same tick"
+    )
+
+
+def test_poll_viewers_liveviews_404_uses_firmware_hint_not_reselect(fake_indigo, caplog):
+    """Issue #8: 404 on /liveviews during the poll must use the
+    firmware-gap wording, not _describe_api_error's "reselect it in the
+    device settings"."""
+    plug = make_plugin({})
+    add_viewer_device(fake_indigo, plug)
+
+    class API:
+        def get_liveviews(self):
+            raise ProtectAPIError("HTTP 404 for /liveviews", status=404)
+
+        def get_viewers(self):
+            return [{"id": "viewer-1", "state": "CONNECTED"}]
+
+    plug.api = API()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("ERROR"):
+        plug._poll_viewers()
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "firmware" in errors[0].getMessage()
+    assert "reselect" not in errors[0].getMessage()
+
+
+def test_poll_viewers_404_uses_firmware_hint_not_reselect(fake_indigo, caplog):
+    """Same wording rule for a 404 on /viewers itself."""
+    plug = make_plugin({})
+    add_viewer_device(fake_indigo, plug)
+
+    class API:
+        def get_liveviews(self):
+            return []
+
+        def get_viewers(self):
+            raise ProtectAPIError("HTTP 404 for /viewers", status=404)
+
+    plug.api = API()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("ERROR"):
+        plug._poll_viewers()
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "firmware" in errors[0].getMessage()
+    assert "reselect" not in errors[0].getMessage()
+
+
+def test_poll_viewers_liveviews_failure_does_not_abort_viewer_poll(fake_indigo, caplog):
+    """A liveviews fetch failure must not prevent viewers from polling --
+    viewerState/liveviewId/streamLimit all come from the viewer's OWN
+    successful fetch and must still be written. The viewer's liveview id
+    is UNCHANGED from what was already on the device (a transient
+    liveviews outage, not a live-view switch), so liveviewName must be
+    HELD -- the key SKIPPED in this write batch, never re-fabricated as
+    unavailable and never dropped to the raw id."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    dev.states["liveviewId"] = "lv-1"
+    dev.states["liveviewName"] = "Front Door"
+
+    class LiveviewsFailAPI:
+        def get_liveviews(self):
+            raise ProtectAPIError("boom", status=500)
+
+        def get_viewers(self):
+            return [{"id": "viewer-1", "state": "CONNECTED", "liveview": "lv-1",
+                      "streamLimit": 2}]
+
+    plug.api = LiveviewsFailAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("ERROR"):
+        plug._poll_viewers()
+
+    assert dev.states["viewerState"] == "CONNECTED"
+    assert dev.states["liveviewId"] == "lv-1"
+    assert dev.states["streamLimit"] == 2
+    assert dev.states["liveviewName"] == "Front Door", "unchanged id - hold the last-known name"
+    write_keys = {entry["key"] for entry in dev.state_writes[-1]}
+    assert "liveviewName" not in write_keys, (
+        "the id is unchanged and unresolved - the key must be SKIPPED, never "
+        "rewritten and never fabricated"
+    )
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+
+
+def test_poll_viewers_failure_marks_viewer_state_unavailable_only(fake_indigo, caplog):
+    """A viewers poll failure must proactively mark viewerState unavailable
+    (so a stale CONNECTED never survives an outage unremarked) and touch
+    NOTHING else -- liveviewId/liveviewName/streamLimit/lastPoll are all
+    left at their last-written value, not re-derived and not blanked."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    dev.states["liveviewId"] = "lv-1"
+    dev.states["liveviewName"] = "Front Door"
+    dev.states["streamLimit"] = 2
+    dev.states["lastPoll"] = "2026-08-31T00:00:00"
+
+    class ViewersFailAPI:
+        def get_liveviews(self):
+            return [{"id": "lv-1", "name": "Front Door"}]
+
+        def get_viewers(self):
+            raise ProtectAPIError("boom", status=500)
+
+    plug.api = ViewersFailAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("ERROR"):
+        plug._poll_viewers()
+
+    assert dev.states["viewerState"] == plugin_module.STATE_UNAVAILABLE
+    assert dev.states["liveviewId"] == "lv-1"
+    assert dev.states["liveviewName"] == "Front Door"
+    assert dev.states["streamLimit"] == 2
+    assert dev.states["lastPoll"] == "2026-08-31T00:00:00"
+    write_keys = {entry["key"] for entry in dev.state_writes[-1]}
+    assert write_keys == {"viewerState", "connected"}
+
+
+# -- Issue #22 follow-up: WARN once when a resolved viewer names a liveview
+# id absent from a successful liveviews list (previously 100% silent). ------
+
+def test_poll_viewers_warns_once_when_liveview_id_unresolved_then_clears_then_warns_again(
+        fake_indigo, caplog):
+    """Mirrors _warn_absent_from_list's own-set/clear-on-resolve mechanics:
+    tick 1 (unresolved) warns; tick 2 (still unresolved, same id) is quiet;
+    tick 3 (resolved) clears the guard silently; tick 4 (unresolved again)
+    warns again -- even though it's the SAME id as before."""
+    plug = make_plugin({})
+    add_viewer_device(fake_indigo, plug)
+
+    class UnresolvedAPI:
+        def get_liveviews(self):
+            return []   # lv-1 never listed
+
+        def get_viewers(self):
+            return [{"id": "viewer-1", "state": "CONNECTED", "liveview": "lv-1"}]
+
+    class ResolvedAPI:
+        def get_liveviews(self):
+            return [{"id": "lv-1", "name": "Front Door"}]
+
+        def get_viewers(self):
+            return [{"id": "viewer-1", "state": "CONNECTED", "liveview": "lv-1"}]
+
+    plug.api = UnresolvedAPI()
+    plug._last_rest_call = 0.0
+    with caplog.at_level("WARNING"):
+        plug._poll_viewers()
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "lv-1" in warnings[0].getMessage()
+    assert "is not in the controller's live view list" in warnings[0].getMessage()
+
+    caplog.clear()
+    plug._last_rest_call = 0.0
+    with caplog.at_level("WARNING"):
+        plug._poll_viewers()   # same unresolved id - must stay quiet
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 0
+
+    plug.api = ResolvedAPI()
+    plug._last_rest_call = 0.0
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        plug._poll_viewers()   # resolves - clears the guard, no warning
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 0
+
+    plug.api = UnresolvedAPI()
+    plug._last_rest_call = 0.0
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        plug._poll_viewers()   # unresolved again - must warn again
+
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1, (
+        "the episode having cleared once must not suppress a later recurrence"
+    )
+
+
+def test_poll_viewers_liveview_unresolved_warning_requires_both_polls_to_succeed(
+        fake_indigo, caplog):
+    """A liveviews poll FAILURE already explains the gap via its own ERROR
+    -- piling the unresolved-liveview WARNING on top for every registered
+    viewer would be noise, not new information. liveviews_ok must gate it."""
+    plug = make_plugin({})
+    add_viewer_device(fake_indigo, plug)
+
+    class LiveviewsFailAPI:
+        def get_liveviews(self):
+            raise ProtectAPIError("boom", status=500)
+
+        def get_viewers(self):
+            return [{"id": "viewer-1", "state": "CONNECTED", "liveview": "lv-1"}]
+
+    plug.api = LiveviewsFailAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("WARNING"):
+        plug._poll_viewers()
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 0, "no unresolved-liveview WARNING while liveviews itself failed"
+
+
+# -- Issue #22 follow-up: self.liveview_info survives a liveviews poll
+# failure and a resolvable id keeps resolving through it. ------------------
+
+def test_poll_viewers_liveview_info_held_on_liveviews_failure_and_still_resolves(fake_indigo):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+
+    class API:
+        def __init__(self):
+            self.fail_liveviews = False
+
+        def get_liveviews(self):
+            if self.fail_liveviews:
+                raise ProtectAPIError("boom", status=500)
+            return [{"id": "lv-1", "name": "Front Door"}]
+
+        def get_viewers(self):
+            return [{"id": "viewer-1", "state": "CONNECTED", "liveview": "lv-1"}]
+
+    api = API()
+    plug.api = api
+    plug._last_rest_call = 0.0
+    plug._poll_viewers()
+    assert plug.liveview_info == {"lv-1": {"id": "lv-1", "name": "Front Door"}}
+    assert dev.states["liveviewName"] == "Front Door"
+
+    api.fail_liveviews = True
+    plug._last_rest_call = 0.0
+    plug._poll_viewers()
+
+    assert plug.liveview_info == {"lv-1": {"id": "lv-1", "name": "Front Door"}}, (
+        "a liveviews poll failure must never clear or blank the last-known cache"
+    )
+    assert dev.states["liveviewName"] == "Front Door", (
+        "the id IS in the held cache - the skip/unavailable rule does not apply here"
+    )
+
+
+def test_write_viewer_states_liveview_null_writes_empty_name(fake_indigo):
+    """The API `liveview` field is explicitly nullable -- a viewer with no
+    live view assigned must write liveviewId="" and liveviewName="", not
+    skip either (a null is a confirmed, real answer, unlike an unresolved
+    non-null id)."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "state": "CONNECTED", "liveview": None}}
+
+    plug._apply_viewer_state("viewer-1", force=True)
+
+    assert dev.states["liveviewId"] == ""
+    assert dev.states["liveviewName"] == ""
+
+
+def test_write_viewer_states_liveview_id_not_in_cache_no_prior_id_writes_unavailable(fake_indigo):
+    """The id is present and looks real, self.liveview_info has no entry
+    for it, and there is no PRIOR liveviewId on the device (a brand new
+    device, or the very first poll) -- this counts as a CHANGE (no id ->
+    a real id), so liveviewName must be written STATE_UNAVAILABLE, never
+    fabricated as the raw id and never silently held (there is nothing to
+    hold)."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    assert plug.liveview_info == {}
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "state": "CONNECTED", "liveview": "lv-1"}}
+
+    plug._apply_viewer_state("viewer-1", force=True)
+
+    assert dev.states["liveviewId"] == "lv-1"
+    assert dev.states["liveviewName"] == plugin_module.STATE_UNAVAILABLE
+
+
+def test_write_viewer_states_liveview_id_not_in_cache_unchanged_id_holds_name(fake_indigo):
+    """Same unresolved id as last time (a transient liveviews outage) --
+    the id has NOT changed, so the last-known name must be HELD (the key
+    skipped entirely), never re-fabricated as unavailable and never
+    dropped to the raw id."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    dev.states["liveviewId"] = "lv-1"
+    dev.states["liveviewName"] = "Front Door"
+    assert plug.liveview_info == {}
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "state": "CONNECTED", "liveview": "lv-1"}}
+
+    plug._apply_viewer_state("viewer-1", force=True)
+
+    assert dev.states["liveviewId"] == "lv-1"
+    assert dev.states["liveviewName"] == "Front Door"
+    write_keys = {entry["key"] for entry in dev.state_writes[-1]}
+    assert "liveviewName" not in write_keys
+
+
+def test_write_viewer_states_liveview_id_changed_to_different_unresolved_id_writes_unavailable(fake_indigo):
+    """The id CHANGED to a different one that also isn't in the cache --
+    the OLD name must not be allowed to survive across a live-view switch
+    it can no longer vouch for; STATE_UNAVAILABLE is written instead of
+    holding "Front Door" for a live view that isn't showing anymore."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    dev.states["liveviewId"] = "lv-1"
+    dev.states["liveviewName"] = "Front Door"
+    assert plug.liveview_info == {}
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "state": "CONNECTED", "liveview": "lv-2"}}
+
+    plug._apply_viewer_state("viewer-1", force=True)
+
+    assert dev.states["liveviewId"] == "lv-2"
+    assert dev.states["liveviewName"] == plugin_module.STATE_UNAVAILABLE
+
+
+def test_write_viewer_states_liveview_key_absent_skips_both_id_and_name(fake_indigo):
+    """A partial object (e.g. a partial device-socket frame merged onto a
+    partial cached object) with the `liveview` key ABSENT entirely must
+    skip both liveviewId and liveviewName -- absent is not the same fact
+    as an explicit null, and neither key here is a confirmed read."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    dev.states["liveviewId"] = "lv-1"
+    dev.states["liveviewName"] = "Front Door"
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "state": "CONNECTED"}}
+
+    plug._apply_viewer_state("viewer-1", force=True)
+
+    assert dev.states["liveviewId"] == "lv-1", "held -- absent must not be treated as null"
+    assert dev.states["liveviewName"] == "Front Door"
+    write_keys = {entry["key"] for entry in dev.state_writes[-1]}
+    assert "liveviewId" not in write_keys
+    assert "liveviewName" not in write_keys
+
+
+@pytest.mark.parametrize("bad_value", [True, False, None, "not-a-number"])
+def test_write_viewer_states_stream_limit_never_written_for_bad_values(fake_indigo, bad_value):
+    """Same bool guard as ringVolume/breachEventCount: a bool is a real int
+    subclass in Python (`int(True) == 1`), so it must be explicitly
+    rejected, not silently accepted as a fabricated-looking limit. None and
+    a non-numeric string must likewise never be written. (A numeric STRING
+    like "4" is intentionally not in this list -- int("4") succeeds, and
+    that is the existing, deliberate behavior this mirrors from ringVolume/
+    breachEventCount, not a gap.)"""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.viewer_info = {"viewer-1": {
+        "id": "viewer-1", "state": "CONNECTED", "liveview": None, "streamLimit": bad_value,
+    }}
+
+    plug._apply_viewer_state("viewer-1", force=True)
+
+    assert "streamLimit" not in dev.states
+
+
+def test_write_viewer_states_stream_limit_written_for_real_number(fake_indigo):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.viewer_info = {"viewer-1": {
+        "id": "viewer-1", "state": "CONNECTED", "liveview": None, "streamLimit": 4,
+    }}
+
+    plug._apply_viewer_state("viewer-1", force=True)
+
+    assert dev.states["streamLimit"] == 4
+
+
+def test_write_viewer_states_missing_info_writes_unavailable_only(fake_indigo):
+    """Before the first poll: no liveviewId/liveviewName/streamLimit at
+    all -- only viewerState=unavailable and connected, exactly like every
+    other issue #8 class before its first successful read."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+
+    plug._apply_viewer_state("viewer-1", force=True)
+
+    assert dev.states["viewerState"] == plugin_module.STATE_UNAVAILABLE
+    write_keys = {entry["key"] for entry in dev.state_writes[-1]}
+    assert write_keys == {"viewerState", "connected"}
+
+
+# -- device socket (/subscribe/devices) update/add/remove for viewer -----
+
+def test_device_socket_viewer_update_merges_and_applies(fake_indigo):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "modelKey": "viewer",
+                                       "state": "CONNECTED", "liveview": None}}
+    plug._apply_viewer_state("viewer-1", force=True)
+
+    plug._handle_device_frame(
+        "update", "viewer", "viewer-1",
+        {"id": "viewer-1", "modelKey": "viewer", "state": "CONNECTING"})
+
+    assert plug.viewer_info["viewer-1"]["state"] == "CONNECTING"
+    assert dev.states["viewerState"] == "CONNECTING"
+
+
+def test_device_socket_viewer_update_uncached_id_is_ignored(fake_indigo, caplog):
+    """Merging an update onto nothing would fabricate a partial object that
+    _write_viewer_states would then treat as a full, confirmed read -- an
+    uncached id must be ignored outright, not seeded."""
+    plug = make_plugin({})
+    add_viewer_device(fake_indigo, plug)
+    plug.socket = object()
+    assert "viewer-1" not in plug.viewer_info
+
+    with caplog.at_level("DEBUG"):
+        plug._handle_device_frame(
+            "update", "viewer", "viewer-1", {"id": "viewer-1", "modelKey": "viewer"})
+
+    assert "viewer-1" not in plug.viewer_info
+    assert any("ignoring a device-socket update" in r.getMessage() for r in caplog.records)
+
+
+def test_device_socket_viewer_remove_warns_once_per_episode(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "modelKey": "viewer", "state": "CONNECTED"}}
+    plug._apply_viewer_state("viewer-1", force=True)
+
+    with caplog.at_level("WARNING"):
+        plug._handle_device_frame("remove", "viewer", "viewer-1",
+                                   {"id": "viewer-1", "modelKey": "viewer"})
+
+    assert "viewer-1" not in plug.viewer_info
+    assert dev.states["viewerState"] == plugin_module.STATE_UNAVAILABLE
+    warnings = [r for r in caplog.records if "not in the controller's list" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_device_socket_viewer_add_for_registered_id_applies_state(fake_indigo):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.socket = object()
+
+    plug._handle_device_frame(
+        "add", "viewer", "viewer-1",
+        {"id": "viewer-1", "modelKey": "viewer", "state": "CONNECTED", "liveview": None})
+
+    assert plug.viewer_info["viewer-1"]["state"] == "CONNECTED"
+    assert dev.states["viewerState"] == "CONNECTED"
+
+
+def test_device_socket_viewer_remove_add_remove_warns_twice(fake_indigo, caplog):
+    """T9 (viewer)/F2: the intervening `add` must clear the absence
+    episode, so a second `remove` warns again -- viewers have no list poll
+    of their own running on the same tick as a device-socket frame."""
+    plug = make_plugin({})
+    add_viewer_device(fake_indigo, plug)
+    plug.socket = object()
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "modelKey": "viewer", "state": "CONNECTED"}}
+    plug._apply_viewer_state("viewer-1", force=True)
+
+    with caplog.at_level("WARNING"):
+        plug._handle_device_frame("remove", "viewer", "viewer-1", {"id": "viewer-1", "modelKey": "viewer"})
+        plug._handle_device_frame(
+            "add", "viewer", "viewer-1",
+            {"id": "viewer-1", "modelKey": "viewer", "state": "CONNECTED"})
+        plug._handle_device_frame("remove", "viewer", "viewer-1", {"id": "viewer-1", "modelKey": "viewer"})
+
+    warnings = [r for r in caplog.records if "not in the controller's list" in r.getMessage()]
+    assert len(warnings) == 2, "the intervening add must clear the episode so remove warns again"
+
+
+# -- deviceStopComm (issue #22) --------------------------------------------
+
+def test_viewer_stop_removes_by_device_id_not_by_current_props(fake_indigo):
+    """If the user re-points a device at another viewer, its props already
+    hold the NEW id -- popping by that would orphan the OLD mapping."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug, viewer_id="viewer-old")
+
+    dev.pluginProps["viewerId"] = "viewer-new"
+    plug.deviceStopComm(dev)
+
+    assert "viewer-old" not in plug.viewers, "the stale mapping must be gone"
+    assert all(dev.id not in ids for ids in plug.viewers.values())
+
+
+# -- Registered id absent from a successful list poll (issue #22) ---------
+
+def test_viewer_absent_from_successful_list_warns_keeps_values_no_last_poll(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+
+    class WorkingAPI:
+        def get_liveviews(self):
+            return [{"id": "lv-1", "name": "Front Door"}]
+
+        def get_viewers(self):
+            return [{"id": "viewer-1", "state": "CONNECTED", "liveview": "lv-1", "streamLimit": 2}]
+
+    plug.api = WorkingAPI()
+    plug._last_rest_call = 0.0
+    plug._poll_viewers()
+    assert dev.states["viewerState"] == "CONNECTED"
+    last_poll_after_success = dev.states["lastPoll"]
+
+    class EmptyViewersAPI:
+        def get_liveviews(self):
+            return [{"id": "lv-1", "name": "Front Door"}]
+
+        def get_viewers(self):
+            return []   # the reference rig's actual behaviour
+
+    plug.api = EmptyViewersAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("WARNING"):
+        plug._poll_viewers()
+
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warning_records) == 1
+    assert "viewer-1" in warning_records[0].getMessage()
+    assert dev.states["viewerState"] == "unavailable"
+    assert dev.states["liveviewId"] == "lv-1", "poll-derived fields must be kept at last-known"
+    assert dev.states["liveviewName"] == "Front Door"
+    assert dev.states["lastPoll"] == last_poll_after_success, "lastPoll must not advance"
+    write_keys = {entry["key"] for entry in dev.state_writes[-1]}
+    assert write_keys == {"viewerState", "connected"}
+
+
+def test_viewer_reappearing_in_list_clears_the_absent_warning(fake_indigo, caplog):
+    plug = make_plugin({})
+    add_viewer_device(fake_indigo, plug)
+
+    class EmptyViewersAPI:
+        def get_liveviews(self):
+            return []
+
+        def get_viewers(self):
+            return []
+
+    plug.api = EmptyViewersAPI()
+    plug._last_rest_call = 0.0
+    with caplog.at_level("WARNING"):
+        plug._poll_viewers()
+        plug._poll_viewers()   # would spam without the guard
+
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+
+    class WorkingAPI:
+        def get_liveviews(self):
+            return []
+
+        def get_viewers(self):
+            return [{"id": "viewer-1", "state": "CONNECTED"}]
+
+    plug.api = WorkingAPI()
+    plug._last_rest_call = 0.0
+    plug._poll_viewers()
+
+    plug.api = EmptyViewersAPI()
+    plug._last_rest_call = 0.0
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        plug._poll_viewers()
+
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1, (
+        "the id reappearing must clear the guard so a later absence warns again"
+    )
+
+
+# -- Non-ProtectAPIError from the LIST fetch itself must never escape -----
+
+def test_non_protect_api_error_from_get_liveviews_fetch_is_reported_and_viewers_still_poll(
+        fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+
+    class BuggyAPI:
+        def get_liveviews(self):
+            raise RuntimeError("not a ProtectAPIError at all")
+
+        def get_viewers(self):
+            return [{"id": "viewer-1", "state": "CONNECTED"}]
+
+    plug.api = BuggyAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("ERROR"):
+        plug._poll_viewers()   # must not raise
+
+    assert dev.states["viewerState"] == "CONNECTED"
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("liveview" in r.getMessage() for r in errors)
+
+
+def test_non_protect_api_error_from_get_viewers_fetch_does_not_escape(fake_indigo):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+
+    class BuggyAPI:
+        def get_liveviews(self):
+            return []
+
+        def get_viewers(self):
+            raise RuntimeError("not a ProtectAPIError at all")
+
+    plug.api = BuggyAPI()
+    plug._last_rest_call = 0.0
+
+    plug._poll_viewers()   # must not raise
+
+    assert dev.states["viewerState"] == plugin_module.STATE_UNAVAILABLE
+
+
+# -- ERROR-once guard across two DIFFERENT (class, kind) keys interacting -
+
+def test_liveview_failure_persists_while_viewer_polling_recovers(fake_indigo, caplog):
+    """Two poll failures interacting through two different (class, kind)
+    guard keys: repeated liveviews failures must log exactly ONE ERROR
+    (guard scoped to "liveview"), independent of the viewer class
+    recovering and logging its own "viewer polling recovered" INFO."""
+    plug = make_plugin({})
+    add_viewer_device(fake_indigo, plug)
+
+    class BothFailAPI:
+        def get_liveviews(self):
+            raise ProtectAPIError("HTTP 500 for /liveviews", status=500)
+
+        def get_viewers(self):
+            raise ProtectAPIError("HTTP 500 for /viewers", status=500)
+
+    class ViewerRecoversAPI:
+        def get_liveviews(self):
+            raise ProtectAPIError("HTTP 500 for /liveviews", status=500)
+
+        def get_viewers(self):
+            return [{"id": "viewer-1", "state": "CONNECTED"}]
+
+    with caplog.at_level("DEBUG"):
+        plug.api = BothFailAPI()
+        plug._last_rest_call = 0.0
+        plug._poll_viewers()
+
+        plug.api = ViewerRecoversAPI()
+        plug._last_rest_call = 0.0
+        plug._poll_viewers()
+
+        plug.api = ViewerRecoversAPI()
+        plug._last_rest_call = 0.0
+        plug._poll_viewers()
+
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    liveview_errors = [r for r in error_records if "liveview" in r.getMessage()]
+    recovered_infos = [r for r in caplog.records
+                        if r.levelname == "INFO" and "viewer polling recovered" in r.getMessage()]
+    assert len(liveview_errors) == 1, "repeated liveviews failures must log once, not per tick"
+    assert len(recovered_infos) == 1, "the viewer class recovering must log its own INFO once"
+
+
+# -- setViewerLiveview action ---------------------------------------------
+
+class _RaisesIfTouchedViewer:
+    def patch_viewer(self, viewer_id, body):
+        raise AssertionError(f"patch_viewer must not be called (viewer_id={viewer_id!r})")
+
+    def get_viewer(self, viewer_id):
+        raise AssertionError(f"get_viewer must not be called (viewer_id={viewer_id!r})")
+
+    def get_viewers(self):
+        raise AssertionError("get_viewers must not be called")
+
+    def get_liveviews(self):
+        raise AssertionError("get_liveviews must not be called")
+
+
+def test_set_viewer_liveview_no_api_configured_errors_without_touching_api(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.api = None
+
+    with caplog.at_level("ERROR"):
+        plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("not configured" in r.getMessage() for r in errors)
+
+
+def test_set_viewer_liveview_no_viewer_selected_errors(fake_indigo, caplog):
+    plug = make_plugin({})
+    from conftest import _FakeDevice
+    dev = _FakeDevice(3005, name="ViewPort", device_type_id="protectViewer",
+                       plugin_props={"viewerId": ""})
+    fake_indigo.devices.add(dev)
+    plug.api = _RaisesIfTouchedViewer()
+
+    with caplog.at_level("ERROR"):
+        plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("no viewer selected" in r.getMessage() for r in errors)
+
+
+def test_set_viewer_liveview_empty_liveview_id_errors_without_network(fake_indigo, caplog):
+    """Fatal-collaborator form: an empty selection is caught before any
+    request, exactly like every other action's ConfigUI-level check."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.api = _RaisesIfTouchedViewer()
+
+    with caplog.at_level("ERROR"):
+        plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": ""}), dev)
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("no live view selected" in r.getMessage() for r in errors)
+
+
+def test_set_viewer_liveview_success_updates_cache_and_state(fake_indigo):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.liveview_info = {"lv-1": {"id": "lv-1", "name": "Front Door"}}
+
+    class API:
+        def __init__(self):
+            self.calls = []
+
+        def patch_viewer(self, viewer_id, body):
+            self.calls.append((viewer_id, body))
+            return {"id": viewer_id, "state": "CONNECTED", "liveview": body["liveview"]}
+
+    api = API()
+    plug.api = api
+
+    plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    assert api.calls == [("viewer-1", {"liveview": "lv-1"})]
+    assert plug.viewer_info["viewer-1"]["liveview"] == "lv-1"
+    assert dev.states["liveviewId"] == "lv-1"
+    assert dev.states["liveviewName"] == "Front Door"
+
+
+# -- Issue #22 follow-up: verify the PATCH outcome, don't trust a bare 200 --
+
+def test_set_viewer_liveview_response_reports_different_liveview_errors_no_success_log(
+        fake_indigo, caplog):
+    """A 200 with a matching id but `liveview: None` (or any id other than
+    what was requested) means the controller accepted the REQUEST but the
+    change did not actually apply -- states are still written (the response
+    is still the truth about what the viewer currently shows), but exactly
+    one ERROR is logged and NO "Set Live View ->" success INFO."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.liveview_info = {"lv-1": {"id": "lv-1", "name": "Front Door"}}
+
+    class API:
+        def patch_viewer(self, viewer_id, body):
+            return {"id": viewer_id, "state": "CONNECTED", "liveview": None}
+
+    plug.api = API()
+
+    with caplog.at_level("INFO"):
+        plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    assert dev.states["liveviewId"] == ""
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "did not apply" in errors[0].getMessage()
+    infos = [r for r in caplog.records
+             if r.levelname == "INFO" and "Set Live View ->" in r.getMessage()]
+    assert infos == [], "no success log when the controller reports a different live view"
+
+
+def test_set_viewer_liveview_response_missing_liveview_key_errors_no_success_log(
+        fake_indigo, caplog):
+    """The response omits `liveview` entirely -- also not proof the change
+    applied, and must be treated the same as an explicit mismatch."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+
+    class API:
+        def patch_viewer(self, viewer_id, body):
+            return {"id": viewer_id, "state": "CONNECTED"}   # no "liveview" key at all
+
+    plug.api = API()
+
+    with caplog.at_level("INFO"):
+        plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    infos = [r for r in caplog.records
+             if r.levelname == "INFO" and "Set Live View ->" in r.getMessage()]
+    assert infos == []
+
+
+def test_set_viewer_liveview_patch_success_merges_onto_cache_not_replaces(fake_indigo):
+    """Issue #4: a partial PATCH response must MERGE onto the existing
+    cache, exactly like setChimeVolume -- a partial-but-valid 200 must not
+    blank fields (like streamLimit) the PATCH response never mentioned, nor
+    flip viewerState to unavailable by dropping the cached `state` key."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "modelKey": "viewer",
+                                      "state": "CONNECTED", "streamLimit": 5,
+                                      "liveview": None}}
+    plug.liveview_info = {"lv-1": {"id": "lv-1", "name": "Front Door"}}
+
+    class API:
+        def patch_viewer(self, viewer_id, body):
+            # Partial body: no "state", no "streamLimit".
+            return {"id": viewer_id, "modelKey": "viewer", "liveview": "lv-1"}
+
+    plug.api = API()
+
+    plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    assert dev.states["viewerState"] == "CONNECTED", "must not flip unavailable on a partial merge"
+    assert dev.states["streamLimit"] == 5, "must be retained from the pre-PATCH cache"
+    assert plug.viewer_info["viewer-1"]["state"] == "CONNECTED"
+    assert plug.viewer_info["viewer-1"]["streamLimit"] == 5
+
+
+def test_set_viewer_liveview_refreshes_liveviews_when_applied_id_uncached(fake_indigo):
+    """Issue #7: the applied id isn't in self.liveview_info yet -- refresh
+    liveviews ONCE before applying state, so the name resolves immediately
+    instead of item 1's unresolved-id rule marking it unavailable."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    assert plug.liveview_info == {}
+
+    class API:
+        def __init__(self):
+            self.liveviews_calls = 0
+
+        def patch_viewer(self, viewer_id, body):
+            return {"id": viewer_id, "state": "CONNECTED", "liveview": "lv-1"}
+
+        def get_liveviews(self):
+            self.liveviews_calls += 1
+            return [{"id": "lv-1", "name": "Front Door"}]
+
+    api = API()
+    plug.api = api
+
+    plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    assert api.liveviews_calls == 1
+    assert dev.states["liveviewName"] == "Front Door"
+
+
+def test_set_viewer_liveview_liveviews_refresh_failure_warns_and_still_applies(fake_indigo, caplog):
+    """Issue #7: the refresh fails -- WARNING, not ERROR (the viewer state
+    itself DID apply), and item 1's unresolved-id rule takes over for the
+    name (no prior id on this fresh device -> STATE_UNAVAILABLE)."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+
+    class API:
+        def patch_viewer(self, viewer_id, body):
+            return {"id": viewer_id, "state": "CONNECTED", "liveview": "lv-1"}
+
+        def get_liveviews(self):
+            raise ProtectAPIError("HTTP 500 for /liveviews", status=500)
+
+    plug.api = API()
+
+    with caplog.at_level("WARNING"):
+        plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert dev.states["liveviewId"] == "lv-1"
+    assert dev.states["liveviewName"] == plugin_module.STATE_UNAVAILABLE
+    infos = [r for r in caplog.records
+             if r.levelname == "INFO" and "Set Live View ->" in r.getMessage()]
+    assert infos == [], "the requested id could not be confirmed as applied by name"
+
+
+def test_set_viewer_liveview_no_refresh_when_applied_id_already_cached(fake_indigo):
+    """No wasted REST call when the applied id already resolves -- a fatal
+    collaborator on get_liveviews proves it's never touched."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.liveview_info = {"lv-1": {"id": "lv-1", "name": "Front Door"}}
+
+    class FatalLiveviewsAPI:
+        def patch_viewer(self, viewer_id, body):
+            return {"id": viewer_id, "state": "CONNECTED", "liveview": "lv-1"}
+
+        def get_liveviews(self):
+            raise AssertionError("get_liveviews must not be called - the id already resolves")
+
+    plug.api = FatalLiveviewsAPI()
+
+    plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    assert dev.states["liveviewName"] == "Front Door"
+
+
+def test_set_viewer_liveview_action_advances_last_poll_ms(fake_indigo):
+    """Issue #28: a successful action-triggered apply must advance
+    _device_last_poll_ms exactly like every REST-poll write does, so a
+    later live pulse baseline comparison isn't left stuck at a stale
+    time."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.liveview_info = {"lv-1": {"id": "lv-1", "name": "Front Door"}}
+    assert "viewer-1" not in plug._device_last_poll_ms
+
+    class API:
+        def patch_viewer(self, viewer_id, body):
+            return {"id": viewer_id, "state": "CONNECTED", "liveview": "lv-1"}
+
+    plug.api = API()
+
+    plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    assert "viewer-1" in plug._device_last_poll_ms
+    assert dev.states["lastPoll"] != ""
+
+
+def test_set_viewer_liveview_patch_refused_logs_error_and_does_not_cache(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "state": "CONNECTED", "liveview": None}}
+
+    class RefusingAPI(_RaisesIfTouchedViewer):
+        def patch_viewer(self, viewer_id, body):
+            raise ProtectAPIError("bad request", status=400,
+                                   body='{"issues":[{"message":"nope"}]}')
+
+    plug.api = RefusingAPI()
+
+    with caplog.at_level("ERROR"):
+        plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    assert plug.viewer_info["viewer-1"]["liveview"] is None, "a refused PATCH must not touch the cache"
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("Set Live View" in r.getMessage() for r in errors)
+
+
+def test_set_viewer_liveview_transport_failure_logs_error_and_does_not_cache(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "state": "CONNECTED", "liveview": None}}
+
+    class TransportFailAPI(_RaisesIfTouchedViewer):
+        def patch_viewer(self, viewer_id, body):
+            raise ProtectAPIError("connection refused", status=None)
+
+    plug.api = TransportFailAPI()
+
+    with caplog.at_level("ERROR"):
+        plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    assert plug.viewer_info["viewer-1"]["liveview"] is None
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("Set Live View" in r.getMessage() for r in errors)
+
+
+def test_set_viewer_liveview_shape_mismatch_repolls_instead_of_caching_bad_body(fake_indigo, caplog):
+    """The response's `id` does not match the viewer we PATCHed -- this
+    must NOT replace the cache (mirrors _patch_camera's own rule). Instead
+    it re-reads the real viewer via get_viewer and applies THAT -- and the
+    re-GET's liveview DOES reach dev.states (item 5's comparison uses the
+    re-GET's own liveview field), logging the "response was unusable" ERROR
+    along the way but still succeeding overall."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "state": "CONNECTED", "liveview": None}}
+
+    class ShapeMismatchAPI:
+        def __init__(self):
+            self.get_calls = []
+
+        def patch_viewer(self, viewer_id, body):
+            return {"id": "some-other-id"}   # wrong id -- a proxy wrapper, not the real object
+
+        def get_viewer(self, viewer_id):
+            self.get_calls.append(viewer_id)
+            return {"id": viewer_id, "state": "CONNECTED", "liveview": "lv-1"}
+
+        def get_liveviews(self):
+            return [{"id": "lv-1", "name": "Front Door"}]
+
+    api = ShapeMismatchAPI()
+    plug.api = api
+
+    with caplog.at_level("ERROR"):
+        plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    assert api.get_calls == ["viewer-1"], "must re-poll the real viewer after a shape mismatch"
+    assert plug.viewer_info["viewer-1"] == {"id": "viewer-1", "state": "CONNECTED",
+                                             "liveview": "lv-1"}, (
+        "the cache must come from the re-poll, never from the mismatched PATCH body"
+    )
+    assert dev.states["liveviewId"] == "lv-1", "the re-GET's liveview must still reach state"
+    assert dev.states["liveviewName"] == "Front Door"
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("response was unusable" in r.getMessage() for r in errors)
+
+
+def test_set_viewer_liveview_shape_mismatch_then_reget_fails_leaves_cache_untouched(
+        fake_indigo, caplog):
+    """Both the PATCH response AND the re-GET are unusable -- the pre-action
+    cache must survive untouched and no state write must happen, with
+    exactly the "response was unusable" ERROR plus a "could not re-read"
+    ERROR (two total, nothing more)."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "state": "CONNECTED", "liveview": None}}
+
+    class RegetFailsAPI:
+        def patch_viewer(self, viewer_id, body):
+            return {"id": "some-other-id"}
+
+        def get_viewer(self, viewer_id):
+            raise ProtectAPIError("HTTP 500 for /viewers/viewer-1", status=500)
+
+    plug.api = RegetFailsAPI()
+    writes_before = len(dev.state_writes)
+
+    with caplog.at_level("ERROR"):
+        plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    assert plug.viewer_info["viewer-1"] == {"id": "viewer-1", "state": "CONNECTED",
+                                             "liveview": None}, "cache must be untouched"
+    assert len(dev.state_writes) == writes_before, "no state write when the re-GET itself fails"
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 2
+    assert any("response was unusable" in r.getMessage() for r in errors)
+    assert any("could not re-read" in r.getMessage() for r in errors)
+
+
+def test_set_viewer_liveview_shape_mismatch_then_reget_wrong_id_leaves_cache_untouched(
+        fake_indigo, caplog):
+    """The re-GET itself comes back with the WRONG id too (item 5) -- this
+    must not be trusted any more than the original PATCH body was. No
+    cache write, no state write."""
+    plug = make_plugin({})
+    dev = add_viewer_device(fake_indigo, plug)
+    plug.viewer_info = {"viewer-1": {"id": "viewer-1", "state": "CONNECTED", "liveview": None}}
+
+    class RegetWrongIdAPI:
+        def patch_viewer(self, viewer_id, body):
+            return {"id": "some-other-id"}
+
+        def get_viewer(self, viewer_id):
+            return {"id": "yet-another-id", "state": "CONNECTED", "liveview": "lv-1"}
+
+    plug.api = RegetWrongIdAPI()
+    writes_before = len(dev.state_writes)
+
+    with caplog.at_level("ERROR"):
+        plug.setViewerLiveview(SimpleNamespace(props={"liveviewId": "lv-1"}), dev)
+
+    assert plug.viewer_info["viewer-1"] == {"id": "viewer-1", "state": "CONNECTED",
+                                             "liveview": None}, "cache must be untouched"
+    assert len(dev.state_writes) == writes_before, "no state write when the re-read is also unusable"
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 2
+
+
+# -- getViewerList / getLiveviewList dynamic lists ------------------------
+
+def test_get_viewer_list_not_configured_returns_placeholder(fake_indigo):
+    plug = make_plugin({})
+    assert plug.getViewerList() == [("", "Plugin not configured")]
+
+
+def test_get_viewer_list_success_sorted_and_populates_cache(fake_indigo):
+    plug = make_plugin({})
+
+    class API:
+        def get_viewers(self):
+            return [
+                {"id": "v-1", "name": "zebra"},
+                {"id": "v-2", "name": "Apple"},
+                {"id": "v-3"},          # no name -- falls back to the raw id, still included
+                {"name": "no id"},      # no id at all -- must be skipped entirely
+            ]
+
+    plug.api = API()
+
+    result = plug.getViewerList()
+
+    assert result == [("v-2", "Apple"), ("v-3", "v-3"), ("v-1", "zebra")]
+    assert plug.viewer_info == {
+        "v-1": {"id": "v-1", "name": "zebra"},
+        "v-2": {"id": "v-2", "name": "Apple"},
+        "v-3": {"id": "v-3"},
+    }
+
+
+def test_get_viewer_list_error_returns_menu_error_label(fake_indigo):
+    plug = make_plugin({})
+
+    class FailingAPI:
+        def get_viewers(self):
+            raise ProtectAPIError("rate limited", status=429)
+
+    plug.api = FailingAPI()
+
+    result = plug.getViewerList()
+
+    assert result == [("", "Rate limited - wait a few seconds and reopen")]
+
+
+def test_get_liveview_list_marks_default(fake_indigo):
+    plug = make_plugin({})
+
+    class API:
+        def get_liveviews(self):
+            return [
+                {"id": "lv-1", "name": "All Cameras", "isDefault": True},
+                {"id": "lv-2", "name": "Front Door", "isDefault": False},
+            ]
+
+    plug.api = API()
+
+    result = plug.getLiveviewList()
+
+    assert ("lv-1", "All Cameras (default)") in result
+    assert ("lv-2", "Front Door") in result
+    assert plug.liveview_info["lv-1"]["name"] == "All Cameras"
+
+
+def test_get_liveview_list_error_returns_menu_error_label(fake_indigo):
+    plug = make_plugin({})
+
+    class FailingAPI:
+        def get_liveviews(self):
+            raise ProtectAPIError("rate limited", status=429)
+
+    plug.api = FailingAPI()
+
+    result = plug.getLiveviewList()
+
+    assert result == [("", "Rate limited - wait a few seconds and reopen")]
+
+
+def test_get_liveview_list_sorts_case_insensitively(fake_indigo):
+    plug = make_plugin({})
+
+    class API:
+        def get_liveviews(self):
+            return [
+                {"id": "lv-1", "name": "zebra"},
+                {"id": "lv-2", "name": "Apple"},
+                {"id": "lv-3", "name": "mango"},
+            ]
+
+    plug.api = API()
+
+    result = plug.getLiveviewList()
+
+    assert result == [("lv-2", "Apple"), ("lv-3", "mango"), ("lv-1", "zebra")]
+
+
+# -- validateActionConfigUi ------------------------------------------------
+
+def test_validate_action_config_ui_set_viewer_liveview_rejects_empty(fake_indigo):
+    plug = make_plugin({})
+
+    valid, _values, errors = plug.validateActionConfigUi(
+        {"liveviewId": ""}, "setViewerLiveview", 1001)
+
+    assert valid is False
+    assert "liveviewId" in errors
+
+
+def test_validate_action_config_ui_set_viewer_liveview_accepts_selection(fake_indigo):
+    plug = make_plugin({})
+
+    result = plug.validateActionConfigUi({"liveviewId": "lv-1"}, "setViewerLiveview", 1001)
+
+    assert result[0] is True
+
+
+def test_validate_action_config_ui_still_rejects_existing_type_after_viewer_addition(fake_indigo):
+    """Regression guard: adding the new elif branch must not have broken
+    routing for a pre-existing typeId."""
+    plug = make_plugin({})
+
+    valid, _values, errors = plug.validateActionConfigUi({}, "ptzGotoPreset", 1001)
+
+    assert valid is False
+    assert "slot" in errors
+
+
+# -- discoverCameras (Discover Devices) ------------------------------------
+
+def test_discover_devices_logs_viewers_and_liveviews(fake_indigo, caplog):
+    plug = make_plugin({})
+
+    class API:
+        def get_cameras(self):
+            return []
+
+        def get_sensors(self):
+            return []
+
+        def get_lights(self):
+            return []
+
+        def get_chimes(self):
+            return []
+
+        def get_nvr(self):
+            raise ProtectAPIError("not found", status=404)
+
+        def get_viewers(self):
+            return [{"id": "viewer-1", "name": "Hallway", "state": "CONNECTED",
+                      "liveview": "lv-1"}]
+
+        def get_liveviews(self):
+            return [{"id": "lv-1", "name": "All Cameras", "isDefault": True,
+                      "isGlobal": True, "slots": [{}, {}]}]
+
+    plug.api = API()
+
+    with caplog.at_level("INFO"):
+        plug.discoverCameras()
+
+    messages = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert any("1 viewer(s)" in m for m in messages)
+    assert any("Hallway" in m and "CONNECTED" in m for m in messages)
+    assert any("1 live view(s)" in m for m in messages)
+    assert any("All Cameras" in m and "default" in m and "global" in m for m in messages)
+
+
+def test_discover_devices_viewer_failure_logs_error_without_raising(fake_indigo, caplog):
+    plug = make_plugin({})
+
+    class API:
+        def get_cameras(self):
+            return []
+
+        def get_sensors(self):
+            return []
+
+        def get_lights(self):
+            return []
+
+        def get_chimes(self):
+            return []
+
+        def get_nvr(self):
+            raise ProtectAPIError("not found", status=404)
+
+        def get_viewers(self):
+            raise ProtectAPIError("boom", status=500)
+
+        def get_liveviews(self):
+            return []
+
+    plug.api = API()
+
+    with caplog.at_level("ERROR"):
+        plug.discoverCameras()   # must not raise
+
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert any("Viewer discovery failed" in m for m in errors)
+
+
+def test_discover_devices_liveviews_before_viewers_and_resolves_names(fake_indigo, caplog):
+    """Issue #9 follow-up: liveviews must be discovered BEFORE viewers, and
+    _discover_viewers must resolve the id to a NAME when it's in the
+    freshly-loaded self.liveview_info, else flag it as not-in-list --
+    never just echo the bare id either way."""
+    plug = make_plugin({})
+
+    class API:
+        def __init__(self):
+            self.calls = []
+
+        def get_cameras(self):
+            return []
+
+        def get_sensors(self):
+            return []
+
+        def get_lights(self):
+            return []
+
+        def get_chimes(self):
+            return []
+
+        def get_nvr(self):
+            raise ProtectAPIError("not found", status=404)
+
+        def get_viewers(self):
+            self.calls.append("viewers")
+            return [
+                {"id": "viewer-1", "name": "Hallway", "state": "CONNECTED", "liveview": "lv-1"},
+                {"id": "viewer-2", "name": "Kitchen", "state": "CONNECTED", "liveview": "lv-missing"},
+            ]
+
+        def get_liveviews(self):
+            self.calls.append("liveviews")
+            return [{"id": "lv-1", "name": "Front Door", "isDefault": True}]
+
+    api = API()
+    plug.api = api
+
+    with caplog.at_level("INFO"):
+        plug.discoverCameras()
+
+    assert api.calls == ["liveviews", "viewers"], (
+        "liveviews must be discovered before viewers so names can resolve"
+    )
+    messages = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert any("Hallway" in m and "Front Door (lv-1)" in m for m in messages), (
+        "a resolved liveview id must show its NAME, not the bare id"
+    )
+    assert any("Kitchen" in m and "lv-missing [not in live view list]" in m for m in messages), (
+        "an unresolved liveview id must be flagged, not silently echoed"
+    )

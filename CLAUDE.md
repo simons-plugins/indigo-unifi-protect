@@ -15,10 +15,12 @@
 Bridges UniFi Protect camera motion/person/vehicle/animal detection into Indigo
 sensor devices, using the official UniFi OS integration API
 (`https://<host>/proxy/protect/integration/v1`) — API-key auth, no login/cookies.
-Also bridges Protect sensors, floodlights, doorbell chimes, and NVR arm
-state — those four device classes are **spec-derived, unverified against
-real hardware** (see [`docs/CONTRACT.md`](./docs/CONTRACT.md)); camera
-support above is live-verified.
+Also bridges Protect sensors, floodlights, doorbell chimes, NVR arm state,
+and viewers (ViewPorts). Sensors, lights, chimes, and viewers are
+**spec-derived, unverified against real hardware** (see
+[`docs/CONTRACT.md`](./docs/CONTRACT.md)) — the reference rig owns none of
+that hardware. The NVR's arm-state fields and camera support above are
+both **live-verified**.
 
 **Key architectural fact: the event WebSocket (`/subscribe/events`) is the
 ONLY motion source. There is no polling fallback.** `GET /events` is a 404 —
