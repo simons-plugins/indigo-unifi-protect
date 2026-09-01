@@ -60,9 +60,9 @@ the spec (see below the table):
 | `/v1/cameras/{id}` | GET, PATCH | ✅ GET only |
 | `/v1/cameras/{id}/snapshot` | GET | ✅ |
 | `/v1/cameras/{id}/rtsps-stream` | GET, POST, DELETE | ✅ GET/POST (issue #7); DELETE (issue #25) |
-| `/v1/cameras/{id}/ptz/patrol/start/{slot}` | POST | ✅ (issue #19) |
+| `/v1/cameras/{id}/ptz/patrol/start/{slot}` | POST | ✅ (issue #19) — slot 0-4 |
 | `/v1/cameras/{id}/ptz/patrol/stop` | POST | ✅ (issue #19) |
-| `/v1/cameras/{id}/ptz/goto/{slot}` | POST | ✅ (issue #19) |
+| `/v1/cameras/{id}/ptz/goto/{slot}` | POST | ✅ (issue #19) — slot 0-9, see below |
 | `/v1/cameras/{id}/disable-mic-permanently` | POST | no |
 | `/v1/cameras/{id}/talkback-session` | POST | no |
 | `/v1/sensors` | GET | no — returns `[]` on reference rig |
@@ -244,6 +244,17 @@ likewise UNVERIFIED against the reference rig, which has neither a PTZ
 camera nor an Alarm Manager alarm configured — the API key alone
 authorising them is assumed by extension from the camera PATCH result
 above, not independently confirmed.
+
+**`/ptz/goto/{slot}`'s own spec contradicts itself on the slot range.**
+Its prose says "slot 0-4", identically to `/ptz/patrol/start/{slot}`, but
+its own `examples` field for the goto endpoint lists `["-1","0","2","8",
+"9"]` — reaching 9, which the prose says is illegal. `ptz_patrol_start`
+has no such contradiction (`activePatrolSlotString` is a genuine 5-value
+enum). `protect_api.ptz_goto` was widened to accept 0-9 accordingly (a
+slot the camera doesn't actually have is refused by the controller, not
+by this client); `ptz_patrol_start` stays 0-4. `PTZ_PRESET_SLOT_MAX`/
+`PTZ_PATROL_SLOT_MAX` in `protect_api.py` are the single source of truth
+both `plugin.py`'s ConfigUI menus and this contradiction note derive from.
 
 ## RTSPS streams
 

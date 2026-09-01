@@ -232,25 +232,38 @@ Four more **Device Actions**, built from Protect's published OpenAPI spec
 rather than tested against real hardware — the reference rig has no PTZ
 camera:
 
-- **PTZ: Go To Preset** / **PTZ: Start Patrol** — pick a slot 1–5 (Protect's
-  own UI numbering; the underlying API index is 0–4, and the dialog labels
-  say so). **PTZ: Stop Patrol** takes no fields.
+- **PTZ: Go To Preset** — pick a slot 1–10 (Protect's own UI numbering
+  starts at 1; the underlying API index is 0–9). This one's range is wider
+  than you might expect: the spec's own prose says "slot 0-4", but its own
+  `examples` for this endpoint reach 9, contradicting its own prose — a
+  slot the camera hasn't actually got is refused by the controller, not by
+  this dialog.
+- **PTZ: Start Patrol** — pick a slot 1–5 (API index 0–4). Unlike Go To
+  Preset, this range genuinely is 0–4: the patrol slot is a real 5-value
+  enum with no such contradiction in the spec. **PTZ: Stop Patrol** takes
+  no fields.
 - **Delete Stream URLs** — tick any of High/Medium/Low/Package and the
   plugin deletes just those RTSPS streams on the controller, then clears
   the matching state(s) back to empty. One quality failing doesn't stop the
   others — each is requested independently, and the Event Log names
-  exactly which ones succeeded and which didn't. If **Expose RTSPS stream
-  URLs** is still ticked on the device, a warning explains that the
-  deleted quality will simply come back the next time this plugin
-  refreshes stream URLs for that camera (a device restart, an event-socket
-  reconnect, or the Refresh Stream URLs action all trigger that) — this
-  action is the only thing in the plugin that ever deletes a stream, it is
-  never automatic.
+  exactly which ones succeeded, which were already gone, and which failed.
+  A 404 is only treated as "already gone" when the camera itself is
+  confirmed still on the controller; a 404 that turns out to mean the
+  camera is gone aborts the whole action instead (nothing is cleared, and
+  the Event Log says so). If **Expose RTSPS stream URLs** is still ticked
+  on the device, a warning names exactly which deleted/already-gone
+  quality will come back the next time this plugin refreshes stream URLs
+  for that camera (a device restart, an event-socket reconnect, Send
+  Status Request, or the Refresh Stream URLs action all trigger that) —
+  this action is the only thing in the plugin that ever deletes a stream,
+  it is never automatic.
 
 There is no PTZ position readback anywhere in this API, so the PTZ actions
 are fire-and-forget: a 2xx response is the only confirmation there is, and
 a camera without PTZ hardware simply has the controller refuse the
-command (an Event Log error, same as any other refused write above).
+command (an Event Log error, same as any other refused write above — worded
+to name the likely cause, not to suggest reselecting a camera that was
+never the problem).
 
 #### Trigger Alarm Manager Webhook
 
@@ -259,8 +272,10 @@ fires a Protect **Alarm Manager** alarm configured with a Webhook trigger.
 Enter the trigger ID exactly as set up in Protect (Alarm Manager > your
 alarm > Webhook trigger) — Indigo variable substitution (`%%v:12345%%`) is
 supported, so the ID can come from a variable rather than being hardcoded
-in the action. Spec-derived, unverified against the reference rig, which
-has no Alarm Manager alarms configured.
+in the action. A dangling reference (a deleted variable/device) is caught
+both when you save the dialog and again when the action fires, before
+anything is sent. Spec-derived, unverified against the reference rig,
+which has no Alarm Manager alarms configured.
 
 ## Live stream URLs
 

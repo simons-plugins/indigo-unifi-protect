@@ -162,9 +162,14 @@ class _FakePluginBase:
         """Stand-in for indigo.PluginBase.substitute -- identity by
         default (no %%v:id%%/%%d:id%% patterns are recognized here). Tests
         that need real substitution behavior monkeypatch this method
-        directly on the plugin instance."""
+        directly on the plugin instance.
+
+        Per the real substitute()'s documented return shape,
+        ``validateOnly=True`` returns an ``(isValid, errStr)`` pair, NOT
+        the value itself -- ``errStr`` is empty here because this stub has
+        nothing to say about "no patterns to substitute"."""
         if validateOnly:
-            return True, value
+            return True, ""
         return value
 
 

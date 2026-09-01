@@ -114,10 +114,15 @@
                     <Option value="2">Preset 3 (slot 2)</Option>
                     <Option value="3">Preset 4 (slot 3)</Option>
                     <Option value="4">Preset 5 (slot 4)</Option>
+                    <Option value="5">Preset 6 (slot 5)</Option>
+                    <Option value="6">Preset 7 (slot 6)</Option>
+                    <Option value="7">Preset 8 (slot 7)</Option>
+                    <Option value="8">Preset 9 (slot 8)</Option>
+                    <Option value="9">Preset 10 (slot 9)</Option>
                 </List>
             </Field>
             <Field id="ptzHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
-                <Label>Protect's own UI numbers presets 1-5; the API slot is 0-4, hence the offset above. Fire-and-forget: the API offers no position readback. On a non-PTZ camera the controller refuses the command.</Label>
+                <Label>Protect's own UI numbers presets starting at 1, hence the offset above. The API spec's prose says "slot 0-4" but its own examples for this endpoint reach 9, so this menu offers slots 0-9; a slot the camera hasn't got is refused by the controller, not by this dialog. Fire-and-forget: the API offers no position readback.</Label>
             </Field>
         </ConfigUI>
     </Action>

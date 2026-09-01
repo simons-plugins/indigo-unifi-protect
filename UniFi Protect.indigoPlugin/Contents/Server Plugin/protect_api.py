@@ -156,6 +156,23 @@ class ProtectAPIError(Exception):
         return "http"
 
 
+
+# RTSPS stream qualities the get/create/delete endpoints understand (issue
+# #25) -- single source of truth so plugin.py's ConfigUI checkbox fields
+# don't hand-copy this tuple and silently drift from the one enforced here.
+RTSPS_QUALITIES = ("high", "medium", "low", "package")
+
+# PTZ slot ranges (issue #19). The OpenAPI spec's own prose says "slot
+# 0-4" for BOTH endpoints, but its own `examples` for /ptz/goto/{slot} list
+# values up to 9 (["-1","0","2","8","9"]), contradicting its own prose.
+# ptz_patrol_start genuinely is 0-4 -- `activePatrolSlotString` is a
+# 5-value enum -- so ptz_goto is treated as the wider 0-9 the spec's own
+# examples describe: a slot the camera doesn't actually have is refused by
+# the controller, not by this client.
+PTZ_PRESET_SLOT_MAX = 9
+PTZ_PATROL_SLOT_MAX = 4
+
+
 def _redact_body(exc: ProtectAPIError) -> ProtectAPIError:
     """Return a copy of ``exc`` with ``body=""``, everything else preserved
     (including ``kind``, so a caller's ``exc.kind == "auth"`` branching is
@@ -576,34 +593,43 @@ class ProtectAPI:
 
     def ptz_goto(self, camera_id: str, slot: int) -> None:
         """POST /cameras/{id}/ptz/goto/{slot} -- move the camera to a PTZ
-        preset. `slot` is the API's 0-4 slot index; Protect's own UI numbers
-        the same five presets 1-5.
+        preset. `slot` is the API's slot index, 0-``PTZ_PRESET_SLOT_MAX``
+        (9) -- see the module-level comment above ``PTZ_PRESET_SLOT_MAX``
+        for why this is wider than the spec's own prose ("slot 0-4").
+        Protect's own UI numbers presets starting at 1.
 
         SPEC-DERIVED, UNVERIFIED against the reference rig -- it has no PTZ
         camera to test against. Raises ValueError, before any network call,
-        if `slot` is not an int 0-4 (bool is explicitly rejected: in Python
-        `isinstance(True, int)` is True and `int(True) == 1` would otherwise
-        silently accept a fabricated-looking slot). Raises ProtectAPIError
-        on any non-2xx response or transport failure. Success is 204 No
-        Content -- there is no PTZ position readback anywhere in this API,
-        so this call is fire-and-forget.
+        if `slot` is not an int 0-``PTZ_PRESET_SLOT_MAX`` (bool is
+        explicitly rejected: in Python `isinstance(True, int)` is True and
+        `int(True) == 1` would otherwise silently accept a fabricated-
+        looking slot). Raises ProtectAPIError on any non-2xx response or
+        transport failure. Success is 204 No Content -- there is no PTZ
+        position readback anywhere in this API, so this call is
+        fire-and-forget.
         """
-        if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot <= 4:
-            raise ValueError(f"slot must be an int 0-4, got {slot!r}")
+        if (isinstance(slot, bool) or not isinstance(slot, int)
+                or not 0 <= slot <= PTZ_PRESET_SLOT_MAX):
+            raise ValueError(f"slot must be an int 0-{PTZ_PRESET_SLOT_MAX}, got {slot!r}")
         self._request_no_content("POST", f"/cameras/{camera_id}/ptz/goto/{slot}")
 
     def ptz_patrol_start(self, camera_id: str, slot: int) -> None:
         """POST /cameras/{id}/ptz/patrol/start/{slot} -- start a PTZ patrol.
-        Same `slot` contract (0-4, API index; Protect's UI shows 1-5) and
-        the same caveats as `ptz_goto` above.
+        `slot` is 0-``PTZ_PATROL_SLOT_MAX`` (4) -- unlike ``ptz_goto``,
+        this range is NOT widened: `activePatrolSlotString` is a genuine
+        5-value enum, and the spec's examples for this endpoint don't
+        contradict its own prose the way /ptz/goto/{slot}'s do. Protect's
+        UI shows patrols starting at 1.
 
         SPEC-DERIVED, UNVERIFIED against the reference rig. Raises
         ValueError, before any network call, on the same invalid-slot
-        conditions as `ptz_goto`. Raises ProtectAPIError on any non-2xx
-        response or transport failure. Success is 204 No Content.
+        shape as `ptz_goto` (bool rejected, range 0-``PTZ_PATROL_SLOT_MAX``).
+        Raises ProtectAPIError on any non-2xx response or transport
+        failure. Success is 204 No Content.
         """
-        if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot <= 4:
-            raise ValueError(f"slot must be an int 0-4, got {slot!r}")
+        if (isinstance(slot, bool) or not isinstance(slot, int)
+                or not 0 <= slot <= PTZ_PATROL_SLOT_MAX):
+            raise ValueError(f"slot must be an int 0-{PTZ_PATROL_SLOT_MAX}, got {slot!r}")
         self._request_no_content("POST", f"/cameras/{camera_id}/ptz/patrol/start/{slot}")
 
     def ptz_patrol_stop(self, camera_id: str) -> None:
@@ -656,14 +682,14 @@ class ProtectAPI:
 
         SPEC-DERIVED, UNVERIFIED against the reference rig. Raises
         ValueError, before any network call, if `quality` is not one of
-        "high"/"medium"/"low"/"package". Raises ProtectAPIError on any
-        non-2xx response or transport failure -- and, exactly like
-        `get_rtsps_streams`/`create_rtsps_streams` above, every
-        ProtectAPIError this raises is redacted (`body=""`) via
+        ``RTSPS_QUALITIES`` ("high"/"medium"/"low"/"package"). Raises
+        ProtectAPIError on any non-2xx response or transport failure -- and,
+        exactly like `get_rtsps_streams`/`create_rtsps_streams` above,
+        every ProtectAPIError this raises is redacted (`body=""`) via
         `_redact_body`: this endpoint family can echo a live-stream URL/
         token back in an error body.
         """
-        if quality not in ("high", "medium", "low", "package"):
+        if quality not in RTSPS_QUALITIES:
             raise ValueError(
                 f"quality must be one of 'high'/'medium'/'low'/'package', got {quality!r}")
         path = f"/cameras/{camera_id}/rtsps-stream"

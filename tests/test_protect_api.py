@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from protect_api import ProtectAPI, ProtectAPIError, _assert_no_secret
+from protect_api import ProtectAPI, ProtectAPIError, RTSPS_QUALITIES, _assert_no_secret
 
 FIXTURES = Path(__file__).parent / "fixtures"
 HOST = "192.0.2.1"  # TEST-NET-1 (RFC 5737) -- never a real address
@@ -661,13 +661,28 @@ def test_ptz_goto_error_response_raises_with_kind(monkeypatch):
     assert excinfo.value.kind == "not_found"
 
 
-@pytest.mark.parametrize("bad_slot", [-1, 5, "2", True, 2.0])
+@pytest.mark.parametrize("bad_slot", [-1, 10, "2", True, 2.0])
 def test_ptz_goto_bad_slot_raises_value_error_before_any_http_call(monkeypatch, bad_slot):
     monkeypatch.setattr("protect_api.urllib.request.urlopen", _raise_if_touched())
 
     api = make_api()
     with pytest.raises(ValueError):
         api.ptz_goto("cam1", bad_slot)
+
+
+def test_ptz_goto_accepts_slot_9(monkeypatch):
+    """The spec's own OpenAPI `examples` for this endpoint reach 9
+    (["-1","0","2","8","9"]), contradicting its prose ("slot 0-4") -- goto
+    accepts the wider range since a slot the camera doesn't have is
+    refused by the controller, not by this client."""
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b""))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    assert api.ptz_goto("cam1", 9) is None
+
+    request = mock_urlopen.call_args[0][0]
+    assert request.full_url.endswith("/cameras/cam1/ptz/goto/9")
 
 
 def test_ptz_patrol_start_sends_post_to_slot_path(monkeypatch):
@@ -852,6 +867,20 @@ def test_delete_rtsps_stream_bad_quality_raises_value_error_before_any_http_call
     api = make_api()
     with pytest.raises(ValueError):
         api.delete_rtsps_stream("cam1", bad_quality)
+
+
+@pytest.mark.parametrize("quality", RTSPS_QUALITIES)
+def test_delete_rtsps_stream_every_rtsps_quality_reaches_urlopen(monkeypatch, quality):
+    """Pins RTSPS_QUALITIES as the single source of truth for what
+    delete_rtsps_stream accepts -- every value in the tuple must pass its
+    own validation, not just the four hardcoded literals a hand-written
+    test would happen to pick."""
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b""))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    assert api.delete_rtsps_stream("cam1", quality) is None
+    assert mock_urlopen.called
 
 
 # ---------------------------------------------------------------------
