@@ -216,4 +216,18 @@
             </Field>
         </ConfigUI>
     </Action>
+
+    <Action id="setViewerLiveview" deviceFilter="self.protectViewer" uiPath="DeviceActions">
+        <Name>Set Live View</Name>
+        <CallbackMethod>setViewerLiveview</CallbackMethod>
+        <ConfigUI>
+            <Field id="liveviewId" type="menu" defaultValue="">
+                <Label>Live view:</Label>
+                <List class="self" method="getLiveviewList" dynamicReload="true"/>
+            </Field>
+            <Field id="liveviewHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+                <Label>SPEC-DERIVED, UNVERIFIED: never exercised against a real ViewPort. Changes which live view this ViewPort displays on the controller.</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
 </Actions>

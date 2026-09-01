@@ -505,4 +505,61 @@
         </States>
         <UiDisplayStateId>armStatus</UiDisplayStateId>
     </Device>
+
+    <!-- Issue #22/#23: Protect Viewer (ViewPort) + the live views it can
+    display. Spec-derived (OpenAPI v6.2.83) - UNVERIFIED against real
+    hardware, since GET /viewers returns [] on the reference rig (no
+    ViewPort). See docs/CONTRACT.md. Live view LISTING (Discover Devices,
+    the Set Live View action's menu) reads GET /liveviews, which is not
+    tied to owning a ViewPort - every console has live views - so this
+    class can be partially confirmed even without one. Live view
+    creation/editing is out of scope (read-only, per issue #23). -->
+    <Device type="custom" id="protectViewer">
+        <Name>Protect Viewer (ViewPort)</Name>
+        <ConfigUI>
+            <Field id="viewerIdLabel" type="label">
+                <Label>Select the UniFi Protect ViewPort this device tracks. UNVERIFIED: built from the published OpenAPI spec, never exercised against real hardware -- please report a debug capture if something looks wrong.</Label>
+            </Field>
+            <Field id="viewerId" type="menu">
+                <Label>Viewer:</Label>
+                <List class="self" method="getViewerList" dynamicReload="true"/>
+            </Field>
+            <Field id="SupportsStatusRequest" type="checkbox" defaultValue="true" hidden="true">
+                <Label/>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="viewerState">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Viewer State</TriggerLabel>
+                <ControlPageLabel>Viewer State</ControlPageLabel>
+            </State>
+            <State id="liveviewId">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Live View ID</TriggerLabel>
+                <ControlPageLabel>Live View ID</ControlPageLabel>
+            </State>
+            <State id="liveviewName">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Live View Name</TriggerLabel>
+                <ControlPageLabel>Live View Name</ControlPageLabel>
+            </State>
+            <State id="streamLimit">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Stream Limit</TriggerLabel>
+                <ControlPageLabel>Stream Limit</ControlPageLabel>
+            </State>
+            <State id="connected">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Event Socket Connected</TriggerLabel>
+                <ControlPageLabel>Event Socket Connected</ControlPageLabel>
+            </State>
+            <State id="lastPoll">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Last Poll</TriggerLabel>
+                <ControlPageLabel>Last Poll</ControlPageLabel>
+            </State>
+        </States>
+        <UiDisplayStateId>viewerState</UiDisplayStateId>
+    </Device>
 </Devices>
