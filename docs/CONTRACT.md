@@ -327,9 +327,9 @@ class ProtectAPI:
         (a liveview is console-side view configuration, not Protect
         hardware, and creating/editing one is out of scope). Raises
         ProtectAPIError, including when the parsed body is not a JSON
-        array of objects. SPEC-DERIVED, UNVERIFIED against the reference
-        rig -- /viewers is empty there, but /liveviews itself was never
-        exercised live either way. Deliberately no single-item
+        array of objects. LIVE-VERIFIED 2026-09-01 on the reference rig
+        (Discover Devices listed "Default (default, global) - 3 slot(s)");
+        /viewers is empty there, so the viewer methods remain spec-only. Deliberately no single-item
         get_liveview(id) either (issue #29 follow-up) -- no caller in
         this plugin ever needs one live view by id, only the whole list."""
 ```

@@ -604,9 +604,10 @@ class ProtectAPI:
     # The spec also documents POST (create) and PATCH (edit) for liveviews,
     # but issue #23 scopes this plugin to LISTING only: a liveview is
     # console-side view configuration, not a piece of Protect hardware, and
-    # creating/editing one is out of scope here. Spec-derived, UNVERIFIED --
-    # the reference rig's /viewers is empty, but /liveviews itself was never
-    # exercised live either way. There is deliberately no get_liveview
+    # creating/editing one is out of scope here. GET /liveviews LIVE-VERIFIED
+    # 2026-09-01 on the reference rig (Discover Devices listed the console's
+    # one live view, "Default (default, global) - 3 slot(s)"); /viewers is
+    # empty there, so the viewer methods above remain spec-only. There is deliberately no get_liveview
     # (single-item GET /liveviews/{id}) either -- every caller in this
     # plugin only ever needs the whole list (name resolution, the
     # setViewerLiveview menu, Discover Devices); a dead single-item method
