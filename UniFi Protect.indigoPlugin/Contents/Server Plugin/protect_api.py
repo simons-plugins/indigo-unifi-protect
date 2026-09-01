@@ -558,6 +558,120 @@ class ProtectAPI:
             body = body[0]
         return self._expect_dict(path, body)
 
+    def _request_no_content(self, method: str, path: str,
+                             params: Optional[dict[str, str]] = None,
+                             body: Optional[dict] = None) -> None:
+        """Shared core for the 204-No-Content endpoints below (PTZ goto/
+        patrol, the alarm-manager webhook, the RTSPS single-quality
+        DELETE). Calls `_request` and discards whatever it returns -- any
+        2xx status is success regardless of the body. The spec declares
+        204 (empty body) for every one of these, but this helper makes no
+        assumption about that: a non-empty body on a 2xx is never parsed
+        and never causes a failure here.
+
+        Raises ProtectAPIError on any non-2xx response or transport
+        failure (unchanged from `_request`).
+        """
+        self._request(method, path, params=params, body=body)
+
+    def ptz_goto(self, camera_id: str, slot: int) -> None:
+        """POST /cameras/{id}/ptz/goto/{slot} -- move the camera to a PTZ
+        preset. `slot` is the API's 0-4 slot index; Protect's own UI numbers
+        the same five presets 1-5.
+
+        SPEC-DERIVED, UNVERIFIED against the reference rig -- it has no PTZ
+        camera to test against. Raises ValueError, before any network call,
+        if `slot` is not an int 0-4 (bool is explicitly rejected: in Python
+        `isinstance(True, int)` is True and `int(True) == 1` would otherwise
+        silently accept a fabricated-looking slot). Raises ProtectAPIError
+        on any non-2xx response or transport failure. Success is 204 No
+        Content -- there is no PTZ position readback anywhere in this API,
+        so this call is fire-and-forget.
+        """
+        if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot <= 4:
+            raise ValueError(f"slot must be an int 0-4, got {slot!r}")
+        self._request_no_content("POST", f"/cameras/{camera_id}/ptz/goto/{slot}")
+
+    def ptz_patrol_start(self, camera_id: str, slot: int) -> None:
+        """POST /cameras/{id}/ptz/patrol/start/{slot} -- start a PTZ patrol.
+        Same `slot` contract (0-4, API index; Protect's UI shows 1-5) and
+        the same caveats as `ptz_goto` above.
+
+        SPEC-DERIVED, UNVERIFIED against the reference rig. Raises
+        ValueError, before any network call, on the same invalid-slot
+        conditions as `ptz_goto`. Raises ProtectAPIError on any non-2xx
+        response or transport failure. Success is 204 No Content.
+        """
+        if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot <= 4:
+            raise ValueError(f"slot must be an int 0-4, got {slot!r}")
+        self._request_no_content("POST", f"/cameras/{camera_id}/ptz/patrol/start/{slot}")
+
+    def ptz_patrol_stop(self, camera_id: str) -> None:
+        """POST /cameras/{id}/ptz/patrol/stop -- stop whatever PTZ patrol is
+        currently running. No slot -- the endpoint stops the camera's one
+        active patrol, whichever it is.
+
+        SPEC-DERIVED, UNVERIFIED against the reference rig. Raises
+        ProtectAPIError on any non-2xx response or transport failure.
+        Success is 204 No Content.
+        """
+        self._request_no_content("POST", f"/cameras/{camera_id}/ptz/patrol/stop")
+
+    def send_alarm_webhook(self, trigger_id: str) -> None:
+        """POST /alarm-manager/webhook/{id} -- fires whichever Protect Alarm
+        Manager alarm has a Webhook trigger configured with this id.
+        `trigger_id` is a user-defined free-form string set up on the
+        controller (Protect > Alarm Manager > alarm > Webhook trigger), not
+        a Protect object id -- the spec's own example is literally
+        "AnyRandomString". It is URL-encoded with
+        `urllib.parse.quote(trigger_id, safe="")` before being placed in the
+        path, since a user-chosen string may contain "/", spaces, or other
+        characters that would otherwise be misread as extra path segments.
+
+        SPEC-DERIVED, UNVERIFIED against the reference rig -- it has no
+        Alarm Manager alarms configured. Raises ValueError, before any
+        network call, if `trigger_id` is not a string or is empty/
+        whitespace-only. Raises ProtectAPIError on any non-2xx response
+        (e.g. a 400 `idRequiredError` for an empty id) or transport
+        failure. Success is 204 No Content.
+        """
+        if not isinstance(trigger_id, str) or not trigger_id.strip():
+            raise ValueError("trigger_id must be a non-empty string")
+        quoted = urllib.parse.quote(trigger_id, safe="")
+        self._request_no_content("POST", f"/alarm-manager/webhook/{quoted}")
+
+    def delete_rtsps_stream(self, camera_id: str, quality: str) -> None:
+        """DELETE /cameras/{id}/rtsps-stream?qualities=<quality> -- removes
+        ONE RTSPS stream quality on the controller. Success is 204 No
+        Content.
+
+        The spec's `qualities` query parameter is documented as `anyOf` a
+        single quality string or an array of them, but how this server
+        expects the array form encoded in a query string (repeated
+        `qualities=high&qualities=low`? comma-joined? bracketed
+        `qualities[]=`?) is undocumented and has never been exercised. The
+        single-string form is unambiguous and is the other half of that
+        `anyOf`, so this method only ever deletes one quality per call --
+        callers wanting several call this once per quality.
+
+        SPEC-DERIVED, UNVERIFIED against the reference rig. Raises
+        ValueError, before any network call, if `quality` is not one of
+        "high"/"medium"/"low"/"package". Raises ProtectAPIError on any
+        non-2xx response or transport failure -- and, exactly like
+        `get_rtsps_streams`/`create_rtsps_streams` above, every
+        ProtectAPIError this raises is redacted (`body=""`) via
+        `_redact_body`: this endpoint family can echo a live-stream URL/
+        token back in an error body.
+        """
+        if quality not in ("high", "medium", "low", "package"):
+            raise ValueError(
+                f"quality must be one of 'high'/'medium'/'low'/'package', got {quality!r}")
+        path = f"/cameras/{camera_id}/rtsps-stream"
+        try:
+            self._request_no_content("DELETE", path, params={"qualities": quality})
+        except ProtectAPIError as exc:
+            raise _redact_body(exc) from None
+
     def get_meta_info(self) -> dict:
         """GET /meta/info -> {'applicationVersion': '7.2.105'}.
 
