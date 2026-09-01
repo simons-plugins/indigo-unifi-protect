@@ -606,19 +606,17 @@ class ProtectAPI:
     # console-side view configuration, not a piece of Protect hardware, and
     # creating/editing one is out of scope here. Spec-derived, UNVERIFIED --
     # the reference rig's /viewers is empty, but /liveviews itself was never
-    # exercised live either way.
+    # exercised live either way. There is deliberately no get_liveview
+    # (single-item GET /liveviews/{id}) either -- every caller in this
+    # plugin only ever needs the whole list (name resolution, the
+    # setViewerLiveview menu, Discover Devices); a dead single-item method
+    # would be untested, unverified, and unreachable code.
 
     def get_liveviews(self) -> list[dict]:
         """GET /liveviews. Raises ProtectAPIError, including when the
         parsed body is not a JSON array of objects."""
         path = "/liveviews"
         return self._expect_list_of_dicts(path, self._get_json(path))
-
-    def get_liveview(self, liveview_id: str) -> dict:
-        """GET /liveviews/{id}. Raises ProtectAPIError, including when the
-        parsed body is not a JSON object."""
-        path = f"/liveviews/{liveview_id}"
-        return self._expect_dict(path, self._get_json(path))
 
     def _request_no_content(self, method: str, path: str,
                              params: Optional[dict[str, str]] = None,

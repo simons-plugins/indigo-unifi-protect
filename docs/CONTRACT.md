@@ -329,11 +329,9 @@ class ProtectAPI:
         ProtectAPIError, including when the parsed body is not a JSON
         array of objects. SPEC-DERIVED, UNVERIFIED against the reference
         rig -- /viewers is empty there, but /liveviews itself was never
-        exercised live either way."""
-
-    def get_liveview(self, liveview_id: str) -> dict:
-        """GET /liveviews/{id}. Raises ProtectAPIError, including when the
-        parsed body is not a JSON object. SPEC-DERIVED, UNVERIFIED."""
+        exercised live either way. Deliberately no single-item
+        get_liveview(id) either (issue #29 follow-up) -- no caller in
+        this plugin ever needs one live view by id, only the whole list."""
 ```
 
 Use `urllib.request` with an `ssl.SSLContext`. When `verify_ssl` is false set
@@ -1903,15 +1901,15 @@ question is "when could this report idle/unavailable/kept and be wrong?":
 > Unlike those three, `GET /liveviews` is NOT gated on owning a viewer --
 > every console has live views -- so the live-view LISTING half of this
 > feature (Discover Devices, the `setViewerLiveview` action's menu) can be
-> partially exercised on any rig even without one, and was.
+> partially exercised on any rig even without one.
 
 Follows the same pattern as Issue #8's sensor/light/chime/NVR classes,
 with one addition: a **second cache with no Indigo device of its own**.
 `self.viewers`/`self.viewer_info` are the usual `dict[protect_id ->
-set[indigo_device_id]]` / `dict[protect_id -> object]` pair; `
-self.liveview_info` is a plain `dict[liveview_id -> object]` -- live views
-are console-side view configuration, not hardware, so there is no
-`self.liveviews` registry and no Indigo device type for them.
+set[indigo_device_id]]` / `dict[protect_id -> object]` pair; `self.liveview_info`
+is a plain `dict[liveview_id -> object]` cache -- live views are console-side
+view configuration, not hardware, so there is no `self.liveviews` registry and
+no Indigo device type for them.
 
 `HANDLED_MODEL_KEYS` (device_router.py) grew to six: `viewer` moved OUT of
 `KNOWN_UNHANDLED_MODEL_KEYS` in plugin.py at the same time -- a viewer
@@ -1941,22 +1939,63 @@ same tick it changed. The two fetches fail independently:
   -- `_poll_devices()`'s `if self.viewers: self._poll_viewers()` guard is
   what enforces this; pinned with a fatal-collaborator test on both
   `get_liveviews` and `get_viewers`.
+- A `not_found` kind on EITHER fetch is described via
+  `_describe_not_found_for_endpoint` with a firmware-gap hint ("this
+  controller's firmware may not expose /liveviews (or /viewers)")
+  instead of `_describe_api_error`'s "reselect it in the device settings"
+  -- there is no single device to reselect for a missing collection
+  endpoint. `_report_poll_failure` takes an optional `description=`
+  override for exactly this; the once-per-`(class, kind)` guard is
+  unaffected either way.
+- A **resolved viewer naming a liveview id absent from a SUCCESSFUL
+  liveviews list** (both fetches succeeded this tick) logs one WARNING
+  per `(viewer_id, liveview_id)` episode -- previously 100% silent.
+  Mirrors `_warn_absent_from_list`'s own-set/clear-on-resolve mechanics
+  (`self._viewer_liveview_warned`, a `dict[viewer_id -> liveview_id]`):
+  cleared the instant the id resolves or the viewer has no liveview at
+  all, so a later recurrence -- even of the exact same id -- warns again.
+  Gated on a `liveviews_ok` flag so a liveviews poll FAILURE (which
+  already logs its own ERROR) doesn't pile a second WARNING per viewer on
+  top.
 
 ### `liveviewName` resolution -- the one "skip, don't fabricate" state here
 
 | `liveview` field | `liveviewId` written | `liveviewName` written |
 |---|---|---|
-| absent / `null` | `""` | `""` |
+| absent (key missing entirely) | **skipped** | **skipped** |
+| `null` / empty | `""` | `""` |
 | a real id, found in `self.liveview_info` | that id | the resolved `name` |
-| a real id, NOT in `self.liveview_info` | that id | **omitted** -- last-known value held |
+| a real id, NOT in cache, UNCHANGED from `dev.states["liveviewId"]` | that id | **skipped** -- last-known name held |
+| a real id, NOT in cache, CHANGED (or no prior id at all) | that id | `STATE_UNAVAILABLE` |
 
-The third row covers two situations identically: the liveview list has
-never successfully loaded yet (fresh cache, `{}`), or a poll failure left
-a stale cache that simply doesn't mention this id. Both mean "not a
-confirmed read" the same way, so both get the same treatment. This never
-writes the bare liveview id into the name field, and never fabricates a
-name -- the same "a key that can't be confirmed is skipped, not
-defaulted" rule the whole Issue #8 pattern already uses for
+Five distinct cases, not three -- the earlier version of this table
+conflated "absent" with "null" (they are different facts: absent is a
+partial frame that says nothing, null is a confirmed "no live view
+assigned") and conflated "unresolved" with "unresolved" regardless of
+whether the id had just changed.
+
+- **Absent vs. null**: a partial frame merged onto a partial cached
+  object (e.g. a device-socket `update` that never touched `liveview`)
+  must not be read as "confirmed: no live view" -- both keys are skipped
+  entirely rather than written `""`.
+- **Unchanged vs. changed unresolved id**: the third and fourth rows
+  cover the SAME raw fact (a real id absent from `self.liveview_info`)
+  differently depending on whether it's a live-view SWITCH. An unchanged
+  id during a liveviews outage holds the last-known name -- the outage
+  is transient and the name was already known. A CHANGED id (or no prior
+  id at all, e.g. the very first poll) is written `STATE_UNAVAILABLE`
+  instead: holding the OLD live view's name across a switch to a
+  different, unresolved one would misreport which live view the ViewPort
+  is actually showing, which is worse than admitting the name can't be
+  confirmed. `_write_viewer_states` reads `self.liveview_info` exactly
+  ONCE via `.get()` for the lookup -- a separate `in` check followed by a
+  subscript risks the UI thread rebinding the attribute in between and
+  turning a routine cache miss into a KeyError that aborts the whole
+  write batch.
+
+This never writes the bare liveview id into the name field, and never
+fabricates a name -- the same "a key that can't be confirmed is skipped,
+not defaulted" rule the whole Issue #8 pattern already uses for
 `lastOpenChange`/`isOpen`/etc.
 
 ### State table -- `protectViewer` (`type="custom"`)
@@ -1964,8 +2003,8 @@ defaulted" rule the whole Issue #8 pattern already uses for
 | State | Type | Source |
 |---|---|---|
 | `viewerState` | String | poll `state`, or `STATE_UNAVAILABLE` |
-| `liveviewId` | String | poll `liveview`, or `""` if null |
-| `liveviewName` | String | resolved from `self.liveview_info`; see table above -- omitted when unresolved |
+| `liveviewId` | String | poll `liveview`; skipped if the key is absent, `""` if null |
+| `liveviewName` | String | resolved from `self.liveview_info`; see table above |
 | `streamLimit` | Integer | poll `streamLimit`; same bool guard as `ringVolume`/`breachEventCount` -- skipped if bool/None/unparseable |
 | `connected` | Boolean | event socket health (same one signal as every other class -- viewers have no live feed of their own) |
 | `lastPoll` | String | ISO, poll-triggered writes only |
@@ -1979,32 +2018,85 @@ touches `connected` for this class -- same as chime/NVR.
 `PATCH /viewers/{id}` with body `{"liveview": <id>}` -> the full updated
 viewer object. Mirrors `_patch_camera`'s "validate before replacing the
 cache" rule rather than going through `_patch_camera` itself (there is no
-camera object here to gate capability on): the response is checked
-(`response.get("id") == viewer_id`) BEFORE it replaces
-`self.viewer_info[viewer_id]`. A shape mismatch does **not** cache the bad
-body -- it re-reads the real viewer via `get_viewer` and applies that
-instead, logging the shape problem first. A refused/errored PATCH (any
-`ProtectAPIError`) logs one ERROR via `_describe_api_error(exc,
-entity="viewer")` and leaves the cache untouched. An empty `liveviewId`
-(no selection) is rejected before any network call, in both
-`validateActionConfigUi` and the callback itself, matching every other
-action's double-check for a scripted `executeAction()` call.
+camera object here to gate capability on): the response's `id` is checked
+(`response.get("id") == viewer_id`) BEFORE it is treated as a real viewer
+object.
+
+A shape mismatch does **not** cache the bad body -- it re-reads the real
+viewer via `get_viewer` instead, logging the shape problem first. The
+re-GET's own shape is ALSO validated (`info.get("id") == viewer_id`): a
+re-read that comes back with the wrong id too is just as unusable as the
+original PATCH body was, and must not be cached or applied either -- one
+more ERROR and the pre-action cache stays untouched.
+
+Both success paths (the PATCH response itself, and a validated re-GET)
+converge on `_finish_set_viewer_liveview(dev, viewer_id, liveview_id,
+info)`, which:
+
+1. **Refreshes liveviews once** (issue #7) if the applied live view id
+   isn't in `self.liveview_info` yet, via `self._rest(self.api.get_liveviews)`
+   -- BEFORE applying state, so the name resolves on this very write
+   instead of falling into the unresolved-id rule above for one tick. A
+   refresh failure here is a WARNING, not an ERROR (the viewer object
+   itself DID apply); mirrors `_request_status_viewer`'s own liveviews
+   refresh.
+2. **Merges, doesn't replace, the cache** -- `self.viewer_info[viewer_id]
+   = {**self.viewer_info.get(viewer_id, {}), **info}`, exactly like
+   `setChimeVolume`'s `{**cached, **response}`. A PATCH response can be a
+   partial object; replacing wholesale would blank fields (e.g.
+   `streamLimit`) the PATCH never touched and could flip `viewerState` to
+   unavailable by dropping the cached `state` key.
+3. **Applies state** with `poll_timestamp_ms` set, advancing
+   `_device_last_poll_ms[viewer_id]` the same way every REST-poll write
+   does (issue #28) -- an action-triggered refresh is exactly as good
+   evidence of freshness as a poll.
+4. **Verifies the controller actually applied the change** (issue #3): a
+   200 is not proof the live view switched, only the object it hands back
+   is. If `"liveview" not in info` or the applied id doesn't match what
+   was requested, logs ONE ERROR ("controller accepted the request but
+   still reports live view ... - the change did not apply") and returns
+   with **no** success INFO -- even though the states just written are
+   the honest current reality. Only on a genuine match does it log
+   `"{dev.name}: Set Live View -> {name}"`, with `name` resolved from the
+   APPLIED id (not the requested one -- they're only guaranteed equal
+   once step 4 has already passed).
+
+An empty `liveviewId` (no selection) is rejected before any network call,
+in both `validateActionConfigUi` and the callback itself, matching every
+other action's double-check for a scripted `executeAction()` call.
 
 ### `getLiveviewList` -- the one dynamic list that works everywhere
 
-Populates the `setViewerLiveview` action's menu (and doubles as the
-`_discover_liveviews` data source). Sorted by name, with `" (default)"`
-appended to the console's default live view (`isDefault`). Unlike every
-other `getXList` in this plugin, this one is not gated by "does the user
-own hardware of this class" -- `GET /liveviews` succeeds on any console.
+Populates the `setViewerLiveview` action's menu. Sorted by name, with
+`" (default)"` appended to the console's default live view (`isDefault`).
+Unlike every other `getXList` in this plugin, this one is not gated by
+"does the user own hardware of this class" -- `GET /liveviews` succeeds
+on any console.
 
 ### `_request_status_viewer` / RequestStatus
 
 Single-device `GET /viewers/{id}`, mirroring every other class's
 RequestStatus path, **plus** a `get_liveviews` refresh so `liveviewName`
-can resolve immediately rather than waiting for the next 60s poll. The
-liveviews refresh failing here is a WARNING, not an ERROR -- the viewer
-itself DID refresh successfully; only the name lookup is stale.
+can resolve immediately rather than waiting for the next 60s poll --
+**skipped entirely** (issue #27) when the viewer's `liveview` id already
+resolves against the current `self.liveview_info`, saving a throttled
+REST call for the common case where nothing about the live view has
+changed. When it does run, a failure is a WARNING, not an ERROR -- the
+viewer itself DID refresh successfully; only the name lookup is stale --
+and a `not_found` kind uses the same firmware-gap wording as
+`_poll_viewers` above instead of "reselect it in the device settings".
+
+### Discovery (`discoverCameras`)
+
+`_discover_liveviews()` runs **before** `_discover_viewers()` (issue #9
+follow-up) and now POPULATES `self.liveview_info` as a side effect of
+listing -- previously the only `get_liveviews` call site in the plugin
+that threw its own result away, which meant Discover Devices could never,
+by itself, make live-view name resolution work. `_discover_viewers` then
+logs `live view: <name> (<id>)` when the id resolves against that
+freshly-loaded cache, or `<id> [not in live view list]` when it doesn't --
+the same fact the poll-time WARNING above reports, surfaced at discovery
+time too instead of a bare, unexplained id.
 
 ### Testing
 
@@ -2022,30 +2114,66 @@ answer and actually be fabricated or stale?" Covered:
 - `_poll_viewers` fetches liveviews before viewers (order pinned via a
   recording API, not wall-clock timing)
 - a liveviews failure does not abort the viewer poll: `viewerState`/
-  `liveviewId`/`streamLimit` are written, `liveviewName` is skipped, and
-  exactly one ERROR is logged
+  `liveviewId`/`streamLimit` are written, `liveviewName` is held (or
+  written unavailable on a live-view change) per the table above, and
+  exactly one ERROR is logged; `self.liveview_info` survives the failure
+  and a previously-resolvable id keeps resolving through it
 - a viewers failure marks `viewerState` unavailable and touches nothing
   else -- proven by diffing the exact key set of the failure's write batch
-- `liveviewName` skipped when the id is present but not in a loaded cache
-  (covers both "never loaded" and "stale after a failure" -- same code
-  path); `""` when the API `liveview` field is null
+- a 404 on either `/liveviews` or `/viewers` uses the firmware-gap
+  wording, not "reselect"
+- an unresolved liveview id on two successful polls warns once, is quiet
+  on a repeat, clears silently on resolution, and warns again on a later
+  recurrence of the SAME id; the warning is suppressed entirely when the
+  liveviews fetch itself failed this tick
+- `liveviewId`/`liveviewName` are both skipped when `liveview` is absent
+  from `info` (vs. `""` for an explicit null); `liveviewName` is skipped
+  (held) for an unchanged unresolved id and written unavailable for a
+  changed one, including "no prior id at all"
 - `streamLimit` never written for a bool/None/non-numeric-string value;
   written for a real int
 - device-socket `viewer` `update` frame merges onto a cached id and
   re-applies state; an uncached id is ignored (not seeded from a partial
-  frame); a `remove` warns once per absence episode
-- `setViewerLiveview`: success updates the cache and resolves
-  `liveviewName` immediately; a refused PATCH (`bad_request`) and a
-  transport failure both log one ERROR and leave the cache untouched; a
-  shape-mismatched response (wrong `id`) does NOT replace the cache and
-  instead re-polls the real viewer via `get_viewer`; no-api and no-viewer
+  frame); an `add` for a registered id applies state; a
+  remove -> add -> remove sequence warns twice (the intervening add clears
+  the episode); a `remove` warns once per absence episode
+- a non-`ProtectAPIError` from either the `get_liveviews` or `get_viewers`
+  LIST fetch itself is reported/contained exactly like a `ProtectAPIError`
+  and never escapes into `_poll_devices`/`_pump`
+- two different `(class, kind)` guard keys are proven independent: a
+  liveviews failure staying failed logs exactly one ERROR while the
+  viewer class recovers and logs its own "polling recovered" INFO
+- `deviceStopComm` removes by device id, not by the (possibly re-pointed)
+  current `viewerId` prop
+- `setViewerLiveview`: success merges onto the cache (not a wholesale
+  replace) and resolves `liveviewName` immediately, refreshing liveviews
+  once first if the applied id isn't cached yet (a refresh failure here
+  is a WARNING); a response reporting a DIFFERENT live view than
+  requested (or omitting the field) logs one ERROR and skips the success
+  INFO even though it still applies state; a refused PATCH
+  (`bad_request`) and a transport failure both log one ERROR and leave
+  the cache untouched; a shape-mismatched response (wrong `id`) does NOT
+  replace the cache and instead re-polls the real viewer via `get_viewer`
+  -- whose own shape is validated too, with a second-mismatch path
+  leaving the cache and state completely untouched; no-api and no-viewer
   each log their own specific ERROR without touching the network; an
-  empty `liveviewId` is rejected before any network call (fatal-
-  collaborator form)
-- `getLiveviewList` appends `" (default)"` for the default live view and
-  returns `_menu_error_label`'s text on a poll failure
+  empty `liveviewId` is rejected before any network call
+  (fatal-collaborator form); a successful apply advances
+  `_device_last_poll_ms`
+- `_request_status_viewer` has full coverage (previously zero): single
+  GET plus a conditional liveviews refresh that's skipped when the id
+  already resolves (fatal collaborator on `get_liveviews`), a liveviews
+  refresh failure warns without erroring, a 404 on it uses the
+  firmware-gap wording, and a `get_viewer` failure itself errors without
+  ever touching liveviews
+- `getViewerList`/`getLiveviewList`: success sorts case-insensitively and
+  populates the respective cache, an id-less entry is skipped, a
+  name-less entry falls back to its raw id, and a poll failure returns
+  `_menu_error_label`'s text
 - `validateActionConfigUi("setViewerLiveview", ...)` rejects an empty
   `liveviewId`; a pre-existing typeId (`ptzGotoPreset`) is re-checked
   after the new branch to prove routing wasn't broken by it
-- `discoverCameras` logs both the viewer list and the live view list, and
-  a viewer-discovery failure logs one ERROR without raising
+- `discoverCameras` discovers live views BEFORE viewers, so
+  `_discover_viewers` can resolve a live view id to its NAME (or flag it
+  `[not in live view list]`) instead of echoing a bare id; a
+  viewer-discovery failure logs one ERROR without raising

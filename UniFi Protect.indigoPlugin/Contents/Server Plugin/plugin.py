@@ -411,6 +411,13 @@ class Plugin(indigo.PluginBase):
         self.viewers = {}
         self.viewer_info = {}
         self.liveview_info = {}
+        # (viewer_id -> liveview_id) currently WARNED as unresolved -- a
+        # successful viewers poll named this liveview id and a successful
+        # liveviews poll didn't list it. Popped the moment it resolves (or
+        # the viewer has no liveview at all), so a later re-occurrence (even
+        # of the SAME id) warns again -- mirrors _absent_from_list_reported's
+        # "own set, cleared on resolution" shape.
+        self._viewer_liveview_warned = {}
 
         # Protect id -> epoch-ms wall-clock time of the last successful poll
         # write for that sensor/light device. Used to decide whether a live
@@ -1056,12 +1063,13 @@ class Plugin(indigo.PluginBase):
             # no event-socket feed at all, and sensors/lights still need a
             # periodic poll for their measurements/config even though some
             # of their state is pulse/lifecycle-driven above. Each polled
-            # class costs one
-            # throttled REST call (_rest enforces MIN_REST_INTERVAL=3s), so
-            # a full poll cycle here can block this loop for up to N*3s;
-            # any WS frames that arrive meanwhile simply queue in the
-            # socket's own read buffer -- an accepted trade against running
-            # a second thread just for polling.
+            # class costs one throttled REST call (_rest enforces
+            # MIN_REST_INTERVAL=3s) EXCEPT viewers, which cost two
+            # (liveviews, then viewers -- see _poll_viewers), so a full
+            # poll cycle here can block this loop for up to (N+1)*3s; any
+            # WS frames that arrive meanwhile simply queue in the socket's
+            # own read buffer -- an accepted trade against running a
+            # second thread just for polling.
             if now - self._last_poll >= DEVICE_POLL_INTERVAL:
                 self._poll_devices()
 
@@ -1210,7 +1218,7 @@ class Plugin(indigo.PluginBase):
         if first_time:
             self.logger.warning(
                 f"Discarding {delta} unparseable device-socket frame(s) - the "
-                "device-config push may be broken; sensor/light/chime/NVR polling "
+                "device-config push may be broken; sensor/light/chime/NVR/viewer polling "
                 "still applies and cameras fall back to 60s refresh"
             )
         else:
@@ -1654,13 +1662,22 @@ class Plugin(indigo.PluginBase):
                         )
                         self.logger.debug("camera fallback poll traceback", exc_info=True)
 
-    def _report_poll_failure(self, class_name, exc):
+    def _report_poll_failure(self, class_name, exc, description=None):
         """ERROR once per (class, failure kind) per outage; DEBUG for every
         failure after the first, so a controller stuck down doesn't spam
         the Event Log once a minute forever. Keyed on `exc.kind` (falling
         back to the exception's type name for a non-ProtectAPIError) as
         well as the class, so e.g. an auth failure and a transport failure
-        are each reported once rather than the second masking the first."""
+        are each reported once rather than the second masking the first.
+
+        ``description`` lets a caller override the default wording -- issue
+        #22/#23's viewer/liveview polls pass `_describe_not_found_for_endpoint`'s
+        text on a 404 instead of `_describe_api_error`'s "reselect it in the
+        device settings", which assumes a camera-style single device was
+        deselected (not what a missing /liveviews or /viewers endpoint
+        means). The once-per-(class, kind) guard below is unaffected either
+        way -- only the logged text changes.
+        """
         kind = getattr(exc, "kind", None) or type(exc).__name__
         key = (class_name, kind)
         # _describe_api_error (camera-control error messaging) reads
@@ -1669,8 +1686,10 @@ class Plugin(indigo.PluginBase):
         # here (a bug, or a fake in a test) must not raise AttributeError
         # out of a poll-failure handler, so it gets the plain fallback
         # instead of that richer formatting.
-        description = (self._describe_api_error(exc, entity=class_name) if isinstance(exc, ProtectAPIError)
-                        else f"{type(exc).__name__}: {exc}")
+        if description is None:
+            description = (self._describe_api_error(exc, entity=class_name)
+                            if isinstance(exc, ProtectAPIError)
+                            else f"{type(exc).__name__}: {exc}")
         if key not in self._poll_failed_classes:
             self._poll_failed_classes.add(key)
             self.logger.error(
@@ -1882,6 +1901,10 @@ class Plugin(indigo.PluginBase):
             self.nvrs.setdefault(real_id, set()).update(self.nvrs.pop(old_key))
         self._nvr_known_id = real_id
 
+    _VIEWER_NOT_FOUND_HINT = (
+        "this controller's firmware may not expose /liveviews (or /viewers)."
+    )
+
     def _poll_viewers(self):
         """Poll viewers AND liveviews (issue #22/#23) -- liveviews FIRST,
         so a viewer's liveviewName resolves against the freshest liveview
@@ -1894,28 +1917,45 @@ class Plugin(indigo.PluginBase):
         self.liveview_info is left at its last-known contents on a
         failure, exactly like every other class's info cache on a poll
         failure, so a transient liveviews outage doesn't erase a name that
-        was already known).
+        was already known). A `not_found` kind uses
+        `_describe_not_found_for_endpoint`'s wording instead of
+        `_describe_api_error`'s "reselect it in the device settings" --
+        there is no single device to reselect for a missing collection
+        endpoint.
 
         A viewers failure marks viewerState unavailable via
         _mark_class_unavailable and returns -- same shape as
         _poll_sensors/_poll_lights/_poll_chimes/_poll_nvr.
+
+        `liveviews_ok` gates the unresolved-liveview WARNING below (issue
+        #22 follow-up): a viewer naming a liveview id absent from the
+        liveview list is only worth remarking on when BOTH polls this tick
+        actually succeeded -- a liveviews poll failure already explains the
+        gap via its own ERROR, and piling a second WARNING per viewer on
+        top of that would be noise, not information.
         """
         now_ms = int(time.time() * 1000)
+        liveviews_ok = False
         try:
             liveviews = self._rest(self.api.get_liveviews)
         except ProtectAPIError as exc:
-            self._report_poll_failure("liveview", exc)
+            description = (self._describe_not_found_for_endpoint(exc, self._VIEWER_NOT_FOUND_HINT)
+                            if exc.kind == "not_found" else None)
+            self._report_poll_failure("liveview", exc, description=description)
         except Exception as exc:  # pylint: disable=broad-except
             self._report_poll_failure("liveview", exc)
             self.logger.debug("liveview poll traceback", exc_info=True)
         else:
             self._clear_poll_failure("liveview")
             self.liveview_info = {lv["id"]: lv for lv in liveviews if lv.get("id")}
+            liveviews_ok = True
 
         try:
             viewers = self._rest(self.api.get_viewers)
         except ProtectAPIError as exc:
-            self._report_poll_failure("viewer", exc)
+            description = (self._describe_not_found_for_endpoint(exc, self._VIEWER_NOT_FOUND_HINT)
+                            if exc.kind == "not_found" else None)
+            self._report_poll_failure("viewer", exc, description=description)
             self._mark_class_unavailable(self.viewers, "viewerState")
             return
         except Exception as exc:  # pylint: disable=broad-except
@@ -1932,8 +1972,39 @@ class Plugin(indigo.PluginBase):
                 self._apply_viewer_state(viewer_id, force=True)
                 continue
             self._clear_absent_from_list("viewer", viewer_id)
+            if liveviews_ok:
+                self._check_liveview_resolves(viewer_id, info)
             self._apply_viewer_state(viewer_id, force=True, poll_timestamp_ms=now_ms)
             self._device_last_poll_ms[viewer_id] = now_ms
+
+    def _check_liveview_resolves(self, viewer_id, info):
+        """Called only when both this tick's liveviews AND viewers polls
+        succeeded. A viewer naming a real, non-empty liveview id that the
+        freshly-loaded self.liveview_info still doesn't contain is silently
+        wrong today -- liveviewName just quietly holds/unavailables with no
+        signal anything is off. WARNING once per (viewer_id, liveview_id)
+        episode; cleared the moment it resolves (or the viewer has no
+        liveview at all), so a later recurrence -- even of the exact same
+        id -- warns again."""
+        liveview_id = (info or {}).get("liveview") or ""
+        if liveview_id and liveview_id not in self.liveview_info:
+            self._warn_unresolved_liveview(viewer_id, liveview_id)
+        else:
+            self._viewer_liveview_warned.pop(viewer_id, None)
+
+    def _warn_unresolved_liveview(self, viewer_id, liveview_id):
+        if self._viewer_liveview_warned.get(viewer_id) == liveview_id:
+            return
+        self._viewer_liveview_warned[viewer_id] = liveview_id
+        for dev_id in sorted(self.viewers.get(viewer_id, ())):
+            dev = indigo.devices.get(dev_id, None)
+            if dev is None:
+                continue
+            self.logger.warning(
+                f"{dev.name}: live view {liveview_id} is not in the controller's live "
+                "view list - it may be a non-global view this API key cannot see; "
+                "liveviewName is unavailable"
+            )
 
     @staticmethod
     def _iso_or_empty(epoch_ms):
@@ -2556,12 +2627,18 @@ class Plugin(indigo.PluginBase):
         #22/#23). SPEC-DERIVED, UNVERIFIED against the reference rig -- no
         ViewPort to test against.
 
-        On success, the response is validated (`response.get("id") ==
+        On a 200, the response is validated (`response.get("id") ==
         viewer_id`) BEFORE it replaces `self.viewer_info[viewer_id]` --
         mirrors `_patch_camera`'s "validate before replacing the cache"
         rule: a 200 that isn't recognizably the viewer object must not
         blank every other cached field. A failed shape check re-polls the
-        one viewer via `get_viewer` instead of trusting the bad body.
+        one viewer via `get_viewer` instead of trusting the bad body, and
+        the re-GET's own shape is validated too (a wrong-id body there is
+        just as unusable as one from the PATCH). Either success path then
+        runs through `_finish_set_viewer_liveview`, which additionally
+        VERIFIES the controller actually applied the requested live view --
+        a 200 is not proof the change took; only the object it hands back
+        is.
         """
         viewer_id = dev.pluginProps.get("viewerId", "")
         if not viewer_id:
@@ -2596,15 +2673,63 @@ class Plugin(indigo.PluginBase):
                     "states may be stale until the next poll"
                 )
                 return
-            self.viewer_info[viewer_id] = info
-            self._apply_viewer_state(viewer_id, force=True)
+            if not (isinstance(info, dict) and info.get("id") == viewer_id):
+                self.logger.error(
+                    f"{dev.name}: Set Live View - the re-read viewer object was also "
+                    "unusable (wrong id) - leaving cached state untouched"
+                )
+                return
+            self._finish_set_viewer_liveview(dev, viewer_id, liveview_id, info)
             return
 
-        self.viewer_info[viewer_id] = response
+        self._finish_set_viewer_liveview(dev, viewer_id, liveview_id, response)
+
+    def _finish_set_viewer_liveview(self, dev, viewer_id, liveview_id, info):
+        """Shared tail for setViewerLiveview's two success paths (the PATCH
+        response itself, and a re-GET after a shape mismatch):
+
+        1. If the applied liveview id isn't cached yet, refresh liveviews
+           ONCE (issue #7) so the name resolves on THIS write instead of
+           looking unavailable for one tick and then a WARNING here (never
+           an ERROR -- the viewer object itself DID apply) if that refresh
+           fails.
+        2. Cache the viewer object MERGED onto whatever was already cached
+           (issue #4, exactly like setChimeVolume) -- a PATCH response can
+           be a partial object, and replacing wholesale would blank fields
+           the PATCH never touched.
+        3. Apply state (poll_timestamp_ms advances lastPoll the same as
+           every other action-triggered refresh).
+        4. VERIFY the controller actually applied the requested live view
+           (issue #3) before logging success -- a 200 that still reports
+           the OLD (or no) live view is a silent no-op otherwise.
+        """
+        applied = info.get("liveview")
+        if applied and applied not in self.liveview_info:
+            try:
+                liveviews = self._rest(self.api.get_liveviews)
+            except ProtectAPIError as exc:
+                self.logger.warning(
+                    f"{dev.name}: Set Live View - could not refresh live views "
+                    f"({self._describe_api_error(exc, entity='liveview')}) - the live "
+                    "view name may be unavailable"
+                )
+            else:
+                self._clear_poll_failure("liveview")
+                self.liveview_info = {lv["id"]: lv for lv in liveviews if lv.get("id")}
+
+        self.viewer_info[viewer_id] = {**self.viewer_info.get(viewer_id, {}), **info}
         now_ms = int(time.time() * 1000)
         self._apply_viewer_state(viewer_id, force=True, poll_timestamp_ms=now_ms)
         self._device_last_poll_ms[viewer_id] = now_ms
-        name = self.liveview_info.get(liveview_id, {}).get("name") or liveview_id
+
+        if "liveview" not in info or applied != liveview_id:
+            self.logger.error(
+                f"{dev.name}: Set Live View - controller accepted the request but still "
+                f"reports live view {applied!r} (asked for {liveview_id!r}) - the change "
+                "did not apply"
+            )
+            return
+        name = self.liveview_info.get(applied, {}).get("name") or applied
         self.logger.info(f"{dev.name}: Set Live View -> {name}")
 
     # -- NVR state ------------------------------------------------------
@@ -2669,28 +2794,55 @@ class Plugin(indigo.PluginBase):
 
     def _write_viewer_states(self, dev, viewer_id, connected, force, poll_timestamp_ms):
         """liveviewName is the one state here with a real "skip, don't
-        fabricate" rule (see docs/CONTRACT.md): it is written "" when the
-        viewer's own `liveview` field is empty/null, written the resolved
-        name when that id IS in self.liveview_info, and OMITTED (last-known
-        value held) when the id is present but not in the liveview cache --
-        whether because liveviews have never successfully polled, or a
-        poll failure left a stale cache without this id. Never fabricates a
-        name and never writes the bare id into the name field."""
+        fabricate" rule (see docs/CONTRACT.md):
+
+        - `liveview` key ABSENT from `info` entirely (a partial frame
+          merged onto a partial object) -- both liveviewId and
+          liveviewName are SKIPPED. Absent is not the same fact as null;
+          neither key here is a confirmed read.
+        - `liveview` present but null/empty -- both are written "" (a
+          confirmed "no live view assigned").
+        - a real id, found in `self.liveview_info` -- the resolved `name`.
+        - a real id, NOT in `self.liveview_info`, UNCHANGED from the id
+          already sitting in `dev.states["liveviewId"]` -- SKIPPED
+          (last-known name held; a transient liveviews outage must not
+          blank a name that was already known).
+        - a real id, NOT in `self.liveview_info`, and DIFFERENT from
+          whatever `dev.states["liveviewId"]` currently holds (or there is
+          no prior id at all) -- written STATE_UNAVAILABLE. Holding the
+          OLD live view's name across a switch to a new, unresolved one
+          would misreport which live view the ViewPort is actually
+          showing -- worse than admitting the name can't be confirmed.
+
+        `self.liveview_info` is read exactly ONCE via `.get()` -- a
+        separate `in` check followed by a subscript risks the UI thread
+        rebinding the attribute in between and turning a routine cache
+        miss into a KeyError that aborts this whole write batch.
+
+        Never fabricates a name and never writes the bare id into the name
+        field."""
         info = self.viewer_info.get(viewer_id)
         states = [
             {"key": "viewerState", "value": _state_or_unavailable(info)},
             {"key": "connected", "value": connected},
         ]
         if info:
-            liveview_id = info.get("liveview") or ""
-            states.append({"key": "liveviewId", "value": liveview_id})
-            if not liveview_id:
-                states.append({"key": "liveviewName", "value": ""})
-            elif liveview_id in self.liveview_info:
-                name = self.liveview_info[liveview_id].get("name") or ""
-                states.append({"key": "liveviewName", "value": name})
-            # else: skip -- not a confirmed read, never fabricate a name or
-            # fall back to writing the raw id.
+            if "liveview" in info:
+                liveview_id = info.get("liveview") or ""
+                states.append({"key": "liveviewId", "value": liveview_id})
+                if not liveview_id:
+                    states.append({"key": "liveviewName", "value": ""})
+                else:
+                    liveview = self.liveview_info.get(liveview_id)
+                    if liveview is not None:
+                        states.append({"key": "liveviewName", "value": liveview.get("name") or ""})
+                    elif dev.states.get("liveviewId") == liveview_id:
+                        pass  # unchanged id, unresolved -- hold the last-known name.
+                    else:
+                        states.append({"key": "liveviewName", "value": STATE_UNAVAILABLE})
+            # else: "liveview" key absent entirely -- skip both, a partial
+            # frame merged onto a partial object must not look like a
+            # confirmed null read.
             try:
                 stream_limit = info["streamLimit"]
                 if isinstance(stream_limit, bool):
@@ -2826,9 +2978,15 @@ class Plugin(indigo.PluginBase):
     def _request_status_viewer(self, dev):
         """Single-device GET, mirroring every other class's RequestStatus
         path -- plus a get_liveviews refresh so liveviewName can resolve
-        immediately rather than waiting for the next 60s poll. A liveviews
-        failure here is a WARNING, not an ERROR: the viewer itself DID
-        refresh successfully, only the name lookup is stale."""
+        immediately rather than waiting for the next 60s poll. Skipped
+        entirely when the viewer's liveview id already resolves against
+        the current cache (issue #27) -- saves a throttled REST call for
+        the common case where nothing about the live view has changed.
+        A liveviews failure here is a WARNING, not an ERROR: the viewer
+        itself DID refresh successfully, only the name lookup is stale --
+        and a `not_found` kind uses `_describe_not_found_for_endpoint`'s
+        wording (issue #8) instead of "reselect it in the device settings",
+        which assumes a single device was deselected."""
         viewer_id = dev.pluginProps.get("viewerId", "")
         if not viewer_id:
             self.logger.error(f"{dev.name}: no viewer selected.")
@@ -2843,17 +3001,21 @@ class Plugin(indigo.PluginBase):
             return
         self._clear_poll_failure("viewer")
         self.viewer_info[viewer_id] = info
-        try:
-            liveviews = self._rest(self.api.get_liveviews)
-        except ProtectAPIError as exc:
-            self.logger.warning(
-                f"{dev.name}: refreshed the viewer, but could not refresh live views "
-                f"({self._describe_api_error(exc, entity='liveview')}) - the live view "
-                "name may be stale"
-            )
-        else:
-            self._clear_poll_failure("liveview")
-            self.liveview_info = {lv["id"]: lv for lv in liveviews if lv.get("id")}
+        liveview_id = info.get("liveview") or ""
+        if liveview_id and liveview_id not in self.liveview_info:
+            try:
+                liveviews = self._rest(self.api.get_liveviews)
+            except ProtectAPIError as exc:
+                description = (self._describe_not_found_for_endpoint(exc, self._VIEWER_NOT_FOUND_HINT)
+                                if exc.kind == "not_found"
+                                else self._describe_api_error(exc, entity="liveview"))
+                self.logger.warning(
+                    f"{dev.name}: refreshed the viewer, but could not refresh live views "
+                    f"({description}) - the live view name may be stale"
+                )
+            else:
+                self._clear_poll_failure("liveview")
+                self.liveview_info = {lv["id"]: lv for lv in liveviews if lv.get("id")}
         now_ms = int(time.time() * 1000)
         self._apply_viewer_state(viewer_id, force=True, poll_timestamp_ms=now_ms)
         self._device_last_poll_ms[viewer_id] = now_ms
@@ -3519,7 +3681,9 @@ class Plugin(indigo.PluginBase):
         extends this to list every device class, not just cameras. Issue
         #22/#23 adds viewers and the live view listing -- the live view
         listing is the one part of this that works on any console, since
-        GET /liveviews isn't gated on owning ViewPort hardware."""
+        GET /liveviews isn't gated on owning ViewPort hardware. Live
+        views are discovered BEFORE viewers so each viewer's listing can
+        resolve its live view's NAME, not just echo the bare id."""
         if not self.api:
             self.logger.error("UniFi Protect is not configured.")
             return
@@ -3528,8 +3692,12 @@ class Plugin(indigo.PluginBase):
         self._discover_lights()
         self._discover_chimes()
         self._discover_nvr()
-        self._discover_viewers()
+        # Liveviews BEFORE viewers (issue #9 follow-up), mirroring
+        # _poll_viewers' own ordering: _discover_viewers resolves each
+        # viewer's live view NAME against self.liveview_info, so the
+        # lookup needs the freshest liveview list already loaded.
         self._discover_liveviews()
+        self._discover_viewers()
 
     def _discover_cameras(self):
         try:
@@ -3594,6 +3762,12 @@ class Plugin(indigo.PluginBase):
         self.logger.info(f"Protect NVR: {nvr.get('name')} {flag}")
 
     def _discover_viewers(self):
+        """Called AFTER _discover_liveviews (see discoverCameras), so each
+        viewer's live view id can be resolved to its NAME against
+        self.liveview_info -- "<name> (<id>)" when it resolves, or
+        "<id> [not in live view list]" when it doesn't (the same fact
+        issue #22 follow-up's _check_liveview_resolves WARNs about during
+        a regular poll)."""
         try:
             viewers = self._rest(self.api.get_viewers)
         except ProtectAPIError as exc:
@@ -3603,18 +3777,30 @@ class Plugin(indigo.PluginBase):
         self.logger.info(f"Protect reports {len(viewers)} viewer(s):")
         for viewer in viewers:
             flag = "[in Indigo]" if viewer.get("id") in known else "[not yet added]"
-            liveview = viewer.get("liveview") or "none"
+            liveview_id = viewer.get("liveview") or ""
+            if not liveview_id:
+                liveview_text = "none"
+            elif liveview_id in self.liveview_info:
+                name = self.liveview_info[liveview_id].get("name") or liveview_id
+                liveview_text = f"{name} ({liveview_id})"
+            else:
+                liveview_text = f"{liveview_id} [not in live view list]"
             self.logger.info(
                 f"  {viewer.get('name')} - {viewer.get('state')} - "
-                f"live view: {liveview} {flag}"
+                f"live view: {liveview_text} {flag}"
             )
 
     def _discover_liveviews(self):
+        """Populates self.liveview_info (issue #9 follow-up) -- previously
+        the only get_liveviews call site that threw its result away, which
+        meant running Discover Devices could never, by itself, make
+        _discover_viewers' name resolution work."""
         try:
             liveviews = self._rest(self.api.get_liveviews)
         except ProtectAPIError as exc:
             self.logger.error(f"Live view discovery failed: {exc}")
             return
+        self.liveview_info = {lv["id"]: lv for lv in liveviews if lv.get("id")}
         self.logger.info(f"Protect reports {len(liveviews)} live view(s):")
         for liveview in liveviews:
             markers = []

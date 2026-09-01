@@ -469,13 +469,25 @@ States: `viewerState`, `liveviewId`, `liveviewName`, `streamLimit`,
 There's a **Set Live View** action that changes which live view the
 ViewPort shows, picked from a dropdown of every live view your console has
 (read-only listing -- creating or editing a live view is not exposed).
+It verifies the change actually took: if the controller accepts the
+request but its response still reports the old (or no) live view, the
+action logs an error instead of a false success, even though the states
+it writes are still the honest current reality.
 
 `liveviewName` is resolved from a separately-polled live view cache, not
 from the viewer object itself (the API only gives a live view *id*). If
-that id can't be resolved yet -- the live view list hasn't loaded, or the
-id isn't in the last successful load -- `liveviewName` is left at its
-last-known value rather than showing the raw id or a blank; it reads `""`
-only when the ViewPort genuinely has no live view assigned.
+that id can't be resolved yet -- the live view list hasn't loaded, or a
+transient outage left the cache without it -- `liveviewName` holds its
+last-known value, but only as long as the live view id itself hasn't
+changed; a *different* id that still can't be resolved is shown as
+`"unavailable"` instead, so the name doesn't keep claiming a live view
+that isn't showing anymore. `liveviewId`/`liveviewName` read `""` only
+when the ViewPort genuinely has no live view assigned (an explicit null
+from the API); if the field is missing from a response entirely, both are
+left untouched rather than misread as "none". A live view id that a
+successful poll can never resolve -- it may be a non-global view this
+plugin's API key can't see -- logs one warning per episode instead of
+staying silent.
 
 **How to confirm this class without owning a ViewPort:** run **Discover
 Devices** (plugin menu). It always lists your console's live views (`GET
