@@ -6527,31 +6527,24 @@ def test_poll_devices_with_one_viewer_only_fetches_viewers_and_liveviews(fake_in
     plug = make_plugin({})
     add_viewer_device(fake_indigo, plug)
 
+    calls = []
+
     class ViewerOnlyAPI(_FatalNonCameraAPI):
         def get_liveviews(self):
+            calls.append("get_liveviews")
             return []
 
         def get_viewers(self):
+            calls.append("get_viewers")
             return []
 
     plug.api = ViewerOnlyAPI()
     plug._last_rest_call = 0.0
 
     plug._poll_devices()   # must not raise touching sensors/lights/chimes/nvr
-
-
-def test_poll_viewers_never_fetches_liveviews_with_no_viewer_registered(fake_indigo):
-    """The class docstring/CONTRACT rule stated explicitly: liveviews must
-    NEVER be fetched when no viewer device is registered. _poll_devices'
-    own `if self.viewers:` guard is what enforces this -- proven here by a
-    fatal collaborator on BOTH endpoints, driven through the real
-    _poll_devices entry point rather than calling _poll_viewers directly."""
-    plug = make_plugin({})
-    add_camera_device(fake_indigo, plug)
-    plug.api = _FatalNonCameraAPI()
-    plug._last_rest_call = 0.0
-
-    plug._poll_devices()   # must not raise
+    # The positive half: both fetches actually happened (a _poll_devices
+    # that skipped viewers entirely would otherwise pass this test).
+    assert calls == ["get_liveviews", "get_viewers"]
 
 
 class _RecordingViewerPollAPI:

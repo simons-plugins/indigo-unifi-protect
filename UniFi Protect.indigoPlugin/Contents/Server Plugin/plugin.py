@@ -2628,10 +2628,10 @@ class Plugin(indigo.PluginBase):
         ViewPort to test against.
 
         On a 200, the response is validated (`response.get("id") ==
-        viewer_id`) BEFORE it replaces `self.viewer_info[viewer_id]` --
-        mirrors `_patch_camera`'s "validate before replacing the cache"
-        rule: a 200 that isn't recognizably the viewer object must not
-        blank every other cached field. A failed shape check re-polls the
+        viewer_id`) BEFORE it is merged into `self.viewer_info[viewer_id]`
+        -- stricter than `_patch_camera`, which replaces its cache
+        unconditionally: a 200 that isn't recognizably the viewer object
+        must not blank every other cached field. A failed shape check re-polls the
         one viewer via `get_viewer` instead of trusting the bad body, and
         the re-GET's own shape is validated too (a wrong-id body there is
         just as unusable as one from the PATCH). Either success path then
