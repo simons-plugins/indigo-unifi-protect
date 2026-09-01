@@ -119,6 +119,15 @@ OVERLAY_LOCATIONS = (
 )
 HDR_TYPES = ("auto", "on", "off")
 
+# Legal ConfigUI values for the PTZ goto/patrol-start actions (issues
+# #19/#21) -- the API's slot index, as a string (menu values arrive as
+# strings). Protect's own UI numbers the same five slots 1-5.
+PTZ_SLOTS = ("0", "1", "2", "3", "4")
+
+# Legal ConfigUI checkbox fields for deleteStreamUrls (issue #25), same
+# four qualities STREAM_URL_STATES already knows about.
+RTSPS_DELETE_QUALITIES = ("high", "medium", "low", "package")
+
 # Under Indigo's "Web Assets/images", so snapshots survive plugin upgrades and
 # are servable to control pages at /images/<SNAPSHOT_SUBDIR>/...
 SNAPSHOT_SUBDIR = "unifi-protect"
@@ -605,6 +614,18 @@ class Plugin(indigo.PluginBase):
         elif typeId == "setVideoMode":
             if not valuesDict.get("videoMode", "").strip():
                 errors["videoMode"] = "Select a video mode."
+        elif typeId in ("ptzGotoPreset", "ptzPatrolStart"):
+            if valuesDict.get("slot") not in PTZ_SLOTS:
+                errors["slot"] = "Select a preset/patrol."
+        elif typeId == "triggerAlarmWebhook":
+            if not valuesDict.get("webhookId", "").strip():
+                errors["webhookId"] = "Enter the Alarm Manager webhook trigger ID."
+        elif typeId == "deleteStreamUrls":
+            if not any(_truthy(valuesDict.get(field), default=False)
+                       for field in RTSPS_DELETE_QUALITIES):
+                message = "Select at least one quality to delete."
+                for field in RTSPS_DELETE_QUALITIES:
+                    errors[field] = message
         if errors:
             return False, valuesDict, errors
         return True, valuesDict
@@ -2972,8 +2993,104 @@ class Plugin(indigo.PluginBase):
         self._patch_camera(dev, camera_id, {"micVolume": volume}, "Set Microphone Volume",
                             str(volume))
 
+    # -- PTZ (issues #19/#21) ------------------------------------------
+    #
+    # Fire-and-forget: the official API has no PTZ position readback
+    # anywhere, so there is nothing to verify a goto/patrol against after
+    # the fact -- a 2xx (204 No Content) is the only confirmation there
+    # is. Unlike setStatusLed/setOsdOverlay/etc, these do NOT go through
+    # _resolve_camera/_patch_camera (there is no camera object to refresh
+    # or cache afterwards) -- the precheck mirrors setChimeVolume's
+    # cheaper shape instead: cameraId present, self.api configured.
+    # SPEC-DERIVED, UNVERIFIED against the reference rig (no PTZ camera).
+
+    def ptzGotoPreset(self, action, dev):
+        camera_id = dev.pluginProps.get("cameraId", "")
+        if not camera_id:
+            self.logger.error(f"{dev.name}: PTZ: Go To Preset - no camera selected.")
+            return
+        if not self.api:
+            self.logger.error("UniFi Protect is not configured.")
+            return
+        slot = action.props.get("slot")
+        if slot not in PTZ_SLOTS:
+            self.logger.error(
+                f"{dev.name}: PTZ: Go To Preset - invalid slot {slot!r} "
+                f"(must be one of {', '.join(PTZ_SLOTS)})."
+            )
+            return
+        try:
+            self._rest(self.api.ptz_goto, camera_id, int(slot))
+        except ProtectAPIError as exc:
+            self.logger.error(f"{dev.name}: PTZ: Go To Preset - {self._describe_api_error(exc)}")
+            return
+        self.logger.info(f"{dev.name}: PTZ: Go To Preset -> slot {slot}")
+
+    def ptzPatrolStart(self, action, dev):
+        camera_id = dev.pluginProps.get("cameraId", "")
+        if not camera_id:
+            self.logger.error(f"{dev.name}: PTZ: Start Patrol - no camera selected.")
+            return
+        if not self.api:
+            self.logger.error("UniFi Protect is not configured.")
+            return
+        slot = action.props.get("slot")
+        if slot not in PTZ_SLOTS:
+            self.logger.error(
+                f"{dev.name}: PTZ: Start Patrol - invalid slot {slot!r} "
+                f"(must be one of {', '.join(PTZ_SLOTS)})."
+            )
+            return
+        try:
+            self._rest(self.api.ptz_patrol_start, camera_id, int(slot))
+        except ProtectAPIError as exc:
+            self.logger.error(f"{dev.name}: PTZ: Start Patrol - {self._describe_api_error(exc)}")
+            return
+        self.logger.info(f"{dev.name}: PTZ: Start Patrol -> slot {slot}")
+
+    def ptzPatrolStop(self, action, dev):
+        camera_id = dev.pluginProps.get("cameraId", "")
+        if not camera_id:
+            self.logger.error(f"{dev.name}: PTZ: Stop Patrol - no camera selected.")
+            return
+        if not self.api:
+            self.logger.error("UniFi Protect is not configured.")
+            return
+        try:
+            self._rest(self.api.ptz_patrol_stop, camera_id)
+        except ProtectAPIError as exc:
+            self.logger.error(f"{dev.name}: PTZ: Stop Patrol - {self._describe_api_error(exc)}")
+            return
+        self.logger.info(f"{dev.name}: PTZ: Stop Patrol -> stopped")
+
     def refreshCameras(self, action):
         self._refresh_camera_info()
+
+    # -- Alarm Manager webhook (issue #21) ------------------------------
+    #
+    # Plugin-level, not a device action -- one Protect console has one
+    # Alarm Manager, independent of any single camera. SPEC-DERIVED,
+    # UNVERIFIED against the reference rig (no Alarm Manager alarms
+    # configured there).
+
+    def triggerAlarmWebhook(self, action):
+        if not self.api:
+            self.logger.error("UniFi Protect is not configured.")
+            return
+        raw = action.props.get("webhookId", "")
+        trigger_id = self.substitute(raw)
+        if not trigger_id or not trigger_id.strip():
+            self.logger.error(
+                "Trigger Alarm Manager Webhook - webhook trigger ID is empty "
+                "(after variable substitution)."
+            )
+            return
+        try:
+            self._rest(self.api.send_alarm_webhook, trigger_id)
+        except ProtectAPIError as exc:
+            self.logger.error(f"Trigger Alarm Manager Webhook - {self._describe_api_error(exc)}")
+            return
+        self.logger.info("Trigger Alarm Manager Webhook -> sent")
 
     def discoverCameras(self):
         """Menu id/callback kept as 'discoverCameras' for compatibility
@@ -3072,6 +3189,65 @@ class Plugin(indigo.PluginBase):
 
     def refreshStreamUrls(self, action, dev):
         self._refresh_stream_urls_sync(dev)
+
+    def deleteStreamUrls(self, action, dev):
+        """Delete the selected RTSPS stream qualities on the controller
+        (issue #25). One quality at a time (protect_api.delete_rtsps_stream
+        only ever deletes one) -- a single quality failing must not skip
+        the rest, so each is tried and reported independently.
+
+        SPEC-DERIVED, UNVERIFIED against the reference rig. Streams are
+        NEVER deleted automatically anywhere else in this plugin -- this
+        action is the only path that removes one.
+        """
+        camera_id = dev.pluginProps.get("cameraId", "")
+        if not camera_id:
+            self.logger.error(f"{dev.name}: Delete Stream URLs - no camera selected.")
+            return
+        if not self.api:
+            self.logger.error("UniFi Protect is not configured.")
+            return
+        selected = [quality for quality in RTSPS_DELETE_QUALITIES
+                    if _truthy(action.props.get(quality), default=False)]
+        if not selected:
+            self.logger.error(f"{dev.name}: Delete Stream URLs - no qualities selected.")
+            return
+
+        deleted = []
+        failed = []
+        for quality in selected:
+            try:
+                self._rest(self.api.delete_rtsps_stream, camera_id, quality)
+            except ProtectAPIError as exc:
+                if exc.kind == "not_found":
+                    self.logger.info(
+                        f"{dev.name}: Delete Stream URLs - {quality} was already gone "
+                        "on the controller."
+                    )
+                else:
+                    self.logger.error(
+                        f"{dev.name}: Delete Stream URLs - {quality}: "
+                        f"{self._describe_api_error(exc)}"
+                    )
+                    failed.append(quality)
+                    continue
+            dev.updateStatesOnServer([{"key": STREAM_URL_STATES[quality], "value": ""}])
+            deleted.append(quality)
+
+        summary = []
+        if deleted:
+            summary.append(f"deleted: {', '.join(deleted)}")
+        if failed:
+            summary.append(f"failed: {', '.join(failed)}")
+        self.logger.info(f"{dev.name}: Delete Stream URLs -> {'; '.join(summary)}")
+
+        if deleted and self._stream_urls_exposed(dev):
+            self.logger.warning(
+                f"{dev.name}: 'Expose RTSPS stream URLs' is still ticked for this device "
+                "- the plugin will recreate the deleted stream(s) the next time it "
+                "refreshes stream URLs for this camera (device restart, event-socket "
+                "reconnect, or the Refresh Stream URLs action)."
+            )
 
     def _stream_urls_exposed(self, dev):
         expose = dev.pluginProps.get("exposeStreamUrls", False)

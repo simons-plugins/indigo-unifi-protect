@@ -1808,6 +1808,340 @@ def test_validate_action_config_ui_video_mode_selected_accepted(fake_indigo):
     result = plug.validateActionConfigUi({"videoMode": "sport"}, "setVideoMode", 1001)
 
     assert result[0] is True
+
+
+# ---------------------------------------------------------------------
+# Issues #19/#21: PTZ goto/patrol-start/patrol-stop and the alarm-manager
+# webhook. SPEC-DERIVED, UNVERIFIED against the reference rig (no PTZ
+# camera, no Alarm Manager alarms configured).
+#
+# Unlike setStatusLed/etc, these do NOT go through _resolve_camera/
+# _patch_camera -- there is no camera object to gate on or refresh
+# afterwards (the API offers no PTZ capability flag and no position
+# readback at all). The precheck is the cheaper cameraId+api shape,
+# mirroring setChimeVolume. The question, per workspace convention: when
+# could this look successful and be wrong?
+# ---------------------------------------------------------------------
+
+class _RaisesIfTouchedPTZ:
+    """Fatal-collaborator form for the PTZ/webhook actions -- proves a
+    validation/precheck failure runs BEFORE any request."""
+
+    def ptz_goto(self, camera_id, slot):
+        raise AssertionError(f"ptz_goto must not be called (camera_id={camera_id!r}, slot={slot!r})")
+
+    def ptz_patrol_start(self, camera_id, slot):
+        raise AssertionError(
+            f"ptz_patrol_start must not be called (camera_id={camera_id!r}, slot={slot!r})")
+
+    def ptz_patrol_stop(self, camera_id):
+        raise AssertionError(f"ptz_patrol_stop must not be called (camera_id={camera_id!r})")
+
+    def send_alarm_webhook(self, trigger_id):
+        raise AssertionError(f"send_alarm_webhook must not be called (trigger_id={trigger_id!r})")
+
+
+class _RecordingPTZAPI:
+    def __init__(self):
+        self.goto_calls = []
+        self.patrol_start_calls = []
+        self.patrol_stop_calls = []
+        self.webhook_calls = []
+
+    def ptz_goto(self, camera_id, slot):
+        self.goto_calls.append((camera_id, slot))
+
+    def ptz_patrol_start(self, camera_id, slot):
+        self.patrol_start_calls.append((camera_id, slot))
+
+    def ptz_patrol_stop(self, camera_id):
+        self.patrol_stop_calls.append(camera_id)
+
+    def send_alarm_webhook(self, trigger_id):
+        self.webhook_calls.append(trigger_id)
+
+
+def _ptz_plugin(fake_indigo, api=None):
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = add_camera_device(fake_indigo, plug)
+    plug._last_rest_call = 0.0
+    plug.api = api if api is not None else _RecordingPTZAPI()
+    return plug, dev
+
+
+def test_ptz_goto_preset_missing_camera_id_does_not_touch_api(fake_indigo, caplog):
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    from conftest import _FakeDevice
+    dev = _FakeDevice(1001, name="Patio", plugin_props={})
+    fake_indigo.devices.add(dev)
+    plug.api = _RaisesIfTouchedPTZ()
+
+    with caplog.at_level("ERROR"):
+        plug.ptzGotoPreset(SimpleNamespace(props={"slot": "0"}), dev)
+
+    assert any("no camera selected" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_ptz_goto_preset_unconfigured_api_does_not_touch_api(fake_indigo, caplog):
+    plug, dev = _ptz_plugin(fake_indigo, api=None)
+    plug.api = None
+
+    with caplog.at_level("ERROR"):
+        plug.ptzGotoPreset(SimpleNamespace(props={"slot": "0"}), dev)
+
+    assert any("not configured" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_ptz_goto_preset_invalid_slot_does_not_touch_api(fake_indigo, caplog):
+    """A scripter can call executeAction() directly with any value --
+    proves the enum check runs before the request even for a slot the
+    dialog itself could never produce."""
+    plug, dev = _ptz_plugin(fake_indigo, api=_RaisesIfTouchedPTZ())
+
+    with caplog.at_level("ERROR"):
+        plug.ptzGotoPreset(SimpleNamespace(props={"slot": "9"}), dev)
+
+    assert any("invalid slot" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_ptz_goto_preset_success_logs_one_info(fake_indigo, caplog):
+    plug, dev = _ptz_plugin(fake_indigo)
+
+    with caplog.at_level("INFO"):
+        plug.ptzGotoPreset(SimpleNamespace(props={"slot": "2"}), dev)
+
+    assert plug.api.goto_calls == [("cam-1", 2)]
+    infos = [r for r in caplog.records if r.levelname == "INFO"
+             and "PTZ: Go To Preset" in r.getMessage()]
+    assert len(infos) == 1
+    assert "2" in infos[0].getMessage()
+
+
+def test_ptz_goto_preset_api_error_logs_one_error_and_does_not_raise(fake_indigo, caplog):
+    class RaisingAPI:
+        def ptz_goto(self, camera_id, slot):
+            raise ProtectAPIError("HTTP 400 for /ptz/goto/0", status=400,
+                                   body='{"error":"camera has no PTZ"}')
+
+    plug, dev = _ptz_plugin(fake_indigo, api=RaisingAPI())
+
+    with caplog.at_level("ERROR"):
+        plug.ptzGotoPreset(SimpleNamespace(props={"slot": "0"}), dev)   # must not raise
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "camera has no PTZ" in errors[0].getMessage()
+
+
+def test_ptz_patrol_start_success_logs_one_info(fake_indigo, caplog):
+    plug, dev = _ptz_plugin(fake_indigo)
+
+    with caplog.at_level("INFO"):
+        plug.ptzPatrolStart(SimpleNamespace(props={"slot": "4"}), dev)
+
+    assert plug.api.patrol_start_calls == [("cam-1", 4)]
+    assert any("PTZ: Start Patrol" in r.getMessage() for r in caplog.records
+               if r.levelname == "INFO")
+
+
+def test_ptz_patrol_start_invalid_slot_does_not_touch_api(fake_indigo, caplog):
+    plug, dev = _ptz_plugin(fake_indigo, api=_RaisesIfTouchedPTZ())
+
+    with caplog.at_level("ERROR"):
+        plug.ptzPatrolStart(SimpleNamespace(props={"slot": "bogus"}), dev)
+
+    assert any("invalid slot" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_ptz_patrol_start_missing_camera_id_does_not_touch_api(fake_indigo, caplog):
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    from conftest import _FakeDevice
+    dev = _FakeDevice(1001, name="Patio", plugin_props={})
+    fake_indigo.devices.add(dev)
+    plug.api = _RaisesIfTouchedPTZ()
+
+    with caplog.at_level("ERROR"):
+        plug.ptzPatrolStart(SimpleNamespace(props={"slot": "0"}), dev)
+
+    assert any("no camera selected" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_ptz_patrol_start_api_error_logs_one_error(fake_indigo, caplog):
+    class RaisingAPI:
+        def ptz_patrol_start(self, camera_id, slot):
+            raise ProtectAPIError("HTTP 500 for /ptz/patrol/start/0", status=500)
+
+    plug, dev = _ptz_plugin(fake_indigo, api=RaisingAPI())
+
+    with caplog.at_level("ERROR"):
+        plug.ptzPatrolStart(SimpleNamespace(props={"slot": "0"}), dev)   # must not raise
+
+    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
+
+
+def test_ptz_patrol_stop_success_logs_one_info(fake_indigo, caplog):
+    plug, dev = _ptz_plugin(fake_indigo)
+
+    with caplog.at_level("INFO"):
+        plug.ptzPatrolStop(SimpleNamespace(props={}), dev)
+
+    assert plug.api.patrol_stop_calls == ["cam-1"]
+    assert any("PTZ: Stop Patrol" in r.getMessage() for r in caplog.records
+               if r.levelname == "INFO")
+
+
+def test_ptz_patrol_stop_missing_camera_id_does_not_touch_api(fake_indigo, caplog):
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    from conftest import _FakeDevice
+    dev = _FakeDevice(1001, name="Patio", plugin_props={})
+    fake_indigo.devices.add(dev)
+    plug.api = _RaisesIfTouchedPTZ()
+
+    with caplog.at_level("ERROR"):
+        plug.ptzPatrolStop(SimpleNamespace(props={}), dev)
+
+    assert any("no camera selected" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_ptz_patrol_stop_unconfigured_api_does_not_touch_api(fake_indigo, caplog):
+    plug, dev = _ptz_plugin(fake_indigo)
+    plug.api = None
+
+    with caplog.at_level("ERROR"):
+        plug.ptzPatrolStop(SimpleNamespace(props={}), dev)
+
+    assert any("not configured" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_ptz_patrol_stop_api_error_logs_one_error(fake_indigo, caplog):
+    class RaisingAPI:
+        def ptz_patrol_stop(self, camera_id):
+            raise ProtectAPIError("connection failure", status=None)
+
+    plug, dev = _ptz_plugin(fake_indigo, api=RaisingAPI())
+
+    with caplog.at_level("ERROR"):
+        plug.ptzPatrolStop(SimpleNamespace(props={}), dev)   # must not raise
+
+    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
+
+
+def test_trigger_alarm_webhook_unconfigured_api_does_not_touch_api(fake_indigo, caplog):
+    plug = make_plugin({})
+    plug.api = None
+
+    with caplog.at_level("ERROR"):
+        plug.triggerAlarmWebhook(SimpleNamespace(props={"webhookId": "trig-1"}))
+
+    assert any("not configured" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_trigger_alarm_webhook_applies_substitution(fake_indigo, monkeypatch):
+    """The webhookId field must go through self.substitute() so an Indigo
+    variable reference (%%v:12345%%) resolves before it hits the network."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    api = _RecordingPTZAPI()
+    plug.api = api
+    plug._last_rest_call = 0.0
+    monkeypatch.setattr(plug, "substitute", lambda raw: raw.replace("%%v:1%%", "resolved-id"))
+
+    plug.triggerAlarmWebhook(SimpleNamespace(props={"webhookId": "%%v:1%%"}))
+
+    assert api.webhook_calls == ["resolved-id"]
+
+
+def test_trigger_alarm_webhook_empty_after_substitution_sends_no_request(fake_indigo, caplog,
+                                                                          monkeypatch):
+    """A variable that resolves to empty (or whitespace) must be caught
+    AFTER substitution, not just checked against the raw (pre-substitution)
+    text -- proven with a fatal-collaborator API."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    plug.api = _RaisesIfTouchedPTZ()
+    monkeypatch.setattr(plug, "substitute", lambda raw: "   ")
+
+    with caplog.at_level("ERROR"):
+        plug.triggerAlarmWebhook(SimpleNamespace(props={"webhookId": "%%v:1%%"}))
+
+    assert any("empty" in r.getMessage().lower() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_trigger_alarm_webhook_success_logs_one_info(fake_indigo, caplog):
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    api = _RecordingPTZAPI()
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("INFO"):
+        plug.triggerAlarmWebhook(SimpleNamespace(props={"webhookId": "trig-1"}))
+
+    assert api.webhook_calls == ["trig-1"]
+    infos = [r for r in caplog.records if r.levelname == "INFO"
+             and "Trigger Alarm Manager Webhook" in r.getMessage()]
+    assert len(infos) == 1
+
+
+def test_trigger_alarm_webhook_api_error_logs_one_error_and_does_not_raise(fake_indigo, caplog):
+    class RaisingAPI:
+        def send_alarm_webhook(self, trigger_id):
+            raise ProtectAPIError("HTTP 400 for /alarm-manager/webhook/trig-1", status=400,
+                                   body='{"error":"idRequiredError"}')
+
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    plug.api = RaisingAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("ERROR"):
+        plug.triggerAlarmWebhook(SimpleNamespace(props={"webhookId": "trig-1"}))   # must not raise
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "idRequiredError" in errors[0].getMessage()
+
+
+def test_validate_action_config_ui_ptz_slot_rejected_when_missing(fake_indigo):
+    plug = make_plugin({})
+
+    valid, _values, errors = plug.validateActionConfigUi({}, "ptzGotoPreset", 1001)
+
+    assert valid is False
+    assert "slot" in errors
+
+
+def test_validate_action_config_ui_ptz_slot_accepted(fake_indigo):
+    plug = make_plugin({})
+
+    result = plug.validateActionConfigUi({"slot": "3"}, "ptzPatrolStart", 1001)
+
+    assert result[0] is True
+
+
+def test_validate_action_config_ui_webhook_id_rejected_when_blank(fake_indigo):
+    plug = make_plugin({})
+
+    valid, _values, errors = plug.validateActionConfigUi(
+        {"webhookId": "   "}, "triggerAlarmWebhook", 0)
+
+    assert valid is False
+    assert "webhookId" in errors
+
+
+def test_validate_action_config_ui_webhook_id_accepted(fake_indigo):
+    plug = make_plugin({})
+
+    result = plug.validateActionConfigUi({"webhookId": "trig-1"}, "triggerAlarmWebhook", 0)
+
+    assert result[0] is True
+
+
 # ---------------------------------------------------------------------
 # Issue #7: RTSPS stream URLs.
 #
@@ -2392,6 +2726,236 @@ def test_open_socket_primes_but_never_fetches_stream_urls(fake_indigo, monkeypat
     plug._open_socket()   # must not raise
 
     assert dev.id in plug._stream_refresh_pending, "opted-in device must be queued, not fetched"
+
+
+# ---------------------------------------------------------------------
+# Issue #25: deleteStreamUrls. Streams are NEVER deleted automatically
+# anywhere else in this plugin -- this action is the only path that
+# removes one. The question, per workspace convention: when could a
+# partial failure look like everything succeeded, or a delete silently
+# leave a stale state behind?
+# ---------------------------------------------------------------------
+
+class _RaisesIfTouchedDelete:
+    def delete_rtsps_stream(self, camera_id, quality):
+        raise AssertionError(
+            f"delete_rtsps_stream must not be called (camera_id={camera_id!r}, "
+            f"quality={quality!r})")
+
+
+class _RecordingDeleteAPI:
+    """Records every delete_rtsps_stream call. `fail_qualities` maps a
+    quality to the ProtectAPIError it should raise instead of succeeding."""
+
+    def __init__(self, fail_qualities=None):
+        self.calls = []
+        self._fail = fail_qualities or {}
+
+    def delete_rtsps_stream(self, camera_id, quality):
+        self.calls.append((camera_id, quality))
+        if quality in self._fail:
+            raise self._fail[quality]
+
+
+def _delete_stream_device(fake_indigo, plug, exposed=False, dev_id=1001, camera_id="cam-1"):
+    from conftest import _FakeDevice
+    props = {"cameraId": camera_id, "exposeStreamUrls": exposed}
+    dev = _FakeDevice(dev_id, name="Patio", plugin_props=props)
+    fake_indigo.devices.add(dev)
+    for key in plugin_module.STREAM_URL_STATES.values():
+        dev.states[key] = "rtsps://192.0.2.1:7441/stale-token?enableSrtp"
+    return dev
+
+
+def test_delete_stream_urls_missing_camera_id_does_not_touch_api(fake_indigo, caplog):
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    from conftest import _FakeDevice
+    dev = _FakeDevice(1001, name="Patio", plugin_props={})
+    fake_indigo.devices.add(dev)
+    plug.api = _RaisesIfTouchedDelete()
+
+    with caplog.at_level("ERROR"):
+        plug.deleteStreamUrls(SimpleNamespace(props={"high": True}), dev)
+
+    assert any("no camera selected" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_delete_stream_urls_unconfigured_api_does_not_touch_api(fake_indigo, caplog):
+    plug = make_plugin({})
+    dev = _delete_stream_device(fake_indigo, plug)
+    plug.api = None
+
+    with caplog.at_level("ERROR"):
+        plug.deleteStreamUrls(SimpleNamespace(props={"high": True}), dev)
+
+    assert any("not configured" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+@pytest.mark.parametrize("props", [
+    {},
+    {"high": False, "medium": False, "low": False, "package": False},
+    {"high": "false", "medium": "False"},
+])
+def test_delete_stream_urls_nothing_selected_does_not_touch_api(fake_indigo, caplog, props):
+    """String 'false' checkboxes (an Indigo quirk) must be treated as
+    unticked, not truthy -- proven with a fatal-collaborator API."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = _delete_stream_device(fake_indigo, plug)
+    plug.api = _RaisesIfTouchedDelete()
+
+    with caplog.at_level("ERROR"):
+        plug.deleteStreamUrls(SimpleNamespace(props=props), dev)
+
+    assert any("no qualities selected" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_delete_stream_urls_only_ticked_qualities_are_deleted(fake_indigo):
+    """Only high and low are ticked -- medium/package must never be
+    touched, and their stored states must be left exactly as they were."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = _delete_stream_device(fake_indigo, plug)
+    api = _RecordingDeleteAPI()
+    plug.api = api
+    plug._last_rest_call = 0.0
+    stale_medium = dev.states["streamUrlMedium"]
+    stale_package = dev.states["streamUrlPackage"]
+
+    plug.deleteStreamUrls(
+        SimpleNamespace(props={"high": True, "medium": False, "low": True, "package": False}), dev)
+
+    assert sorted(api.calls) == [("cam-1", "high"), ("cam-1", "low")]
+    assert dev.states["streamUrlHigh"] == ""
+    assert dev.states["streamUrlLow"] == ""
+    assert dev.states["streamUrlMedium"] == stale_medium, "untouched quality must not be cleared"
+    assert dev.states["streamUrlPackage"] == stale_package, "untouched quality must not be cleared"
+
+
+def test_delete_stream_urls_one_failure_does_not_skip_the_rest(fake_indigo, caplog):
+    """A failed quality must not abort the loop -- the remaining selected
+    qualities must still be attempted and, on success, cleared."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = _delete_stream_device(fake_indigo, plug)
+    api = _RecordingDeleteAPI(fail_qualities={
+        "medium": ProtectAPIError("HTTP 500 for /rtsps-stream", status=500)})
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("ERROR"):
+        plug.deleteStreamUrls(
+            SimpleNamespace(props={"high": True, "medium": True, "low": True}), dev)
+
+    assert sorted(api.calls) == [("cam-1", "high"), ("cam-1", "low"), ("cam-1", "medium")]
+    assert dev.states["streamUrlHigh"] == "", "high succeeded and must be cleared"
+    assert dev.states["streamUrlLow"] == "", "low succeeded and must be cleared"
+    assert dev.states["streamUrlMedium"] != "", "the failed quality's state must be left alone"
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "medium" in errors[0].getMessage()
+
+
+def test_delete_stream_urls_not_found_is_treated_as_already_gone(fake_indigo, caplog):
+    """A 404 means the stream is already gone -- that is the outcome this
+    action wants, not a failure. Must still clear the state and must NOT
+    log an ERROR for it."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = _delete_stream_device(fake_indigo, plug)
+    api = _RecordingDeleteAPI(fail_qualities={
+        "package": ProtectAPIError("HTTP 404 for /rtsps-stream", status=404)})
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("INFO"):
+        plug.deleteStreamUrls(SimpleNamespace(props={"package": True}), dev)
+
+    assert dev.states["streamUrlPackage"] == "", "not_found must still clear the state"
+    assert not any(r.levelname == "ERROR" for r in caplog.records), (
+        "an already-gone stream is not a failure -- it must not be an ERROR"
+    )
+
+
+def test_delete_stream_urls_success_logs_one_summary_info(fake_indigo, caplog):
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = _delete_stream_device(fake_indigo, plug)
+    plug.api = _RecordingDeleteAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("INFO"):
+        plug.deleteStreamUrls(SimpleNamespace(props={"high": True, "low": True}), dev)
+
+    summary_infos = [r for r in caplog.records if r.levelname == "INFO"
+                      and "Delete Stream URLs ->" in r.getMessage()]
+    assert len(summary_infos) == 1
+    assert "high" in summary_infos[0].getMessage()
+    assert "low" in summary_infos[0].getMessage()
+
+
+def test_delete_stream_urls_expose_still_on_warns_of_recreation(fake_indigo, caplog):
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = _delete_stream_device(fake_indigo, plug, exposed=True)
+    plug.api = _RecordingDeleteAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("WARNING"):
+        plug.deleteStreamUrls(SimpleNamespace(props={"high": True}), dev)
+
+    assert any("recreate" in r.getMessage() for r in caplog.records
+               if r.levelname == "WARNING")
+
+
+def test_delete_stream_urls_expose_off_does_not_warn_of_recreation(fake_indigo, caplog):
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = _delete_stream_device(fake_indigo, plug, exposed=False)
+    plug.api = _RecordingDeleteAPI()
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("WARNING"):
+        plug.deleteStreamUrls(SimpleNamespace(props={"high": True}), dev)
+
+    assert not any("recreate" in r.getMessage() for r in caplog.records
+                   if r.levelname == "WARNING")
+
+
+def test_delete_stream_urls_all_failed_does_not_warn_of_recreation(fake_indigo, caplog):
+    """Nothing was actually deleted -- there is nothing to recreate, so the
+    warning must not fire even though exposure is on."""
+    plug = make_plugin({"host": "h", "apiKey": "k"})
+    dev = _delete_stream_device(fake_indigo, plug, exposed=True)
+    api = _RecordingDeleteAPI(fail_qualities={
+        "high": ProtectAPIError("HTTP 500 for /rtsps-stream", status=500)})
+    plug.api = api
+    plug._last_rest_call = 0.0
+
+    with caplog.at_level("WARNING"):
+        plug.deleteStreamUrls(SimpleNamespace(props={"high": True}), dev)
+
+    assert not any(r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_validate_action_config_ui_delete_stream_urls_rejected_when_none_selected(fake_indigo):
+    plug = make_plugin({})
+
+    valid, _values, errors = plug.validateActionConfigUi(
+        {"high": False, "medium": "false", "low": False, "package": False},
+        "deleteStreamUrls", 1001)
+
+    assert valid is False
+    assert "high" in errors
+
+
+def test_validate_action_config_ui_delete_stream_urls_accepted_when_one_selected(fake_indigo):
+    plug = make_plugin({})
+
+    result = plug.validateActionConfigUi(
+        {"high": True, "medium": False, "low": False, "package": False},
+        "deleteStreamUrls", 1001)
+
+    assert result[0] is True
+
+
+# ---------------------------------------------------------------------
 # Issue #8: sensors/lights/chimes/NVR.
 #
 # Spec-derived (OpenAPI v6.2.83) -- UNVERIFIED against real hardware, the

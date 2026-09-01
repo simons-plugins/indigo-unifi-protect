@@ -158,6 +158,15 @@ class _FakePluginBase:
     def debugLog(self, msg):
         self.logger.debug(msg)
 
+    def substitute(self, value, validateOnly=False):
+        """Stand-in for indigo.PluginBase.substitute -- identity by
+        default (no %%v:id%%/%%d:id%% patterns are recognized here). Tests
+        that need real substitution behavior monkeypatch this method
+        directly on the plugin instance."""
+        if validateOnly:
+            return True, value
+        return value
+
 
 class _StateImageSel:
     MotionSensor = "MotionSensor"
