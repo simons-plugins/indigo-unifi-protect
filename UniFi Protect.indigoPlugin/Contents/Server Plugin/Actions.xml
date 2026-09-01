@@ -102,14 +102,99 @@
         </ConfigUI>
     </Action>
 
+    <Action id="ptzGotoPreset" deviceFilter="self.protectCamera" uiPath="DeviceActions">
+        <Name>PTZ: Go To Preset</Name>
+        <CallbackMethod>ptzGotoPreset</CallbackMethod>
+        <ConfigUI>
+            <Field id="slot" type="menu" defaultValue="0">
+                <Label>Preset:</Label>
+                <List>
+                    <Option value="0">Preset 1 (slot 0)</Option>
+                    <Option value="1">Preset 2 (slot 1)</Option>
+                    <Option value="2">Preset 3 (slot 2)</Option>
+                    <Option value="3">Preset 4 (slot 3)</Option>
+                    <Option value="4">Preset 5 (slot 4)</Option>
+                    <Option value="5">Preset 6 (slot 5)</Option>
+                    <Option value="6">Preset 7 (slot 6)</Option>
+                    <Option value="7">Preset 8 (slot 7)</Option>
+                    <Option value="8">Preset 9 (slot 8)</Option>
+                    <Option value="9">Preset 10 (slot 9)</Option>
+                </List>
+            </Field>
+            <Field id="ptzHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+                <Label>Protect's own UI numbers presets starting at 1, hence the offset above. The API spec's prose says "slot 0-4" but its own examples for this endpoint reach 9, so this menu offers slots 0-9; a slot the camera hasn't got is refused by the controller, not by this dialog. Fire-and-forget: the API offers no position readback.</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="ptzPatrolStart" deviceFilter="self.protectCamera" uiPath="DeviceActions">
+        <Name>PTZ: Start Patrol</Name>
+        <CallbackMethod>ptzPatrolStart</CallbackMethod>
+        <ConfigUI>
+            <Field id="slot" type="menu" defaultValue="0">
+                <Label>Patrol:</Label>
+                <List>
+                    <Option value="0">Patrol 1 (slot 0)</Option>
+                    <Option value="1">Patrol 2 (slot 1)</Option>
+                    <Option value="2">Patrol 3 (slot 2)</Option>
+                    <Option value="3">Patrol 4 (slot 3)</Option>
+                    <Option value="4">Patrol 5 (slot 4)</Option>
+                </List>
+            </Field>
+            <Field id="ptzHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+                <Label>Protect's own UI numbers patrols 1-5; the API slot is 0-4, hence the offset above. Fire-and-forget: the API offers no position readback. On a non-PTZ camera the controller refuses the command.</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="ptzPatrolStop" deviceFilter="self.protectCamera" uiPath="DeviceActions">
+        <Name>PTZ: Stop Patrol</Name>
+        <CallbackMethod>ptzPatrolStop</CallbackMethod>
+    </Action>
+
     <Action id="refreshCameras">
         <Name>Refresh Cameras</Name>
         <CallbackMethod>refreshCameras</CallbackMethod>
     </Action>
 
+    <Action id="triggerAlarmWebhook">
+        <Name>Trigger Alarm Manager Webhook</Name>
+        <CallbackMethod>triggerAlarmWebhook</CallbackMethod>
+        <ConfigUI>
+            <Field id="webhookId" type="textfield">
+                <Label>Webhook trigger ID:</Label>
+            </Field>
+            <Field id="webhookHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+                <Label>The Alarm Manager alarm's trigger ID (Protect > Alarm Manager > alarm > Webhook trigger). Indigo variable substitution (%%v:12345%%) is supported.</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
     <Action id="refreshStreamUrls" deviceFilter="self.protectCamera" uiPath="DeviceActions">
         <Name>Refresh Stream URLs</Name>
         <CallbackMethod>refreshStreamUrls</CallbackMethod>
+    </Action>
+
+    <Action id="deleteStreamUrls" deviceFilter="self.protectCamera" uiPath="DeviceActions">
+        <Name>Delete Stream URLs</Name>
+        <CallbackMethod>deleteStreamUrls</CallbackMethod>
+        <ConfigUI>
+            <Field id="high" type="checkbox" defaultValue="false">
+                <Label>High:</Label>
+            </Field>
+            <Field id="medium" type="checkbox" defaultValue="false">
+                <Label>Medium:</Label>
+            </Field>
+            <Field id="low" type="checkbox" defaultValue="false">
+                <Label>Low:</Label>
+            </Field>
+            <Field id="package" type="checkbox" defaultValue="false">
+                <Label>Package:</Label>
+            </Field>
+            <Field id="deleteStreamHelp" type="label" fontSize="small" fontColor="darkgray" alignWithControl="true">
+                <Label>Removes the selected RTSPS streams on the controller. Anything else using those URLs (HomeKit, Scrypted, a viewer) will lose them. Streams are never deleted automatically.</Label>
+            </Field>
+        </ConfigUI>
     </Action>
 
     <Action id="setLightLevel" deviceFilter="self.protectLight" uiPath="DeviceActions">

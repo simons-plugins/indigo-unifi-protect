@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from protect_api import ProtectAPI, ProtectAPIError, _assert_no_secret
+from protect_api import ProtectAPI, ProtectAPIError, RTSPS_QUALITIES, _assert_no_secret
 
 FIXTURES = Path(__file__).parent / "fixtures"
 HOST = "192.0.2.1"  # TEST-NET-1 (RFC 5737) -- never a real address
@@ -603,6 +603,284 @@ def test_fake_api_key_never_appears_in_create_rtsps_streams_exception(monkeypatc
     assert FAKE_KEY not in exc.body
     assert FAKE_KEY not in exc.url
     assert FAKE_KEY not in repr(exc)
+
+
+# ---------------------------------------------------------------------
+# Issues #19/#21/#25: PTZ goto/patrol, the alarm-manager webhook, and the
+# single-quality RTSPS DELETE.
+#
+# All five are SPEC-DERIVED, UNVERIFIED against the reference rig (no PTZ
+# camera, no Alarm Manager alarms configured). Every one of them declares
+# 204 No Content on success, so the questions here are not "does it parse
+# the response?" (there IS nothing to parse) but:
+#
+# - "does a stray non-empty 204 body get mistaken for a parse failure?"
+# - "does the slot/quality/webhook-id validation actually run BEFORE any
+#   network call, or could a bad value still reach the controller?"
+# - "does a user-typed webhook id with '/' or spaces survive as one path
+#   segment, or does it get split/mangled?"
+# ---------------------------------------------------------------------
+
+def _raise_if_touched():
+    """A urlopen mock that fails the test if ever called -- proves a
+    validation error was raised BEFORE any network attempt."""
+    return MagicMock(side_effect=AssertionError("urlopen must not be called"))
+
+
+def test_ptz_goto_sends_post_to_slot_path(monkeypatch):
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b""))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    assert api.ptz_goto("cam1", 2) is None
+
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "POST"
+    assert request.full_url.endswith("/cameras/cam1/ptz/goto/2")
+    assert request.data is None
+
+
+def test_ptz_goto_stray_response_body_is_discarded(monkeypatch):
+    """A 204 is documented, but nothing here should choke if the server
+    sends a body anyway -- it must never be parsed."""
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(b"not json {{{")))
+
+    api = make_api()
+    assert api.ptz_goto("cam1", 0) is None
+
+
+def test_ptz_goto_error_response_raises_with_kind(monkeypatch):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(side_effect=http_error(404, body=b'{"error":"not found"}')))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.ptz_goto("cam1", 0)
+
+    assert excinfo.value.kind == "not_found"
+
+
+@pytest.mark.parametrize("bad_slot", [-1, 10, "2", True, 2.0])
+def test_ptz_goto_bad_slot_raises_value_error_before_any_http_call(monkeypatch, bad_slot):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", _raise_if_touched())
+
+    api = make_api()
+    with pytest.raises(ValueError):
+        api.ptz_goto("cam1", bad_slot)
+
+
+def test_ptz_goto_accepts_slot_9(monkeypatch):
+    """The spec's own OpenAPI `examples` for this endpoint reach 9
+    (["-1","0","2","8","9"]), contradicting its prose ("slot 0-4") -- goto
+    accepts the wider range since a slot the camera doesn't have is
+    refused by the controller, not by this client."""
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b""))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    assert api.ptz_goto("cam1", 9) is None
+
+    request = mock_urlopen.call_args[0][0]
+    assert request.full_url.endswith("/cameras/cam1/ptz/goto/9")
+
+
+def test_ptz_patrol_start_sends_post_to_slot_path(monkeypatch):
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b""))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    assert api.ptz_patrol_start("cam1", 4) is None
+
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "POST"
+    assert request.full_url.endswith("/cameras/cam1/ptz/patrol/start/4")
+
+
+def test_ptz_patrol_start_stray_response_body_is_discarded(monkeypatch):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(b"unexpected junk")))
+
+    api = make_api()
+    assert api.ptz_patrol_start("cam1", 0) is None
+
+
+def test_ptz_patrol_start_error_response_raises_with_kind(monkeypatch):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(side_effect=http_error(400, body=b'{"error":"bad slot"}')))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.ptz_patrol_start("cam1", 0)
+
+    assert excinfo.value.kind == "bad_request"
+
+
+@pytest.mark.parametrize("bad_slot", [-1, 5, "2", True, 2.0])
+def test_ptz_patrol_start_bad_slot_raises_value_error_before_any_http_call(
+        monkeypatch, bad_slot):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", _raise_if_touched())
+
+    api = make_api()
+    with pytest.raises(ValueError):
+        api.ptz_patrol_start("cam1", bad_slot)
+
+
+def test_ptz_patrol_stop_sends_post_no_slot(monkeypatch):
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b""))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    assert api.ptz_patrol_stop("cam1") is None
+
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "POST"
+    assert request.full_url.endswith("/cameras/cam1/ptz/patrol/stop")
+
+
+def test_ptz_patrol_stop_error_response_raises(monkeypatch):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(side_effect=http_error(500, body=b"boom")))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.ptz_patrol_stop("cam1")
+
+    assert excinfo.value.kind == "server"
+
+
+def test_send_alarm_webhook_sends_post_to_encoded_path(monkeypatch):
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b""))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    assert api.send_alarm_webhook("AnyRandomString") is None
+
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "POST"
+    assert request.full_url.endswith("/alarm-manager/webhook/AnyRandomString")
+
+
+def test_send_alarm_webhook_encodes_slash_and_space(monkeypatch):
+    """A user-typed trigger id containing '/' or a space must survive as ONE
+    path segment, not be split into extra segments or sent unescaped."""
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b""))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    api.send_alarm_webhook("front door/alarm 1")
+
+    request = mock_urlopen.call_args[0][0]
+    assert request.full_url.endswith("/alarm-manager/webhook/front%20door%2Falarm%201")
+    assert "front door/alarm 1" not in request.full_url
+
+
+def test_send_alarm_webhook_stray_response_body_is_discarded(monkeypatch):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(b"junk")))
+
+    api = make_api()
+    assert api.send_alarm_webhook("trigger-1") is None
+
+
+def test_send_alarm_webhook_error_response_raises_with_kind(monkeypatch):
+    """400 idRequiredError per the spec -- but any non-2xx must surface as
+    ProtectAPIError, not an unhandled HTTPError."""
+    monkeypatch.setattr(
+        "protect_api.urllib.request.urlopen",
+        MagicMock(side_effect=http_error(400, body=b'{"error":"idRequiredError"}')))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.send_alarm_webhook("trigger-1")
+
+    assert excinfo.value.kind == "bad_request"
+
+
+@pytest.mark.parametrize("bad_id", ["", "   ", None, 5])
+def test_send_alarm_webhook_bad_id_raises_value_error_before_any_http_call(
+        monkeypatch, bad_id):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", _raise_if_touched())
+
+    api = make_api()
+    with pytest.raises(ValueError):
+        api.send_alarm_webhook(bad_id)
+
+
+def test_delete_rtsps_stream_sends_delete_with_single_qualities_param(monkeypatch):
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b""))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    assert api.delete_rtsps_stream("cam1", "high") is None
+
+    request = mock_urlopen.call_args[0][0]
+    assert request.get_method() == "DELETE"
+    assert request.full_url == "https://192.0.2.1/proxy/protect/integration/v1" \
+        "/cameras/cam1/rtsps-stream?qualities=high"
+
+
+def test_delete_rtsps_stream_stray_response_body_is_discarded(monkeypatch):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(return_value=_FakeResponse(b"not json {{{")))
+
+    api = make_api()
+    assert api.delete_rtsps_stream("cam1", "package") is None
+
+
+def test_delete_rtsps_stream_error_response_body_is_never_propagated(monkeypatch):
+    """Same redaction as get/create_rtsps_streams -- this endpoint family
+    can echo a stream URL/token back in an error body."""
+    leaking_body = b'{"error":"rtsps://192.0.2.1:7441/SECRETTOKEN?enableSrtp"}'
+    monkeypatch.setattr("protect_api.urllib.request.urlopen",
+                         MagicMock(side_effect=http_error(500, body=leaking_body)))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.delete_rtsps_stream("cam1", "high")
+
+    exc = excinfo.value
+    assert exc.body == ""
+    assert exc.kind == "server"
+    assert "SECRETTOKEN" not in str(exc)
+    assert "SECRETTOKEN" not in repr(exc)
+
+
+def test_delete_rtsps_stream_not_found_kind_preserved_after_redaction(monkeypatch):
+    monkeypatch.setattr(
+        "protect_api.urllib.request.urlopen",
+        MagicMock(side_effect=http_error(404, body=b'{"error":"Entity not found"}')))
+
+    api = make_api()
+    with pytest.raises(ProtectAPIError) as excinfo:
+        api.delete_rtsps_stream("cam1", "low")
+
+    assert excinfo.value.kind == "not_found"
+    assert excinfo.value.body == ""
+
+
+@pytest.mark.parametrize("bad_quality", ["High", "all", "", None, 1])
+def test_delete_rtsps_stream_bad_quality_raises_value_error_before_any_http_call(
+        monkeypatch, bad_quality):
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", _raise_if_touched())
+
+    api = make_api()
+    with pytest.raises(ValueError):
+        api.delete_rtsps_stream("cam1", bad_quality)
+
+
+@pytest.mark.parametrize("quality", RTSPS_QUALITIES)
+def test_delete_rtsps_stream_every_rtsps_quality_reaches_urlopen(monkeypatch, quality):
+    """Pins RTSPS_QUALITIES as the single source of truth for what
+    delete_rtsps_stream accepts -- every value in the tuple must pass its
+    own validation, not just the four hardcoded literals a hand-written
+    test would happen to pick."""
+    mock_urlopen = MagicMock(return_value=_FakeResponse(b""))
+    monkeypatch.setattr("protect_api.urllib.request.urlopen", mock_urlopen)
+
+    api = make_api()
+    assert api.delete_rtsps_stream("cam1", quality) is None
+    assert mock_urlopen.called
 
 
 # ---------------------------------------------------------------------

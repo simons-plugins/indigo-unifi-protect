@@ -254,6 +254,54 @@ class ProtectAPI:
     def get_meta_info(self) -> dict:
         """GET /meta/info -> {'applicationVersion': '7.2.105'}.
         Used as the connectivity check; cheapest authenticated call."""
+
+    def _request_no_content(self, method: str, path: str, params: dict[str, str] | None = None,
+                             body: dict | None = None) -> None:
+        """Shared core for the 204-No-Content endpoints below. Calls
+        `_request` and discards the return value -- any 2xx is success
+        regardless of body content; a stray non-empty body on a declared-204
+        endpoint is never parsed and never a failure."""
+
+    def ptz_goto(self, camera_id: str, slot: int) -> None:
+        """POST /cameras/{id}/ptz/goto/{slot} (issue #19). `slot` is an int
+        0-4 (Protect's own UI numbers the same five presets 1-5); bool is
+        explicitly rejected (`isinstance(True, int)` is True in Python).
+        Raises ValueError before any network call on an invalid slot.
+        204 No Content on success -- fire-and-forget, there is no PTZ
+        position readback anywhere in this API. SPEC-DERIVED, UNVERIFIED --
+        the reference rig has no PTZ camera."""
+
+    def ptz_patrol_start(self, camera_id: str, slot: int) -> None:
+        """POST /cameras/{id}/ptz/patrol/start/{slot} (issue #19). Same
+        slot contract and caveats as `ptz_goto`."""
+
+    def ptz_patrol_stop(self, camera_id: str) -> None:
+        """POST /cameras/{id}/ptz/patrol/stop (issue #19). No slot -- stops
+        whichever patrol is currently running."""
+
+    def send_alarm_webhook(self, trigger_id: str) -> None:
+        """POST /alarm-manager/webhook/{id} (issue #21). `trigger_id` is a
+        user-defined free-form string set up on the controller (Alarm
+        Manager > alarm > Webhook trigger), not a Protect object id --
+        URL-encoded with `urllib.parse.quote(trigger_id, safe="")` since it
+        may contain "/" or spaces. Raises ValueError before any network
+        call if empty/whitespace/non-str. 204 No Content on success.
+        SPEC-DERIVED, UNVERIFIED -- the reference rig has no Alarm Manager
+        alarms configured."""
+
+    def delete_rtsps_stream(self, camera_id: str, quality: str) -> None:
+        """DELETE /cameras/{id}/rtsps-stream?qualities=<quality> (issue
+        #25). ONE quality per call, deliberately -- the spec's `qualities`
+        query param is `anyOf` a single string or an array, but how the
+        array form is expected to be encoded in a query string is
+        undocumented for this server, and the single-string form is
+        unambiguous and already documented, so this never guesses at the
+        other encoding. Raises ValueError before any network call if
+        `quality` isn't one of "high"/"medium"/"low"/"package". Same
+        `_redact_body` treatment as get_rtsps_streams/create_rtsps_streams
+        above on every ProtectAPIError raised -- this endpoint family can
+        echo a stream URL/token back in an error body. 204 No Content on
+        success. SPEC-DERIVED, UNVERIFIED."""
 ```
 
 Use `urllib.request` with an `ssl.SSLContext`. When `verify_ssl` is false set
@@ -1047,6 +1095,149 @@ callbacks re-check defensively (an empty OSD body, an out-of-range mic
 volume, the enum checks described above) because a scripter can call
 `executeAction()` directly and bypass the dialog — and its validation —
 entirely.
+
+### Issue #19/#21/#25 actions
+
+Five more `Actions.xml` entries, following the #6 shape above but NOT
+going through `_resolve_camera`/`_patch_camera` — none of them have a
+camera object to gate capability on or refresh state from afterwards
+(the API has no PTZ capability flag and no position readback at all, and
+the webhook/delete-stream endpoints aren't camera-state writes in the
+`_camera_info_states` sense). The precheck for the device-scoped ones is
+the cheaper `setChimeVolume` shape instead: `cameraId` present in
+`pluginProps`, `self.api` configured — no cached-object lookup.
+
+| Action id | deviceFilter | ConfigUI | PATCH/method |
+|---|---|---|---|
+| `ptzGotoPreset` | `self.protectCamera` | `slot` menu, "0".."9" (labelled Preset 1-10) | `ptz_goto(camera_id, int(slot))` |
+| `ptzPatrolStart` | `self.protectCamera` | `slot` menu, "0".."4" (labelled Patrol 1-5) | `ptz_patrol_start(camera_id, int(slot))` |
+| `ptzPatrolStop` | `self.protectCamera` | none | `ptz_patrol_stop(camera_id)` |
+| `triggerAlarmWebhook` | none (plugin-level, like `refreshCameras`) | `webhookId` textfield | `send_alarm_webhook(self.substitute(webhookId))` |
+| `deleteStreamUrls` | `self.protectCamera` | four checkboxes: `high`/`medium`/`low`/`package` | `delete_rtsps_stream(camera_id, quality)` per ticked quality |
+
+**PTZ slot ranges are NOT symmetric, and this is deliberate, not a typo.**
+The OpenAPI spec's own prose says "slot 0-4" for both `/ptz/goto/{slot}`
+and `/ptz/patrol/start/{slot}`, but its own `examples` for the goto
+endpoint list values up to 9 (`["-1","0","2","8","9"]`), contradicting its
+own prose — while `activePatrolSlotString` (the patrol enum) genuinely is
+a 5-value 0-4 enum with no such contradiction. `protect_api.py` defines
+`PTZ_PRESET_SLOT_MAX = 9` and `PTZ_PATROL_SLOT_MAX = 4`, enforced in
+`ptz_goto`/`ptz_patrol_start` respectively; `plugin.py` derives
+`PTZ_PRESET_SLOTS`/`PTZ_PATROL_SLOTS` (strings) from those two constants
+for its own `Actions.xml` menu and validation, rather than hand-copying a
+second pair of ranges. `ptzGotoPreset`/`ptzPatrolStart`'s `slot` is
+validated in both `validateActionConfigUi` (against the matching tuple,
+via a `typeId -> (slots, message)` lookup) and the callback itself — the
+same double-check as every #6 action, because a scripter can call
+`executeAction()` with any value, including a real `int` rather than the
+dialog's string (`action.props.get("slot")` is normalised to `str(slot)`
+first, excluding `bool` — `isinstance(True, int)` is True in Python and
+would otherwise launder `True` into slot `"1"`). All three PTZ callbacks
+and `deleteStreamUrls` additionally catch `ValueError` around their
+`protect_api` call, belt-and-braces against `RTSPS_DELETE_QUALITIES`/
+`PTZ_*_SLOTS` ever drifting from what `protect_api.py` itself enforces —
+logged as one ERROR, never allowed to escape the callback uncaught.
+
+`triggerAlarmWebhook` validates in two passes, because the real
+`self.substitute()` splices in `""` for a dangling variable/device
+reference rather than raising — so checking the raw `%%...%%` text isn't
+enough, and checking only the post-substitution text can't tell "resolved
+to empty" from "never existed". Both `validateActionConfigUi` and the
+callback itself call `self.substitute(raw, validateOnly=True)` first (an
+`(isValid, errStr)` pair, per the Indigo SDK) and reject/abort on a
+dangling reference before ever substituting for real; only then does the
+callback call `self.substitute(raw)` (wrapped in `try`/`except`, belt-and-
+braces) and apply the existing empty-after-substitution check. A
+non-string `webhookId` (e.g. `123` from a scripter) is rejected before
+either substitute call. The success log names the resolved id:
+`"Trigger Alarm Manager Webhook -> sent (trigger ID 'trig-1')"`.
+
+**A 404 on any of these four is NOT described via `_describe_api_error`'s
+`not_found` wording.** That wording says "reselect it in the device
+settings", which assumes a camera was deselected — wrong for a PTZ 404
+(more likely: non-PTZ camera, unconfigured slot, or missing firmware
+support) and nonsensical for the plugin-level webhook (there is no device
+to reselect at all). All four share `_describe_not_found_for_endpoint(exc,
+hint)`, which renders `f"controller returned 404 ({detail}) - {hint}"`
+with an endpoint-specific `hint`. Every other `ProtectAPIError` kind still
+goes through `_describe_api_error` unchanged. Separately,
+`_describe_api_error`'s own generic fallthrough (an unclassified `kind`,
+e.g. `"http"`) now appends any AJV/`error`-derived `exc.issues` in
+parentheses, the same detail `bad_request` already surfaces.
+
+`deleteStreamUrls` loops over the ticked qualities (`_truthy`-checked,
+same string-`"false"` handling as `exposeStreamUrls`) and calls
+`delete_rtsps_stream` once per quality via `_delete_one_stream_quality`,
+independently — one failing quality must never skip the others. Outcomes
+are tracked in three buckets, and the closing INFO line names all three
+that are non-empty, e.g. `"deleted: high; already gone: package; failed:
+low"`:
+
+- **`not_found`** is genuinely ambiguous — it could mean the STREAM was
+  already gone (fine, that's what the action wants) or the CAMERA itself
+  is gone (a much bigger deal). On the first `not_found` in a call, the
+  camera's presence is checked once (`camera_id in self.camera_info`,
+  refreshing via `_refresh_camera_info()` if not already cached) and
+  cached in a `[checked, present]` pair shared across the remaining
+  qualities in the same call — a genuinely-failed refresh is treated the
+  same as "still absent" (there is no third, better answer). If the
+  camera is gone (or its status is unknown), the WHOLE action aborts
+  immediately: no state is cleared, no summary is logged, no recreate
+  warning fires, and the remaining qualities are never even attempted
+  (proven in tests with a fatal-collaborator API). If the camera IS
+  present, the quality is logged as `already_gone` (one INFO line naming
+  it) and its state is cleared exactly like a real delete.
+- **`transport`/`server`** does NOT reuse `_describe_api_error`'s generic
+  "states will update on the next refresh" wording — that is false here:
+  with `exposeStreamUrls` off nothing refreshes on its own at all, and
+  with it on, only the NEXT explicit refresh recreates a quality, not
+  passive settling. The dedicated wording says the outcome is unknown and
+  names the two ways to re-sync (re-run this action, or Refresh Stream
+  URLs with expose ticked).
+- Any other kind logs one ERROR via `_describe_api_error` naming the
+  quality, exactly as before.
+
+Each quality's state clear (`_clear_one_stream_state`) is wrapped exactly
+like `_patch_camera`'s own post-write guard: the controller-side delete
+already happened, so a `dev.updateStatesOnServer` failure is logged as
+"deleted on the controller, but the Indigo state update failed" and still
+counts as deleted — it must never look like the delete itself failed, and
+must never abort the remaining qualities. Every log line in this action
+(all outcomes, plus the closing summary and recreate warning) passes
+through `_assert_no_url_in_message` against the device's current stored
+stream values, mirroring the rest of the issue #7 stream-URL family.
+
+**Streams are never deleted automatically anywhere else in this plugin —
+`deleteStreamUrls` is the only path that removes one.** This is
+deliberate: `_refresh_stream_urls` only ever *creates* missing qualities
+(via `create_rtsps_streams`) or falls back to whatever was already
+stored, it never deletes on its own initiative, because a momentary GET
+returning null for a quality that used to work must not be read as "the
+user wants this gone." The consequence, stated in both the action's help
+label and its success path: `_warn_if_deleted_streams_will_be_recreated`
+computes the recreatable subset EXACTLY as `_refresh_stream_urls` does
+(`high`/`medium`/`low` always, `package` only when the cached camera
+reports `hasPackageCamera`) and warns only when the intersection of
+`deleted + already_gone` with that subset is non-empty, naming those
+qualities specifically — deleting `package` on a camera without a
+package lens must not claim it'll come back, because it never will. The
+warning also only fires while `exposeStreamUrls` is still on (a refresh
+with it off only clears state, per `_refresh_stream_urls`, never
+recreates). The trigger list is a device restart, an event-socket
+reconnect, **Send Status Request** (routes to `_refresh_stream_urls_sync`
+via `actionControlUniversal`), or the Refresh Stream URLs action —
+confirmed against `_refresh_stream_urls`'s actual missing-quality/create
+logic, not guessed. A delete that's meant to be permanent needs
+`exposeStreamUrls` unticked too.
+
+**Single source of truth for the RTSPS quality tuple**: `protect_api.py`
+defines `RTSPS_QUALITIES = ("high","medium","low","package")`, used by
+`delete_rtsps_stream`'s own validation; `plugin.py` imports it as
+`RTSPS_DELETE_QUALITIES` for its ConfigUI checkboxes and
+`validateActionConfigUi`, rather than hand-copying the tuple a third time.
+
+All five are SPEC-DERIVED, UNVERIFIED against the reference rig — no PTZ
+camera, no Alarm Manager alarms configured there.
 
 ---
 
