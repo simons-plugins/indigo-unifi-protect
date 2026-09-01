@@ -59,10 +59,10 @@ the spec (see below the table):
 | `/v1/cameras` | GET | ✅ camera list / discovery |
 | `/v1/cameras/{id}` | GET, PATCH | ✅ GET only |
 | `/v1/cameras/{id}/snapshot` | GET | ✅ |
-| `/v1/cameras/{id}/rtsps-stream` | GET, POST, DELETE | no (issue #7) |
-| `/v1/cameras/{id}/ptz/patrol/start/{slot}` | POST | no |
-| `/v1/cameras/{id}/ptz/patrol/stop` | POST | no |
-| `/v1/cameras/{id}/ptz/goto/{slot}` | POST | no |
+| `/v1/cameras/{id}/rtsps-stream` | GET, POST, DELETE | ✅ GET/POST (issue #7); DELETE (issue #25) |
+| `/v1/cameras/{id}/ptz/patrol/start/{slot}` | POST | ✅ (issue #19) |
+| `/v1/cameras/{id}/ptz/patrol/stop` | POST | ✅ (issue #19) |
+| `/v1/cameras/{id}/ptz/goto/{slot}` | POST | ✅ (issue #19) |
 | `/v1/cameras/{id}/disable-mic-permanently` | POST | no |
 | `/v1/cameras/{id}/talkback-session` | POST | no |
 | `/v1/sensors` | GET | no — returns `[]` on reference rig |
@@ -77,7 +77,7 @@ the spec (see below the table):
 | `/v1/liveviews` | GET, POST | no |
 | `/v1/liveviews/{id}` | GET, PATCH | no |
 | `/v1/files/{fileType}` | GET, POST | no |
-| `/v1/alarm-manager/webhook/{id}` | POST | no |
+| `/v1/alarm-manager/webhook/{id}` | POST | ✅ (issue #21) |
 | `/v1/subscribe/events` | GET (WS upgrade) | ✅ the only motion source |
 | `/v1/subscribe/devices` | GET (WS upgrade) | ✅ issue #18 — see below |
 | `/v1/users` *(undocumented)* | GET | no |
@@ -236,8 +236,14 @@ Error shapes:
 
 This answers the open question in issue #6 ("whether the API key alone
 authorises writes, or whether some writes need the private API") for the
-camera fields tested: it does. PTZ patrol/goto, mic-disable, and talkback
-writes are spec-documented (see the endpoint table above) but untested.
+camera fields tested: it does. Mic-disable and talkback writes are still
+spec-documented but untested. PTZ goto/patrol (issue #19) and the
+alarm-manager webhook (issue #21) are now implemented in `protect_api.py`
+(`ptz_goto`/`ptz_patrol_start`/`ptz_patrol_stop`/`send_alarm_webhook`) but
+likewise UNVERIFIED against the reference rig, which has neither a PTZ
+camera nor an Alarm Manager alarm configured — the API key alone
+authorising them is assumed by extension from the camera PATCH result
+above, not independently confirmed.
 
 ## RTSPS streams
 
@@ -253,10 +259,22 @@ live camera object and in `CONTRACT.md`, but not in the spec's `camera`
 schema).
 
 The spec also documents `POST` (body `{"qualities": [...]}`, `qualities` has
-`minItems: 1` — creates streams) and `DELETE` (takes `qualities` as a
-**query** parameter, not a body — array or single value of
-`high|medium|low|package` — and returns **204** on success) on the same
-path. Neither has been exercised.
+`minItems: 1` — creates streams, implemented as `create_rtsps_streams`,
+issue #7) and `DELETE` (takes `qualities` as a **query** parameter, not a
+body — `anyOf` an array or a single value of `high|medium|low|package` —
+and returns **204** on success) on the same path.
+
+`DELETE` is implemented (issue #25) as `protect_api.delete_rtsps_stream`,
+UNVERIFIED against the reference rig, and deliberately sends only the
+single-value form — one quality per call (`?qualities=high`), never the
+array form. How this server expects an array encoded into a query string
+(repeated keys? comma-joined? bracketed `qualities[]=`?) is undocumented,
+and the single-value form is unambiguous and already a documented option,
+so there was nothing to gain by guessing at the other one. A caller
+deleting several qualities makes several calls. Every `ProtectAPIError`
+this raises has its body redacted the same way `get_rtsps_streams`/
+`create_rtsps_streams` already do — this endpoint family can echo a
+stream URL/token back in an error response.
 
 **Treat the URL as a credential** — the token in the path *is* the auth, per
 issue #7. Don't log it, and think before writing it into a device state that

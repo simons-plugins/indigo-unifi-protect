@@ -254,6 +254,54 @@ class ProtectAPI:
     def get_meta_info(self) -> dict:
         """GET /meta/info -> {'applicationVersion': '7.2.105'}.
         Used as the connectivity check; cheapest authenticated call."""
+
+    def _request_no_content(self, method: str, path: str, params: dict[str, str] | None = None,
+                             body: dict | None = None) -> None:
+        """Shared core for the 204-No-Content endpoints below. Calls
+        `_request` and discards the return value -- any 2xx is success
+        regardless of body content; a stray non-empty body on a declared-204
+        endpoint is never parsed and never a failure."""
+
+    def ptz_goto(self, camera_id: str, slot: int) -> None:
+        """POST /cameras/{id}/ptz/goto/{slot} (issue #19). `slot` is an int
+        0-4 (Protect's own UI numbers the same five presets 1-5); bool is
+        explicitly rejected (`isinstance(True, int)` is True in Python).
+        Raises ValueError before any network call on an invalid slot.
+        204 No Content on success -- fire-and-forget, there is no PTZ
+        position readback anywhere in this API. SPEC-DERIVED, UNVERIFIED --
+        the reference rig has no PTZ camera."""
+
+    def ptz_patrol_start(self, camera_id: str, slot: int) -> None:
+        """POST /cameras/{id}/ptz/patrol/start/{slot} (issue #19). Same
+        slot contract and caveats as `ptz_goto`."""
+
+    def ptz_patrol_stop(self, camera_id: str) -> None:
+        """POST /cameras/{id}/ptz/patrol/stop (issue #19). No slot -- stops
+        whichever patrol is currently running."""
+
+    def send_alarm_webhook(self, trigger_id: str) -> None:
+        """POST /alarm-manager/webhook/{id} (issue #21). `trigger_id` is a
+        user-defined free-form string set up on the controller (Alarm
+        Manager > alarm > Webhook trigger), not a Protect object id --
+        URL-encoded with `urllib.parse.quote(trigger_id, safe="")` since it
+        may contain "/" or spaces. Raises ValueError before any network
+        call if empty/whitespace/non-str. 204 No Content on success.
+        SPEC-DERIVED, UNVERIFIED -- the reference rig has no Alarm Manager
+        alarms configured."""
+
+    def delete_rtsps_stream(self, camera_id: str, quality: str) -> None:
+        """DELETE /cameras/{id}/rtsps-stream?qualities=<quality> (issue
+        #25). ONE quality per call, deliberately -- the spec's `qualities`
+        query param is `anyOf` a single string or an array, but how the
+        array form is expected to be encoded in a query string is
+        undocumented for this server, and the single-string form is
+        unambiguous and already documented, so this never guesses at the
+        other encoding. Raises ValueError before any network call if
+        `quality` isn't one of "high"/"medium"/"low"/"package". Same
+        `_redact_body` treatment as get_rtsps_streams/create_rtsps_streams
+        above on every ProtectAPIError raised -- this endpoint family can
+        echo a stream URL/token back in an error body. 204 No Content on
+        success. SPEC-DERIVED, UNVERIFIED."""
 ```
 
 Use `urllib.request` with an `ssl.SSLContext`. When `verify_ssl` is false set
@@ -1047,6 +1095,62 @@ callbacks re-check defensively (an empty OSD body, an out-of-range mic
 volume, the enum checks described above) because a scripter can call
 `executeAction()` directly and bypass the dialog — and its validation —
 entirely.
+
+### Issue #19/#21/#25 actions
+
+Five more `Actions.xml` entries, following the #6 shape above but NOT
+going through `_resolve_camera`/`_patch_camera` — none of them have a
+camera object to gate capability on or refresh state from afterwards
+(the API has no PTZ capability flag and no position readback at all, and
+the webhook/delete-stream endpoints aren't camera-state writes in the
+`_camera_info_states` sense). The precheck for the device-scoped ones is
+the cheaper `setChimeVolume` shape instead: `cameraId` present in
+`pluginProps`, `self.api` configured — no cached-object lookup.
+
+| Action id | deviceFilter | ConfigUI | PATCH/method |
+|---|---|---|---|
+| `ptzGotoPreset` | `self.protectCamera` | `slot` menu, "0".."4" (labelled Preset 1-5) | `ptz_goto(camera_id, int(slot))` |
+| `ptzPatrolStart` | `self.protectCamera` | `slot` menu, "0".."4" (labelled Patrol 1-5) | `ptz_patrol_start(camera_id, int(slot))` |
+| `ptzPatrolStop` | `self.protectCamera` | none | `ptz_patrol_stop(camera_id)` |
+| `triggerAlarmWebhook` | none (plugin-level, like `refreshCameras`) | `webhookId` textfield | `send_alarm_webhook(self.substitute(webhookId))` |
+| `deleteStreamUrls` | `self.protectCamera` | four checkboxes: `high`/`medium`/`low`/`package` | `delete_rtsps_stream(camera_id, quality)` per ticked quality |
+
+`ptzGotoPreset`/`ptzPatrolStart`'s `slot` is validated in both
+`validateActionConfigUi` (against `PTZ_SLOTS = ("0","1","2","3","4")`) and
+the callback itself — the same double-check as every #6 action, because a
+scripter can call `executeAction()` with any value. `triggerAlarmWebhook`
+applies `self.substitute(raw)` before validating: an empty result (a
+variable that resolved to nothing, or whitespace) is caught AFTER
+substitution and never reaches the network — checking the raw
+pre-substitution text would miss that case entirely.
+
+`deleteStreamUrls` loops over the ticked qualities (`_truthy`-checked,
+same string-`"false"` handling as `exposeStreamUrls`) and calls
+`delete_rtsps_stream` once per quality, independently: a `not_found` is
+treated as already-gone (the state is cleared, no ERROR — that's the
+outcome the action wants); any other `ProtectAPIError` logs one ERROR via
+`_describe_api_error` naming the quality and moves on to the rest — one
+failing quality must never skip the others. A single INFO line at the end
+summarises the whole run, e.g. `"deleted: high, medium; failed: low"`.
+
+**Streams are never deleted automatically anywhere else in this plugin —
+`deleteStreamUrls` is the only path that removes one.** This is
+deliberate: `_refresh_stream_urls` only ever *creates* missing qualities
+(via `create_rtsps_streams`) or falls back to whatever was already
+stored, it never deletes on its own initiative, because a momentary GET
+returning null for a quality that used to work must not be read as "the
+user wants this gone." The consequence, stated in both the action's help
+label and its success path: if a device still has `exposeStreamUrls` on
+when a quality is deleted, the very next stream-URL refresh for that
+camera (a device restart, an event-socket reconnect, or the Refresh
+Stream URLs action — confirmed against `_refresh_stream_urls`'s actual
+missing-quality/create logic, not guessed) will see that quality null on
+the GET and recreate it. The action logs a WARNING saying exactly that,
+so a delete that's meant to be permanent needs `exposeStreamUrls`
+unticked too.
+
+All five are SPEC-DERIVED, UNVERIFIED against the reference rig — no PTZ
+camera, no Alarm Manager alarms configured there.
 
 ---
 

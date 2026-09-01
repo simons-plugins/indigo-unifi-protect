@@ -226,6 +226,42 @@ Verified live against a UNVR on Protect **7.2.105**, 2026-08-31: the API
 key alone authorises these writes, the same as every read in this plugin —
 no separate write credential was needed.
 
+#### PTZ and Delete Stream URLs (spec-derived, unverified)
+
+Four more **Device Actions**, built from Protect's published OpenAPI spec
+rather than tested against real hardware — the reference rig has no PTZ
+camera:
+
+- **PTZ: Go To Preset** / **PTZ: Start Patrol** — pick a slot 1–5 (Protect's
+  own UI numbering; the underlying API index is 0–4, and the dialog labels
+  say so). **PTZ: Stop Patrol** takes no fields.
+- **Delete Stream URLs** — tick any of High/Medium/Low/Package and the
+  plugin deletes just those RTSPS streams on the controller, then clears
+  the matching state(s) back to empty. One quality failing doesn't stop the
+  others — each is requested independently, and the Event Log names
+  exactly which ones succeeded and which didn't. If **Expose RTSPS stream
+  URLs** is still ticked on the device, a warning explains that the
+  deleted quality will simply come back the next time this plugin
+  refreshes stream URLs for that camera (a device restart, an event-socket
+  reconnect, or the Refresh Stream URLs action all trigger that) — this
+  action is the only thing in the plugin that ever deletes a stream, it is
+  never automatic.
+
+There is no PTZ position readback anywhere in this API, so the PTZ actions
+are fire-and-forget: a 2xx response is the only confirmation there is, and
+a camera without PTZ hardware simply has the controller refuse the
+command (an Event Log error, same as any other refused write above).
+
+#### Trigger Alarm Manager Webhook
+
+A **plugin-level** action (Plugin Actions menu, not tied to a device) that
+fires a Protect **Alarm Manager** alarm configured with a Webhook trigger.
+Enter the trigger ID exactly as set up in Protect (Alarm Manager > your
+alarm > Webhook trigger) — Indigo variable substitution (`%%v:12345%%`) is
+supported, so the ID can come from a variable rather than being hardcoded
+in the action. Spec-derived, unverified against the reference rig, which
+has no Alarm Manager alarms configured.
+
 ## Live stream URLs
 
 Each camera device can optionally expose its RTSPS live-stream URLs as
