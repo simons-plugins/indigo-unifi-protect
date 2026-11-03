@@ -23,7 +23,7 @@ If you've unticked that box (or are on an older plugin version), fall back to
 copying it by hand:
 
 ```bash
-cp cameras.html "/Library/Application Support/Perceptive Automation/Indigo 2025.2/Web Assets/static/pages/"
+cp cameras.html "/Library/Application Support/Perceptive Automation/Indigo 2026.1/Web Assets/static/pages/"
 ```
 
 Restart the Domio plugin (or Indigo) and the page appears as **Cameras**.
