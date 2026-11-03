@@ -81,7 +81,7 @@ instead:
 
 ```bash
 cp pages/cameras.html \
-  "/Library/Application Support/Perceptive Automation/Indigo 2025.2/Web Assets/static/pages/"
+  "/Library/Application Support/Perceptive Automation/Indigo 2026.1/Web Assets/static/pages/"
 ```
 
 Restart the Domio plugin (or Indigo) and the page appears as **Cameras**.
